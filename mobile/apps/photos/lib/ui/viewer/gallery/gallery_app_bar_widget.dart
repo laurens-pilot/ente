@@ -54,6 +54,7 @@ import 'package:photos/ui/tools/free_space_page.dart';
 import "package:photos/ui/viewer/file/detail_page.dart";
 import "package:photos/ui/viewer/gallery/hooks/add_photos_sheet.dart";
 import 'package:photos/ui/viewer/gallery/hooks/pick_cover_photo.dart';
+import "package:photos/ui/viewer/gallery/photos_lane.dart";
 import "package:photos/ui/viewer/gallery/state/inherited_search_filter_data.dart";
 import "package:photos/ui/viewer/hierarchicial_search/applied_filters_for_appbar.dart";
 import "package:photos/ui/viewer/hierarchicial_search/recommended_filters_for_appbar.dart";
@@ -111,6 +112,11 @@ enum AlbumPopupAction {
   editLocation,
   deleteLocation,
   galleryGuestView,
+}
+
+enum _GuestViewMode {
+  detail,
+  photosLane,
 }
 
 class _GalleryAppBarWidgetState extends State<GalleryAppBarWidget> {
@@ -1183,14 +1189,22 @@ class _GalleryAppBarWidgetState extends State<GalleryAppBarWidget> {
         return;
       }
 
-      // Use the same logic as selected files guest view
-      final page = DetailPage(
-        DetailPageConfiguration(
-          collectionFiles,
-          0,
-          "guest_view",
-        ),
-      );
+      final mode = await _pickGuestViewMode();
+      if (mode == null) {
+        return;
+      }
+      final page = mode == _GuestViewMode.photosLane
+          ? PhotosLanePage(
+              files: collectionFiles,
+              isGuestView: true,
+            )
+          : DetailPage(
+              DetailPageConfiguration(
+                collectionFiles,
+                0,
+                "guest_view",
+              ),
+            );
       await localSettings.setOnGuestView(true);
       routeToPage(context, page, forceCustomPageRoute: true).ignore();
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1203,5 +1217,49 @@ class _GalleryAppBarWidgetState extends State<GalleryAppBarWidget> {
         AppLocalizations.of(context).guestViewEnablePreSteps,
       );
     }
+  }
+
+  Future<_GuestViewMode?> _pickGuestViewMode() async {
+    if (!flagService.internalUser || !flagService.facesTimeline) {
+      return _GuestViewMode.detail;
+    }
+    final l10n = AppLocalizations.of(context);
+    final actionResult = await showActionSheet(
+      context: context,
+      buttons: [
+        const ButtonWidget(
+          labelText: "Photo viewer",
+          buttonType: ButtonType.neutral,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.first,
+          isInAlert: true,
+        ),
+        const ButtonWidget(
+          labelText: "Slideshow",
+          buttonType: ButtonType.neutral,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.second,
+          isInAlert: true,
+        ),
+        ButtonWidget(
+          labelText: l10n.cancel,
+          buttonType: ButtonType.secondary,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.cancel,
+          isInAlert: true,
+        ),
+      ],
+      actionSheetType: ActionSheetType.defaultActionSheet,
+    );
+    if (actionResult?.action == ButtonAction.first) {
+      return _GuestViewMode.detail;
+    }
+    if (actionResult?.action == ButtonAction.second) {
+      return _GuestViewMode.photosLane;
+    }
+    return null;
   }
 }

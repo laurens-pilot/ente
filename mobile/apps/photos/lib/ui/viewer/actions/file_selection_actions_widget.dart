@@ -41,6 +41,7 @@ import "package:photos/ui/tools/collage/collage_creator_page.dart";
 import "package:photos/ui/viewer/actions/suggest_delete_sheet.dart";
 import "package:photos/ui/viewer/date/edit_date_sheet.dart";
 import "package:photos/ui/viewer/file/detail_page.dart";
+import "package:photos/ui/viewer/gallery/photos_lane.dart";
 import "package:photos/ui/viewer/location/update_location_data_widget.dart";
 import "package:photos/ui/viewer/people/add_files_to_person_page.dart";
 import 'package:photos/utils/delete_file_util.dart';
@@ -70,6 +71,11 @@ class FileSelectionActionsWidget extends StatefulWidget {
   @override
   State<FileSelectionActionsWidget> createState() =>
       _FileSelectionActionsWidgetState();
+}
+
+enum _GuestViewMode {
+  detail,
+  photosLane,
 }
 
 class _FileSelectionActionsWidgetState
@@ -808,13 +814,22 @@ class _FileSelectionActionsWidgetState
   Future<void> _onGuestViewClick() async {
     final List<EnteFile> selectedFiles = widget.selectedFiles.files.toList();
     if (await LocalAuthentication().isDeviceSupported()) {
-      final page = DetailPage(
-        DetailPageConfiguration(
-          selectedFiles,
-          0,
-          "guest_view",
-        ),
-      );
+      final mode = await _pickGuestViewMode();
+      if (mode == null) {
+        return;
+      }
+      final page = mode == _GuestViewMode.photosLane
+          ? PhotosLanePage(
+              files: selectedFiles,
+              isGuestView: true,
+            )
+          : DetailPage(
+              DetailPageConfiguration(
+                selectedFiles,
+                0,
+                "guest_view",
+              ),
+            );
       await localSettings.setOnGuestView(true);
       routeToPage(context, page, forceCustomPageRoute: true).ignore();
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -828,6 +843,50 @@ class _FileSelectionActionsWidgetState
       );
     }
     widget.selectedFiles.clearAll();
+  }
+
+  Future<_GuestViewMode?> _pickGuestViewMode() async {
+    if (!flagService.internalUser || !flagService.facesTimeline) {
+      return _GuestViewMode.detail;
+    }
+    final l10n = AppLocalizations.of(context);
+    final actionResult = await showActionSheet(
+      context: context,
+      buttons: [
+        const ButtonWidget(
+          labelText: "Photo viewer",
+          buttonType: ButtonType.neutral,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.first,
+          isInAlert: true,
+        ),
+        const ButtonWidget(
+          labelText: "Slideshow",
+          buttonType: ButtonType.neutral,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.second,
+          isInAlert: true,
+        ),
+        ButtonWidget(
+          labelText: l10n.cancel,
+          buttonType: ButtonType.secondary,
+          buttonSize: ButtonSize.large,
+          shouldStickToDarkTheme: true,
+          buttonAction: ButtonAction.cancel,
+          isInAlert: true,
+        ),
+      ],
+      actionSheetType: ActionSheetType.defaultActionSheet,
+    );
+    if (actionResult?.action == ButtonAction.first) {
+      return _GuestViewMode.detail;
+    }
+    if (actionResult?.action == ButtonAction.second) {
+      return _GuestViewMode.photosLane;
+    }
+    return null;
   }
 
   Future<void> _onArchiveClick() async {

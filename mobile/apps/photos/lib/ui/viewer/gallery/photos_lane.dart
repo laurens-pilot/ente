@@ -1,31 +1,31 @@
 import "dart:async";
 import "dart:math" as math;
-import "dart:typed_data";
 import "dart:ui" as ui;
 
-import "package:collection/collection.dart";
 import "package:flutter/material.dart";
 import "package:intl/intl.dart";
 import "package:logging/logging.dart";
-import "package:photos/db/files_db.dart";
-import "package:photos/db/ml/db.dart";
+import "package:photos/core/event_bus.dart";
 import "package:photos/ente_theme_data.dart";
+import "package:photos/events/guest_view_event.dart";
 import "package:photos/l10n/l10n.dart";
 import "package:photos/models/file/file.dart";
-import "package:photos/models/memory_lane/memory_lane_models.dart";
-import "package:photos/models/ml/face/face.dart";
-import "package:photos/models/ml/face/person.dart";
 import "package:photos/service_locator.dart";
-import "package:photos/services/memory_lane/memory_lane_service.dart";
+import "package:photos/services/local_authentication_service.dart";
 import "package:photos/theme/colors.dart";
 import "package:photos/theme/effects.dart";
 import "package:photos/theme/ente_theme.dart";
-import "package:photos/utils/face/face_thumbnail_cache.dart";
+import "package:photos/utils/thumbnail_util.dart";
 
 class PhotosLanePage extends StatefulWidget {
-  final PersonEntity person;
+  final List<EnteFile> files;
+  final bool isGuestView;
 
-  const PhotosLanePage({required this.person, super.key});
+  const PhotosLanePage({
+    required this.files,
+    this.isGuestView = false,
+    super.key,
+  });
 
   @override
   State<PhotosLanePage> createState() => _PhotosLanePageState();
@@ -75,7 +75,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   bool _hasStartedPlayback = false;
   bool _allFramesLoaded = false;
   bool _timelineUnavailable = false;
-  bool _hasMarkedTimelineSeen = false;
   int _expectedFrameCount = 0;
 
   int _currentIndex = 0;
@@ -86,13 +85,14 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   double _sliderValue = 0;
   double _previousCaptionValue = 0;
   double _currentCaptionValue = 0;
-  _CaptionType _currentCaptionType = _CaptionType.yearsAgo;
   int _maxCaptionDigits = 1;
+  late bool _isGuestView;
   bool get _featureEnabled => flagService.facesTimeline;
 
   @override
   void initState() {
     super.initState();
+    _isGuestView = widget.isGuestView;
     _cardTransitionController = AnimationController(
       vsync: this,
       duration: _cardTransitionDuration,
@@ -128,8 +128,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   }
 
   Future<void> _loadFrames() async {
-    _hasMarkedTimelineSeen =
-        localSettings.hasSeenMemoryLane(widget.person.remoteID);
     _playTimer?.cancel();
     if (mounted) {
       setState(() {
@@ -137,25 +135,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       });
     }
     try {
-      final timeline = await MemoryLaneService.instance.getTimeline(
-        widget.person.remoteID,
-      );
-      if (!mounted) {
-        return;
-      }
-      if (timeline == null || !timeline.isReady || timeline.entries.isEmpty) {
-        setState(() {
-          _timelineUnavailable = true;
-          _allFramesLoaded = true;
-          _frames.clear();
-          _hasStartedPlayback = false;
-          _loggedPlaybackStart = false;
-        });
-        return;
-      }
-
-      final entries = timeline.entries;
-      _expectedFrameCount = entries.length;
+      final files = widget.files;
+      _expectedFrameCount = files.length;
       if (_expectedFrameCount == 0) {
         setState(() {
           _timelineUnavailable = true;
@@ -180,7 +161,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         _sliderValue = 0;
         _previousCaptionValue = 0;
         _currentCaptionValue = 0;
-        _currentCaptionType = _CaptionType.yearsAgo;
         _maxCaptionDigits = 1;
       });
       _updateStackProgress(0);
@@ -189,16 +169,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         ..value = 0;
 
       int loadedCount = 0;
-      final uniqueFileIds =
-          entries.map((entry) => entry.fileId).toSet().toList();
-      final filesById =
-          await FilesDB.instance.getFileIDToFileFromIDs(uniqueFileIds);
-      final Map<int, Future<List<Face>?>> facesFutures = {};
-
       await _buildFramesInParallel(
-        entries: entries,
-        filesById: filesById,
-        facesFutures: facesFutures,
+        files: files,
         onFrameReady: (builtFrame) {
           if (!mounted) {
             return;
@@ -214,10 +186,9 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       setState(() {
         _allFramesLoaded = true;
       });
-      _maybeMarkTimelineSeen();
     } catch (error, stackTrace) {
       _logger.severe(
-        "Faces timeline failed to load",
+        "Photos lane failed to load",
         error,
         stackTrace,
       );
@@ -241,19 +212,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     return math.max(1, math.min(_initialFrameTarget, _expectedFrameCount));
   }
 
-  void _maybeMarkTimelineSeen() {
-    if (_hasMarkedTimelineSeen || !_allFramesLoaded || _frames.isEmpty) {
-      return;
-    }
-    if (_currentIndex != _frames.length - 1) {
-      return;
-    }
-    _hasMarkedTimelineSeen = true;
-    unawaited(
-      localSettings.markMemoryLaneSeen(widget.person.remoteID),
-    );
-  }
-
   void _handleFrameLoaded(_TimelineFrame frame, int loadedCount) {
     final bool isFirstFrame = _frames.isEmpty;
     final int digitCount = _captionDigitCount(frame.captionValue);
@@ -269,7 +227,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         _cardTransitionController.value = 0;
         _currentCaptionValue = frame.captionValue;
         _previousCaptionValue = frame.captionValue;
-        _currentCaptionType = frame.captionType;
       }
     });
     if (isFirstFrame) {
@@ -288,9 +245,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   }
 
   Future<void> _buildFramesInParallel({
-    required List<MemoryLaneEntry> entries,
-    required Map<int, EnteFile> filesById,
-    required Map<int, Future<List<Face>?>> facesFutures,
+    required List<EnteFile> files,
     required void Function(_TimelineFrame builtFrame) onFrameReady,
   }) async {
     final readyFrames = <int, _TimelineFrame?>{};
@@ -301,9 +256,9 @@ class _PhotosLanePageState extends State<PhotosLanePage>
 
     void maybeComplete() {
       if (!completer.isCompleted &&
-          nextEmitIndex >= entries.length &&
+          nextEmitIndex >= files.length &&
           inFlight == 0 &&
-          started >= entries.length) {
+          started >= files.length) {
         completer.complete();
       }
     }
@@ -320,20 +275,12 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     }
 
     void startNext() {
-      while (inFlight < _frameBuildConcurrency && started < entries.length) {
+      while (inFlight < _frameBuildConcurrency && started < files.length) {
         final int index = started;
         started += 1;
         inFlight += 1;
-        final entry = entries[index];
-        final facesFuture = facesFutures.putIfAbsent(
-          entry.fileId,
-          () => MLDataDB.instance.getFacesForGivenFileID(entry.fileId),
-        );
-        _buildFrame(
-          entry,
-          file: filesById[entry.fileId],
-          facesFuture: facesFuture,
-        ).then((built) {
+        final file = files[index];
+        _buildFrame(file).then((built) {
           readyFrames[index] = built;
         }).catchError((error, stackTrace) {
           readyFrames[index] = null;
@@ -350,70 +297,28 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     return completer.future;
   }
 
-  Future<_TimelineFrame> _buildFrame(
-    MemoryLaneEntry entry, {
-    EnteFile? file,
-    Future<List<Face>?>? facesFuture,
-  }) async {
-    EnteFile? effectiveFile = file;
-    effectiveFile ??= await FilesDB.instance.getAnyUploadedFile(entry.fileId);
+  Future<_TimelineFrame> _buildFrame(EnteFile file) async {
     MemoryImage? image;
-    Uint8List? bytes;
-    if (effectiveFile != null) {
-      final List<Face>? faces;
-      if (facesFuture != null) {
-        faces = await facesFuture;
-      } else {
-        faces = await MLDataDB.instance.getFacesForGivenFileID(entry.fileId);
+    try {
+      final bytes = await getThumbnail(file);
+      if (bytes != null && bytes.isNotEmpty) {
+        image = MemoryImage(bytes);
       }
-      final Face? face = faces?.firstWhereOrNull(
-        (element) => element.faceID == entry.faceId,
+    } catch (error, stackTrace) {
+      _logger.warning(
+        "Failed to fetch thumbnail for ${file.tag}",
+        error,
+        stackTrace,
       );
-      if (face != null) {
-        try {
-          final cropMap = await getCachedFaceCrops(
-            effectiveFile,
-            [face],
-            useFullFile: true,
-            useTempCache: false,
-          );
-          bytes = cropMap?[face.faceID];
-          if (bytes != null && bytes.isNotEmpty) {
-            image = MemoryImage(bytes);
-          }
-        } catch (error, stackTrace) {
-          _logger.warning(
-            "Failed to fetch face crop for ${entry.faceId}",
-            error,
-            stackTrace,
-          );
-        }
-      }
     }
-    final creationDate = DateTime.fromMicrosecondsSinceEpoch(
-      entry.creationTimeMicros,
-    );
-    final captionType = widget.person.data.birthDate != null
-        ? _CaptionType.age
-        : _CaptionType.yearsAgo;
-    double captionValue;
-    if (captionType == _CaptionType.age) {
-      final birthDateString = widget.person.data.birthDate!;
-      final birthDate = DateTime.tryParse(birthDateString);
-      if (birthDate == null) {
-        captionValue = _yearsBetween(creationDate, DateTime.now());
-      } else {
-        captionValue = _yearsBetween(birthDate, creationDate);
-      }
-    } else {
-      captionValue = _yearsBetween(creationDate, DateTime.now());
-    }
+    final int creationMicros =
+        file.creationTime ?? DateTime.now().microsecondsSinceEpoch;
+    final creationDate = DateTime.fromMicrosecondsSinceEpoch(creationMicros);
+    double captionValue = _yearsBetween(creationDate, DateTime.now());
     captionValue = captionValue.clamp(0, double.infinity);
     final timelineFrame = _TimelineFrame(
-      entry: entry,
       image: image,
       creationDate: creationDate,
-      captionType: captionType,
       captionValue: captionValue,
     );
     return timelineFrame;
@@ -462,7 +367,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   void _logPlaybackStart(int frameCount) {
     if (_loggedPlaybackStart) return;
     _logger.info(
-      "playback_start person=${widget.person.remoteID} frames=$frameCount",
+      "playback_start frames=$frameCount",
     );
     _loggedPlaybackStart = true;
   }
@@ -515,10 +420,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       final frame = _frames[clamped];
       _previousCaptionValue = _currentCaptionValue;
       _currentCaptionValue = frame.captionValue;
-      _currentCaptionType = frame.captionType;
       _sliderValue = clamped.toDouble();
     });
-    _maybeMarkTimelineSeen();
   }
 
   void _animateToIndex(int index) {
@@ -561,18 +464,20 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       final l10n = context.l10n;
       final colorScheme = getEnteColorScheme(context);
       final textTheme = getEnteTextTheme(context);
-      return Scaffold(
-        appBar: AppBar(title: Text(l10n.facesTimelineAppBarTitle)),
-        body: Center(
-          child: Text(
-            l10n.facesTimelineUnavailable,
-            style: textTheme.body.copyWith(color: colorScheme.textBase),
-            textAlign: TextAlign.center,
+      return _wrapGuestViewPopScope(
+        Scaffold(
+          appBar: AppBar(title: Text(l10n.facesTimelineAppBarTitle)),
+          body: Center(
+            child: Text(
+              l10n.facesTimelineUnavailable,
+              style: textTheme.body.copyWith(color: colorScheme.textBase),
+              textAlign: TextAlign.center,
+            ),
           ),
         ),
       );
     }
-    return Theme(
+    final Widget content = Theme(
       data: darkThemeData,
       child: Builder(
         builder: (context) {
@@ -699,6 +604,38 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         },
       ),
     );
+    return _wrapGuestViewPopScope(content);
+  }
+
+  Widget _wrapGuestViewPopScope(Widget child) {
+    if (!_isGuestView) {
+      return child;
+    }
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) {
+          return;
+        }
+        final authenticated = await _requestAuthentication();
+        if (!authenticated || !mounted) {
+          return;
+        }
+        setState(() {
+          _isGuestView = false;
+        });
+        Bus.instance.fire(GuestViewEvent(false, false));
+        await localSettings.setOnGuestView(false);
+      },
+      child: child,
+    );
+  }
+
+  Future<bool> _requestAuthentication() async {
+    return LocalAuthenticationService.instance.requestLocalAuthentication(
+      context,
+      "Please authenticate to view more photos and videos.",
+    );
   }
 
   Widget _buildFrameView(BuildContext context, double currentStackProgress) {
@@ -723,7 +660,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                 color: colorScheme.backgroundElevated2,
                 child: Center(
                   child: Icon(
-                    Icons.person_outline,
+                    Icons.photo_outlined,
                     size: 72,
                     color: colorScheme.strokeMuted,
                   ),
@@ -827,7 +764,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     final colorScheme = getEnteColorScheme(context);
     final textTheme = getEnteTextTheme(context);
     final l10n = context.l10n;
-    final captionType = _currentCaptionType;
     final isPlaying = _isPlaying;
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
     final localeName = l10n.localeName;
@@ -858,21 +794,11 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     final double slotWidth = samplePainter.width;
     final double slotHeight = samplePainter.height;
     final String formattedCurrent = numberFormat.format(currentRounded);
-    String fullText;
-    if (captionType == _CaptionType.age) {
-      fullText = l10n.facesTimelineCaptionYearsOld(
-        name: widget.person.data.name,
-        count: currentRounded,
-      );
-    } else {
-      fullText = l10n.facesTimelineCaptionYearsAgo(count: currentRounded);
-      if (fullText.contains("#")) {
-        fullText = fullText.replaceAll("#", formattedCurrent);
-      }
-      final String name = widget.person.data.name;
-      if (name.isNotEmpty) {
-        fullText = "$name $fullText";
-      }
+    String fullText = l10n.facesTimelineCaptionYearsAgo(
+      count: currentRounded,
+    );
+    if (fullText.contains("#")) {
+      fullText = fullText.replaceAll("#", formattedCurrent);
     }
     final int insertionIndex = fullText.indexOf(formattedCurrent);
     final InlineSpan captionSpan;
@@ -999,10 +925,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                       final frame = _frames[_currentIndex];
                       _previousCaptionValue = _currentCaptionValue;
                       _currentCaptionValue = frame.captionValue;
-                      _currentCaptionType = frame.captionType;
                       _isScrubbing = true;
                     });
-                    _maybeMarkTimelineSeen();
                   }
                 : null,
             onChangeEnd: frameCount > 1
@@ -1016,7 +940,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                       _isScrubbing = false;
                     });
                     _updateStackProgress(targetProgress);
-                    _maybeMarkTimelineSeen();
                   }
                 : null,
           ),
@@ -1083,26 +1006,20 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       final frame = _frames[clampedIndex];
       _previousCaptionValue = _currentCaptionValue;
       _currentCaptionValue = frame.captionValue;
-      _currentCaptionType = frame.captionType;
       _sliderValue = clampedIndex.toDouble();
     });
     _updateStackProgress(clampedIndex.toDouble());
-    _maybeMarkTimelineSeen();
   }
 }
 
 class _TimelineFrame {
-  final MemoryLaneEntry entry;
   final MemoryImage? image;
   final DateTime creationDate;
-  final _CaptionType captionType;
   final double captionValue;
 
   _TimelineFrame({
-    required this.entry,
     required this.image,
     required this.creationDate,
-    required this.captionType,
     required this.captionValue,
   });
 }
@@ -1188,7 +1105,7 @@ class _MemoryLaneCard extends StatelessWidget {
           if (frame.image == null)
             Center(
               child: Icon(
-                Icons.person_outline,
+                Icons.photo_outlined,
                 size: 72,
                 color: colorScheme.strokeMuted,
               ),
@@ -1385,8 +1302,6 @@ class _MemoryLaneCard extends StatelessWidget {
     return overlayMax * eased;
   }
 }
-
-enum _CaptionType { age, yearsAgo }
 
 double _yearsBetween(DateTime start, DateTime end) {
   final days = end.difference(start).inDays;
