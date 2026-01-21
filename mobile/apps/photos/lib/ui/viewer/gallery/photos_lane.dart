@@ -31,22 +31,9 @@ class PhotosLanePage extends StatefulWidget {
   State<PhotosLanePage> createState() => _PhotosLanePageState();
 }
 
-const LinearGradient _memoryLaneBackgroundGradient = LinearGradient(
-  begin: Alignment.topCenter,
-  end: Alignment.bottomCenter,
-  colors: [
-    Color(0xFF03010A),
-    Color(0xFF16103C),
-    Color(0xFF401963),
-    Color(0xFF241348),
-    Color(0xFF03010A),
-  ],
-  stops: [0.0, 0.3, 0.52, 0.74, 1.0],
-);
-
 class _PhotosLanePageState extends State<PhotosLanePage>
     with TickerProviderStateMixin {
-  static const _frameInterval = Duration(milliseconds: 800);
+  static const _frameInterval = Duration(seconds: 2);
   static const _cardTransitionDuration = Duration(milliseconds: 520);
   static const double _frameWidthFactor = 0.82;
   static const double _frameHeightFactor = 0.78;
@@ -58,6 +45,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   static const int _initialFrameTarget = 120;
   static const int _frameBuildConcurrency = 6;
   static const double _appBarSideWidth = kToolbarHeight;
+  static const bool _showPhotoDate = false;
 
   final Logger _logger = Logger("PhotosLanePage");
   late final AnimationController _cardTransitionController;
@@ -83,9 +71,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   final GlobalKey _controlsKey = GlobalKey();
   bool _isScrubbing = false;
   double _sliderValue = 0;
-  double _previousCaptionValue = 0;
-  double _currentCaptionValue = 0;
-  int _maxCaptionDigits = 1;
   late bool _isGuestView;
   bool get _featureEnabled => flagService.facesTimeline;
 
@@ -159,9 +144,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         _isAnimatingCard = false;
         _currentIndex = 0;
         _sliderValue = 0;
-        _previousCaptionValue = 0;
-        _currentCaptionValue = 0;
-        _maxCaptionDigits = 1;
       });
       _updateStackProgress(0);
       _cardTransitionController
@@ -214,10 +196,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
 
   void _handleFrameLoaded(_TimelineFrame frame, int loadedCount) {
     final bool isFirstFrame = _frames.isEmpty;
-    final int digitCount = _captionDigitCount(frame.captionValue);
     setState(() {
       _frames.add(frame);
-      _maxCaptionDigits = math.max(_maxCaptionDigits, digitCount);
       if (isFirstFrame) {
         _currentIndex = 0;
         _sliderValue = 0;
@@ -225,8 +205,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         _targetIndex = 0;
         _isAnimatingCard = false;
         _cardTransitionController.value = 0;
-        _currentCaptionValue = frame.captionValue;
-        _previousCaptionValue = frame.captionValue;
       }
     });
     if (isFirstFrame) {
@@ -237,11 +215,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       _startPlayback();
       _logPlaybackStart(_expectedFrameCount);
     }
-  }
-
-  int _captionDigitCount(double value) {
-    final int rounded = value.round().abs();
-    return math.max(1, rounded.toString().length);
   }
 
   Future<void> _buildFramesInParallel({
@@ -314,12 +287,9 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     final int creationMicros =
         file.creationTime ?? DateTime.now().microsecondsSinceEpoch;
     final creationDate = DateTime.fromMicrosecondsSinceEpoch(creationMicros);
-    double captionValue = _yearsBetween(creationDate, DateTime.now());
-    captionValue = captionValue.clamp(0, double.infinity);
     final timelineFrame = _TimelineFrame(
       image: image,
       creationDate: creationDate,
-      captionValue: captionValue,
     );
     return timelineFrame;
   }
@@ -405,25 +375,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     _animateToIndex(index);
   }
 
-  void _jumpToIndex(int index) {
-    if (_frames.isEmpty) {
-      return;
-    }
-    final clamped = index.clamp(0, _frames.length - 1);
-    _cardTransitionController.stop();
-    _updateStackProgress(clamped.toDouble());
-    setState(() {
-      _isAnimatingCard = false;
-      _animationStartProgress = clamped.toDouble();
-      _targetIndex = clamped;
-      _currentIndex = clamped;
-      final frame = _frames[clamped];
-      _previousCaptionValue = _currentCaptionValue;
-      _currentCaptionValue = frame.captionValue;
-      _sliderValue = clamped.toDouble();
-    });
-  }
-
   void _animateToIndex(int index) {
     if (_frames.isEmpty) {
       return;
@@ -461,144 +412,152 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   @override
   Widget build(BuildContext context) {
     if (!_featureEnabled) {
-      final l10n = context.l10n;
-      final colorScheme = getEnteColorScheme(context);
-      final textTheme = getEnteTextTheme(context);
       return _wrapGuestViewPopScope(
-        Scaffold(
-          appBar: AppBar(title: Text(l10n.facesTimelineAppBarTitle)),
-          body: Center(
-            child: Text(
-              l10n.facesTimelineUnavailable,
-              style: textTheme.body.copyWith(color: colorScheme.textBase),
-              textAlign: TextAlign.center,
-            ),
+        Theme(
+          data: lightThemeData,
+          child: Builder(
+            builder: (context) {
+              final l10n = context.l10n;
+              final colorScheme = getEnteColorScheme(context);
+              final textTheme = getEnteTextTheme(context);
+              return Scaffold(
+                backgroundColor: colorScheme.backgroundBase,
+                appBar: AppBar(
+                  backgroundColor: colorScheme.backgroundBase,
+                  surfaceTintColor: Colors.transparent,
+                  elevation: 0,
+                  scrolledUnderElevation: 0,
+                  foregroundColor: colorScheme.textBase,
+                  title: const Text("Slideshow"),
+                ),
+                body: Center(
+                  child: Text(
+                    l10n.facesTimelineUnavailable,
+                    style: textTheme.body.copyWith(
+                      color: colorScheme.textBase,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              );
+            },
           ),
         ),
       );
     }
     final Widget content = Theme(
-      data: darkThemeData,
+      data: lightThemeData,
       child: Builder(
         builder: (context) {
           final l10n = context.l10n;
-          final title = l10n.facesTimelineAppBarTitle;
+          const title = "Slideshow";
           final colorScheme = getEnteColorScheme(context);
           final textTheme = getEnteTextTheme(context);
           final titleStyle = textTheme.h2Bold.copyWith(
             letterSpacing: -2,
           );
-          return DecoratedBox(
-            decoration: const BoxDecoration(
-              gradient: _memoryLaneBackgroundGradient,
-            ),
-            child: Scaffold(
-              backgroundColor: Colors.transparent,
-              appBar: AppBar(
-                backgroundColor: Colors.transparent,
-                surfaceTintColor: Colors.transparent,
-                elevation: 0,
-                scrolledUnderElevation: 0,
-                foregroundColor: colorScheme.textBase,
-                automaticallyImplyLeading: false,
-                title: Row(
-                  children: [
-                    const SizedBox(
-                      width: _appBarSideWidth,
-                      height: kToolbarHeight,
-                      child: BackButton(),
-                    ),
-                    Expanded(
-                      child: Center(
-                        child: Text(
-                          title,
-                          style: titleStyle,
-                          textAlign: TextAlign.center,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: _appBarSideWidth),
-                  ],
-                ),
-              ),
-              body: Stack(
+          return Scaffold(
+            backgroundColor: colorScheme.backgroundBase,
+            appBar: AppBar(
+              backgroundColor: colorScheme.backgroundBase,
+              surfaceTintColor: Colors.transparent,
+              elevation: 0,
+              scrolledUnderElevation: 0,
+              foregroundColor: colorScheme.textBase,
+              automaticallyImplyLeading: false,
+              title: Row(
                 children: [
-                  if (_timelineUnavailable && _allFramesLoaded)
-                    Center(
+                  const SizedBox(
+                    width: _appBarSideWidth,
+                    height: kToolbarHeight,
+                    child: BackButton(),
+                  ),
+                  Expanded(
+                    child: Center(
                       child: Text(
-                        l10n.facesTimelineUnavailable,
-                        style: textTheme.body,
+                        title,
+                        style: titleStyle,
                         textAlign: TextAlign.center,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                       ),
-                    )
-                  else
-                    LayoutBuilder(
-                      builder: (context, constraints) {
-                        final viewPadding = MediaQuery.of(context).viewPadding;
-                        final double bottomInset = viewPadding.bottom;
-                        final double bottomPadding = math.max(12, bottomInset);
-                        const double topPadding = 12;
-                        final double gapToTop = _cardGap + topPadding;
-                        const double desiredGap = _controlsDesiredGapToCard;
-                        final double overlap =
-                            math.max(0, gapToTop - desiredGap);
-                        final double controlsHeight = _controlsHeight > 0
-                            ? _controlsHeight
-                            : _controlsHeightFallback;
-                        final double reservedHeight =
-                            topPadding + bottomPadding + controlsHeight;
-                        final Widget controlsContent = KeyedSubtree(
-                          key: _controlsKey,
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              _buildCaption(context),
-                              const SizedBox(height: 16),
-                              _buildControls(context),
-                            ],
-                          ),
-                        );
-                        _scheduleControlsHeightUpdate();
-                        return Stack(
-                          children: [
-                            Column(
-                              children: [
-                                Expanded(
-                                  child: Stack(
-                                    children: [
-                                      Positioned.fill(
-                                        child: ValueListenableBuilder<double>(
-                                          valueListenable:
-                                              _stackProgressNotifier,
-                                          builder: (context, stackProgress, _) {
-                                            return _buildFrameView(
-                                              context,
-                                              stackProgress,
-                                            );
-                                          },
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                                SizedBox(height: reservedHeight),
-                              ],
-                            ),
-                            Positioned(
-                              left: 24,
-                              right: 24,
-                              bottom: bottomPadding + overlap,
-                              child: controlsContent,
-                            ),
-                          ],
-                        );
-                      },
                     ),
+                  ),
+                  const SizedBox(width: _appBarSideWidth),
                 ],
               ),
+            ),
+            body: Stack(
+              children: [
+                if (_timelineUnavailable && _allFramesLoaded)
+                  Center(
+                    child: Text(
+                      l10n.facesTimelineUnavailable,
+                      style: textTheme.body,
+                      textAlign: TextAlign.center,
+                    ),
+                  )
+                else
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      final viewPadding = MediaQuery.of(context).viewPadding;
+                      final double bottomInset = viewPadding.bottom;
+                      final double bottomPadding = math.max(12, bottomInset);
+                      const double topPadding = 12;
+                      final double gapToTop = _cardGap + topPadding;
+                      const double desiredGap = _controlsDesiredGapToCard;
+                      final double overlap = math.max(0, gapToTop - desiredGap);
+                      final double controlsHeight = _controlsHeight > 0
+                          ? _controlsHeight
+                          : _controlsHeightFallback;
+                      final double reservedHeight =
+                          topPadding + bottomPadding + controlsHeight;
+                      final Widget controlsContent = KeyedSubtree(
+                        key: _controlsKey,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _buildControls(context),
+                          ],
+                        ),
+                      );
+                      _scheduleControlsHeightUpdate();
+                      return Stack(
+                        children: [
+                          Column(
+                            children: [
+                              Expanded(
+                                child: Stack(
+                                  children: [
+                                    Positioned.fill(
+                                      child: ValueListenableBuilder<double>(
+                                        valueListenable: _stackProgressNotifier,
+                                        builder: (context, stackProgress, _) {
+                                          return _buildFrameView(
+                                            context,
+                                            stackProgress,
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              SizedBox(height: reservedHeight),
+                            ],
+                          ),
+                          Positioned(
+                            left: 24,
+                            right: 24,
+                            bottom: bottomPadding + overlap,
+                            child: controlsContent,
+                          ),
+                        ],
+                      );
+                    },
+                  ),
+              ],
             ),
           );
         },
@@ -733,6 +692,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                       cardHeight: cardHeight,
                       cardWidth: cardWidth,
                       blurEnabled: !_isScrubbing,
+                      showDate: _showPhotoDate,
                     ),
                   ]
                 : orderedSlices
@@ -746,6 +706,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                         cardHeight: cardHeight,
                         cardWidth: cardWidth,
                         blurEnabled: !_isScrubbing,
+                        showDate: _showPhotoDate,
                       ),
                     )
                     .toList();
@@ -760,117 +721,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     );
   }
 
-  Widget _buildCaption(BuildContext context) {
-    final colorScheme = getEnteColorScheme(context);
-    final textTheme = getEnteTextTheme(context);
-    final l10n = context.l10n;
-    final isPlaying = _isPlaying;
-    final bool isDark = Theme.of(context).brightness == Brightness.dark;
-    final localeName = l10n.localeName;
-    final numberFormat = NumberFormat.decimalPattern(localeName);
-    final int currentRounded =
-        _currentCaptionValue.round().clamp(0, 1000).toInt();
-    final int previousRounded =
-        _previousCaptionValue.round().clamp(0, 1000).toInt();
-    final TextStyle baseStyle = textTheme.bodyMuted.copyWith(
-      color: isDark
-          ? colorScheme.textMuted
-          : colorScheme.textBase.withValues(alpha: 0.72),
-    );
-    final TextStyle numberStyle = textTheme.body.copyWith(
-      color: colorScheme.fillBase,
-      fontWeight: FontWeight.w600,
-    );
-    final int digits = math.max(3, _maxCaptionDigits);
-    final int slotSampleValue = _maxValueForDigits(digits);
-    final String sampleString = numberFormat.format(slotSampleValue);
-    final TextScaler textScaler = MediaQuery.textScalerOf(context);
-    final TextPainter samplePainter = TextPainter(
-      text: TextSpan(text: sampleString, style: numberStyle),
-      textDirection: ui.TextDirection.ltr,
-      textScaler: textScaler,
-      maxLines: 1,
-    )..layout();
-    final double slotWidth = samplePainter.width;
-    final double slotHeight = samplePainter.height;
-    final String formattedCurrent = numberFormat.format(currentRounded);
-    String fullText = l10n.facesTimelineCaptionYearsAgo(
-      count: currentRounded,
-    );
-    if (fullText.contains("#")) {
-      fullText = fullText.replaceAll("#", formattedCurrent);
-    }
-    final int insertionIndex = fullText.indexOf(formattedCurrent);
-    final InlineSpan captionSpan;
-    if (insertionIndex == -1) {
-      captionSpan = TextSpan(
-        text: fullText,
-        style: baseStyle,
-      );
-    } else {
-      final String prefix = fullText.substring(0, insertionIndex);
-      final String suffix = fullText.substring(
-        insertionIndex + formattedCurrent.length,
-      );
-      captionSpan = TextSpan(
-        children: [
-          TextSpan(text: prefix, style: baseStyle),
-          WidgetSpan(
-            alignment: PlaceholderAlignment.baseline,
-            baseline: TextBaseline.alphabetic,
-            child: SizedBox(
-              width: slotWidth,
-              height: slotHeight,
-              child: Center(
-                child: _RollingCounter(
-                  value: currentRounded,
-                  previousValue: previousRounded,
-                  textStyle: numberStyle,
-                  numberFormat: numberFormat,
-                ),
-              ),
-            ),
-          ),
-          TextSpan(text: suffix, style: baseStyle),
-        ],
-      );
-    }
-    return Center(
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Tooltip(
-            message: isPlaying
-                ? l10n.facesTimelinePlaybackPause
-                : l10n.facesTimelinePlaybackPlay,
-            child: IconButton(
-              onPressed: _frames.isEmpty ? null : _togglePlayback,
-              icon: Icon(
-                isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded,
-              ),
-              style: IconButton.styleFrom(
-                backgroundColor: colorScheme.fillFaint,
-                foregroundColor: isDark
-                    ? colorScheme.textMuted
-                    : colorScheme.textBase.withValues(alpha: 0.72),
-                minimumSize: const Size(40, 40),
-                padding: const EdgeInsets.all(8),
-                shape: const CircleBorder(),
-              ),
-            ),
-          ),
-          const SizedBox(width: 12),
-          Flexible(
-            child: RichText(
-              textAlign: TextAlign.center,
-              text: captionSpan,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildControls(BuildContext context) {
     final colorScheme = getEnteColorScheme(context);
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
@@ -880,10 +730,11 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         hasMultipleFrames ? (frameCount - 1).toDouble() : 0.0;
     final double sliderValue =
         hasMultipleFrames ? _sliderValue.clamp(0.0, maxValue) : 0.0;
-    const Color activeTrackColor = Colors.white;
+    final Color activeTrackColor = isDark ? Colors.white : colorScheme.fillBase;
     final Color inactiveTrackColor =
         (isDark ? colorScheme.fillBaseGrey : colorScheme.strokeMuted)
             .withValues(alpha: isDark ? 0.55 : 0.48);
+    final Color thumbColor = activeTrackColor;
     final bool sliderDiscrete = _allFramesLoaded && _expectedFrameCount > 1;
     final int? divisions =
         sliderDiscrete ? (_expectedFrameCount - 1) * 4 : null;
@@ -895,7 +746,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
             trackHeight: 4,
             activeTrackColor: activeTrackColor,
             inactiveTrackColor: inactiveTrackColor,
-            thumbColor: Colors.white,
+            thumbColor: thumbColor,
             overlayColor: Colors.transparent,
             trackShape: const RoundedRectSliderTrackShape(),
             thumbShape: const _MemoryLaneSliderThumbShape(),
@@ -922,9 +773,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                     setState(() {
                       _sliderValue = clamped;
                       _currentIndex = clamped.round().clamp(0, frameCount - 1);
-                      final frame = _frames[_currentIndex];
-                      _previousCaptionValue = _currentCaptionValue;
-                      _currentCaptionValue = frame.captionValue;
                       _isScrubbing = true;
                     });
                   }
@@ -946,28 +794,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         ),
       ],
     );
-  }
-
-  void _togglePlayback() {
-    if (_frames.isEmpty) {
-      return;
-    }
-    if (_isPlaying) {
-      _pausePlayback();
-    } else {
-      _resumeAutoPlay();
-    }
-  }
-
-  void _resumeAutoPlay() {
-    if (_frames.isEmpty) {
-      return;
-    }
-    final bool atEnd = _currentIndex >= _frames.length - 1;
-    if (atEnd) {
-      _jumpToIndex(0);
-    }
-    _startPlayback();
   }
 
   void _onCardAnimationTick() {
@@ -1003,9 +829,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     setState(() {
       _isAnimatingCard = false;
       _currentIndex = clampedIndex;
-      final frame = _frames[clampedIndex];
-      _previousCaptionValue = _currentCaptionValue;
-      _currentCaptionValue = frame.captionValue;
       _sliderValue = clampedIndex.toDouble();
     });
     _updateStackProgress(clampedIndex.toDouble());
@@ -1015,12 +838,10 @@ class _PhotosLanePageState extends State<PhotosLanePage>
 class _TimelineFrame {
   final MemoryImage? image;
   final DateTime creationDate;
-  final double captionValue;
 
   _TimelineFrame({
     required this.image,
     required this.creationDate,
-    required this.captionValue,
   });
 }
 
@@ -1036,6 +857,7 @@ class _CardSlice {
 
 class _MemoryLaneCard extends StatelessWidget {
   static const double _cardRadius = 28;
+  static const double _cardBorderWidth = 12;
   static const double _stackOffsetFalloff = 0.62;
   static const double _stackOffsetXFactor = 0.26;
   static const double _stackOffsetYFactor = 0.20;
@@ -1050,6 +872,7 @@ class _MemoryLaneCard extends StatelessWidget {
   final double cardHeight;
   final double cardWidth;
   final bool blurEnabled;
+  final bool showDate;
 
   const _MemoryLaneCard({
     required this.frame,
@@ -1059,6 +882,7 @@ class _MemoryLaneCard extends StatelessWidget {
     required this.cardHeight,
     required this.cardWidth,
     required this.blurEnabled,
+    required this.showDate,
     super.key,
   });
 
@@ -1070,88 +894,86 @@ class _MemoryLaneCard extends StatelessWidget {
     final opacity = _calculateOpacity(distance);
     final blurSigma = blurEnabled ? _calculateBlur(distance) : 0.0;
     final rotation = _calculateRotation(distance);
-    final overlayOpacity = _calculateOverlayOpacity(distance);
 
     final cardShadow = _shadowForCard(distance);
-    // Emphasize the active card by delaying the date reveal until the card is
-    // nearly centered; keeps background cards calm while the primary one lifts.
-    final double emphasisDistance = distance.abs();
-    final double activation =
-        (1 - (emphasisDistance * 1.8)).clamp(0.0, 1.0); // hide until near front
-    final double emphasis = Curves.easeOutQuad.transform(activation);
-    final double dateOpacity = emphasis;
-    final double gradientAlpha = 0.6 * emphasis;
-    final double textShadowAlpha = 0.5 * emphasis;
-    final double dateYOffset = ui.lerpDouble(28, 0, emphasis) ?? 0;
-    final double dateScale = ui.lerpDouble(0.94, 1, emphasis) ?? 1;
-    final String localeTag = Localizations.localeOf(context).toLanguageTag();
-    final String formattedDate = DateFormat(
-      "d MMM yyyy",
-      localeTag,
-    ).format(frame.creationDate.toLocal());
-    final textTheme = getEnteTextTheme(context);
+    double dateOpacity = 0;
+    double textShadowAlpha = 0;
+    double dateYOffset = 0;
+    double dateScale = 1;
+    String? formattedDate;
+    TextStyle? dateTextStyle;
+    if (showDate) {
+      // Emphasize the active card by delaying the date reveal until the card is
+      // nearly centered; keeps background cards calm while the primary one lifts.
+      final double emphasisDistance = distance.abs();
+      final double activation = (1 - (emphasisDistance * 1.8)).clamp(0.0, 1.0);
+      final double emphasis = Curves.easeOutQuad.transform(activation);
+      dateOpacity = emphasis;
+      textShadowAlpha = 0.5 * emphasis;
+      dateYOffset = ui.lerpDouble(28, 0, emphasis) ?? 0;
+      dateScale = ui.lerpDouble(0.94, 1, emphasis) ?? 1;
+      final String localeTag = Localizations.localeOf(context).toLanguageTag();
+      formattedDate = DateFormat(
+        "d MMM yyyy",
+        localeTag,
+      ).format(frame.creationDate.toLocal());
+      final textTheme = getEnteTextTheme(context);
+      dateTextStyle = textTheme.smallMuted.copyWith(
+        shadows: [
+          Shadow(
+            color: Colors.black.withValues(alpha: textShadowAlpha),
+            blurRadius: 12,
+          ),
+        ],
+      );
+    }
 
-    final cardContent = ClipRRect(
-      borderRadius: BorderRadius.circular(_cardRadius),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          _buildImage(blurSigma),
-          if (overlayOpacity > 0)
-            Container(
-              color:
-                  colorScheme.backgroundBase.withValues(alpha: overlayOpacity),
-            ),
-          if (frame.image == null)
-            Center(
-              child: Icon(
-                Icons.photo_outlined,
-                size: 72,
-                color: colorScheme.strokeMuted,
+    final cardContent = DecoratedBox(
+      position: DecorationPosition.foreground,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(_cardRadius),
+        border: Border.all(
+          color: Colors.white,
+          width: _cardBorderWidth,
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(_cardRadius),
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            _buildImage(blurSigma),
+            if (frame.image == null)
+              Center(
+                child: Icon(
+                  Icons.photo_outlined,
+                  size: 72,
+                  color: colorScheme.strokeMuted,
+                ),
               ),
-            ),
-          Align(
-            alignment: Alignment.bottomCenter,
-            child: Opacity(
-              opacity: dateOpacity,
-              child: Transform.translate(
-                offset: Offset(0, dateYOffset),
-                child: Transform.scale(
-                  scale: dateScale,
-                  child: Container(
-                    width: double.infinity,
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        begin: Alignment.bottomCenter,
-                        end: Alignment.topCenter,
-                        colors: [
-                          colorScheme.backgroundBase.withValues(
-                            alpha: gradientAlpha,
-                          ),
-                          colorScheme.backgroundBase.withValues(alpha: 0.0),
-                        ],
-                      ),
-                    ),
-                    padding: const EdgeInsets.fromLTRB(20, 36, 20, 20),
-                    child: Text(
-                      formattedDate,
-                      textAlign: TextAlign.center,
-                      style: textTheme.smallMuted.copyWith(
-                        shadows: [
-                          Shadow(
-                            color:
-                                Colors.black.withValues(alpha: textShadowAlpha),
-                            blurRadius: 12,
-                          ),
-                        ],
+            if (showDate && formattedDate != null && dateTextStyle != null)
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: Opacity(
+                  opacity: dateOpacity,
+                  child: Transform.translate(
+                    offset: Offset(0, dateYOffset),
+                    child: Transform.scale(
+                      scale: dateScale,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(20, 36, 20, 20),
+                        child: Text(
+                          formattedDate,
+                          textAlign: TextAlign.center,
+                          style: dateTextStyle,
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
 
@@ -1206,25 +1028,65 @@ class _MemoryLaneCard extends StatelessWidget {
   }
 
   List<BoxShadow> _shadowForCard(double distance) {
-    final double baseOpacity = isDarkMode ? 0.55 : 0.3;
-    if (distance > 0) {
+    if (isDarkMode) {
+      const double baseOpacity = 0.55;
+      if (distance > 0) {
+        return [
+          BoxShadow(
+            color: Colors.black.withValues(
+              alpha: math.max(0.0, baseOpacity - distance * 0.12),
+            ),
+            blurRadius: 38,
+            offset: const Offset(0, 26),
+            spreadRadius: -6,
+          ),
+        ];
+      }
+      final dampening = math.max(0.2, 1 - distance.abs() * 0.25);
       return [
         BoxShadow(
-          color: Colors.black
-              .withValues(alpha: math.max(0.0, baseOpacity - distance * 0.12)),
-          blurRadius: 38,
-          offset: const Offset(0, 26),
-          spreadRadius: -6,
+          color: Colors.black.withValues(alpha: baseOpacity * dampening),
+          blurRadius: 34,
+          offset: const Offset(0, 24),
+          spreadRadius: -12,
         ),
       ];
     }
-    final dampening = math.max(0.2, 1 - distance.abs() * 0.25);
+
+    final double dampening = math.max(0.2, 1 - distance.abs() * 0.2);
+    if (distance > 0) {
+      final double primaryAlpha = math.max(0.0, 0.26 - distance * 0.08);
+      final double secondaryAlpha = math.max(0.0, 0.12 - distance * 0.04);
+      return [
+        BoxShadow(
+          color: Colors.black.withValues(alpha: primaryAlpha),
+          blurRadius: 46,
+          offset: const Offset(0, 30),
+          spreadRadius: -10,
+        ),
+        BoxShadow(
+          color: Colors.black.withValues(alpha: secondaryAlpha),
+          blurRadius: 14,
+          offset: const Offset(0, 10),
+          spreadRadius: 0,
+        ),
+      ];
+    }
+
+    final double primaryAlpha = 0.26 * dampening;
+    final double secondaryAlpha = 0.12 * dampening;
     return [
       BoxShadow(
-        color: Colors.black.withValues(alpha: baseOpacity * dampening),
-        blurRadius: 34,
-        offset: const Offset(0, 24),
-        spreadRadius: -12,
+        color: Colors.black.withValues(alpha: primaryAlpha),
+        blurRadius: 48,
+        offset: const Offset(0, 32),
+        spreadRadius: -10,
+      ),
+      BoxShadow(
+        color: Colors.black.withValues(alpha: secondaryAlpha),
+        blurRadius: 16,
+        offset: const Offset(0, 10),
+        spreadRadius: 0,
       ),
     ];
   }
@@ -1289,23 +1151,6 @@ class _MemoryLaneCard extends StatelessWidget {
     }
     return math.pow(_opacityBase, d).toDouble().clamp(0.0, 1.0);
   }
-
-  double _calculateOverlayOpacity(double distance) {
-    final double d = distance.abs();
-    if (d <= 0) {
-      return 0;
-    }
-    const double overlayMax = 0.32;
-    const double reachDistance = 2.4;
-    final double normalized = (d / reachDistance).clamp(0.0, 1.0);
-    final double eased = Curves.easeOutCubic.transform(normalized);
-    return overlayMax * eased;
-  }
-}
-
-double _yearsBetween(DateTime start, DateTime end) {
-  final days = end.difference(start).inDays;
-  return days / 365.25;
 }
 
 class _MemoryLaneSliderThumbShape extends SliderComponentShape {
@@ -1342,80 +1187,4 @@ class _MemoryLaneSliderThumbShape extends SliderComponentShape {
     final paint = Paint()..color = color;
     canvas.drawCircle(center, _thumbRadius, paint);
   }
-}
-
-class _RollingCounter extends StatelessWidget {
-  const _RollingCounter({
-    required this.value,
-    required this.previousValue,
-    required this.textStyle,
-    required this.numberFormat,
-  });
-
-  final int value;
-  final int previousValue;
-  final TextStyle textStyle;
-  final NumberFormat numberFormat;
-
-  @override
-  Widget build(BuildContext context) {
-    final ValueKey<int> currentKey = ValueKey<int>(value);
-    final double direction = value >= previousValue ? 1.0 : -1.0;
-    return AnimatedSwitcher(
-      duration: const Duration(milliseconds: 320),
-      switchInCurve: Curves.easeOutCubic,
-      switchOutCurve: Curves.easeInCubic,
-      layoutBuilder: (currentChild, previousChildren) => Stack(
-        alignment: Alignment.center,
-        children: [
-          ...previousChildren,
-          if (currentChild != null) currentChild,
-        ],
-      ),
-      transitionBuilder: (child, animation) {
-        final bool isCurrent = child.key == currentKey;
-        final Animation<double> curved = CurvedAnimation(
-          parent: animation,
-          curve: isCurrent ? Curves.easeOutCubic : Curves.easeInCubic,
-        );
-        return AnimatedBuilder(
-          animation: curved,
-          child: child,
-          builder: (context, child) {
-            if (child == null) {
-              return const SizedBox.shrink();
-            }
-            final double progress = isCurrent ? curved.value : 1 - curved.value;
-            final double offsetY =
-                isCurrent ? direction * (1 - progress) : -direction * progress;
-            return ClipRect(
-              child: FractionalTranslation(
-                translation: Offset(0, offsetY),
-                child: child,
-              ),
-            );
-          },
-        );
-      },
-      child: Align(
-        key: currentKey,
-        alignment: Alignment.center,
-        child: Text(
-          numberFormat.format(value),
-          style: textStyle,
-        ),
-      ),
-    );
-  }
-}
-
-int _maxValueForDigits(int digits) {
-  if (digits <= 0) {
-    return 0;
-  }
-  int value = 0;
-  for (int i = 0; i < digits; i++) {
-    value = (value * 10) + 9;
-  }
-  return value;
 }
