@@ -496,7 +496,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     if (!_featureEnabled) {
       return _wrapGuestViewPopScope(
         Theme(
-          data: lightThemeData,
+          data: darkThemeData,
           child: Builder(
             builder: (context) {
               final l10n = context.l10n;
@@ -528,7 +528,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       );
     }
     final Widget content = Theme(
-      data: lightThemeData,
+      data: darkThemeData,
       child: Builder(
         builder: (context) {
           final l10n = context.l10n;
