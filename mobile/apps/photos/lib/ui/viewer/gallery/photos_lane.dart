@@ -735,9 +735,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
         (isDark ? colorScheme.fillBaseGrey : colorScheme.strokeMuted)
             .withValues(alpha: isDark ? 0.55 : 0.48);
     final Color thumbColor = activeTrackColor;
-    final bool sliderDiscrete = _allFramesLoaded && _expectedFrameCount > 1;
-    final int? divisions =
-        sliderDiscrete ? (_expectedFrameCount - 1) * 4 : null;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -755,7 +752,6 @@ class _PhotosLanePageState extends State<PhotosLanePage>
             value: sliderValue.toDouble(),
             min: 0.0,
             max: frameCount > 1 ? maxValue : 0.0,
-            divisions: divisions,
             onChangeStart: frameCount > 1
                 ? (value) {
                     _pausePlayback();
