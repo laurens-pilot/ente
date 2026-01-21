@@ -46,6 +46,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   static const int _frameBuildConcurrency = 6;
   static const double _appBarSideWidth = kToolbarHeight;
   static const bool _showPhotoDate = false;
+  static const double _dragProgressPerCardWidth = 1.0;
+  static const double _swipeVelocityThreshold = 900;
 
   final Logger _logger = Logger("PhotosLanePage");
   late final AnimationController _cardTransitionController;
@@ -71,6 +73,8 @@ class _PhotosLanePageState extends State<PhotosLanePage>
   final GlobalKey _controlsKey = GlobalKey();
   bool _isScrubbing = false;
   double _sliderValue = 0;
+  double? _dragStartProgress;
+  double _dragDistance = 0;
   late bool _isGuestView;
   bool get _featureEnabled => flagService.facesTimeline;
 
@@ -385,6 +389,7 @@ class _PhotosLanePageState extends State<PhotosLanePage>
       setState(() {
         _sliderValue = targetProgress;
       });
+      _updateStackProgress(targetProgress);
       return;
     }
 
@@ -407,6 +412,83 @@ class _PhotosLanePageState extends State<PhotosLanePage>
     setState(() {
       _sliderValue = targetProgress;
     });
+  }
+
+  void _handleCardDragStart(DragStartDetails details) {
+    if (_frames.length <= 1) {
+      return;
+    }
+    _pausePlayback();
+    _isAnimatingCard = false;
+    _cardTransitionController.stop();
+    _dragStartProgress = _stackProgress;
+    _dragDistance = 0;
+    setState(() {
+      _isScrubbing = true;
+    });
+  }
+
+  void _handleCardDragUpdate(
+    DragUpdateDetails details,
+    double cardWidth,
+  ) {
+    if (_frames.length <= 1) {
+      return;
+    }
+    final start = _dragStartProgress;
+    if (start == null) {
+      return;
+    }
+    _dragDistance += details.delta.dx;
+    final double effectiveWidth = math.max(1, cardWidth);
+    final double deltaProgress =
+        -(_dragDistance / effectiveWidth) * _dragProgressPerCardWidth;
+    final double nextProgress = (start + deltaProgress).clamp(
+      0.0,
+      (_frames.length - 1).toDouble(),
+    );
+    _updateStackProgress(nextProgress);
+    setState(() {
+      _sliderValue = nextProgress;
+      _currentIndex = nextProgress.round().clamp(0, _frames.length - 1);
+      _isScrubbing = true;
+    });
+  }
+
+  void _handleCardDragEnd(DragEndDetails details) {
+    if (_frames.length <= 1) {
+      return;
+    }
+    final int maxIndex = _frames.length - 1;
+    int targetIndex = _stackProgress.round().clamp(0, maxIndex);
+    final double velocity = details.primaryVelocity ?? 0;
+    if (velocity.abs() >= _swipeVelocityThreshold) {
+      if (velocity < 0) {
+        targetIndex = math.min(maxIndex, targetIndex + 1);
+      } else {
+        targetIndex = math.max(0, targetIndex - 1);
+      }
+    }
+    _dragStartProgress = null;
+    _dragDistance = 0;
+    setState(() {
+      _isScrubbing = false;
+    });
+    _animateToIndex(targetIndex);
+  }
+
+  void _handleCardDragCancel() {
+    if (_frames.length <= 1) {
+      return;
+    }
+    final int maxIndex = _frames.length - 1;
+    final int targetIndex = _stackProgress.round().clamp(0, maxIndex);
+    _dragStartProgress = null;
+    _dragDistance = 0;
+    setState(() {
+      _isScrubbing = false;
+    });
+    _animateToIndex(targetIndex);
   }
 
   @override
@@ -710,10 +792,25 @@ class _PhotosLanePageState extends State<PhotosLanePage>
                       ),
                     )
                     .toList();
-            return Stack(
-              clipBehavior: Clip.none,
-              alignment: Alignment.center,
-              children: children,
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragStart:
+                  _frames.length > 1 ? _handleCardDragStart : null,
+              onHorizontalDragUpdate: _frames.length > 1
+                  ? (details) => _handleCardDragUpdate(
+                        details,
+                        cardWidth,
+                      )
+                  : null,
+              onHorizontalDragEnd:
+                  _frames.length > 1 ? _handleCardDragEnd : null,
+              onHorizontalDragCancel:
+                  _frames.length > 1 ? _handleCardDragCancel : null,
+              child: Stack(
+                clipBehavior: Clip.none,
+                alignment: Alignment.center,
+                children: children,
+              ),
             );
           },
         ),
