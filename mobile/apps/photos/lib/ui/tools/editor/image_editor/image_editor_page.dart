@@ -4,10 +4,12 @@ import "dart:math";
 import 'dart:ui' as ui show Image;
 
 import "package:ente_pure_utils/ente_pure_utils.dart";
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import "package:flutter/services.dart";
 import "package:flutter_image_compress/flutter_image_compress.dart";
 import "package:flutter_svg/svg.dart";
+import 'package:image/image.dart' as img;
 import "package:logging/logging.dart";
 import 'package:path/path.dart' as path;
 import "package:photo_manager/photo_manager.dart";
@@ -67,12 +69,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     debugPrint("Image saved with size: ${bytes.length} bytes");
     final DateTime start = DateTime.now();
 
-    final ui.Image decodedResult = await decodeImageFromList(bytes);
-    final result = await FlutterImageCompress.compressWithList(
-      bytes,
-      minWidth: decodedResult.width,
-      minHeight: decodedResult.height,
-    );
+    final Uint8List result = await _encodeEditedImage(bytes);
     _logger.info('Size after compression = ${result.length}');
     final Duration diff = DateTime.now().difference(start);
     _logger.info('image_editor time : $diff');
@@ -141,6 +138,28 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     }
   }
 
+  Future<Uint8List> _encodeEditedImage(Uint8List bytes) async {
+    if (Platform.isAndroid && _isPng(bytes)) {
+      final Uint8List processed = await compute(
+        _normalizeAlphaAndEncodeJpeg,
+        <String, Object>{
+          "pngBytes": bytes,
+          "jpegBackgroundColor": _jpegBackgroundColor.toARGB32(),
+        },
+      );
+      if (processed.isNotEmpty) {
+        return processed;
+      }
+    }
+
+    final ui.Image decodedResult = await decodeImageFromList(bytes);
+    return FlutterImageCompress.compressWithList(
+      bytes,
+      minWidth: decodedResult.width,
+      minHeight: decodedResult.height,
+    );
+  }
+
   Future<void> _showExitConfirmationDialog(BuildContext context) async {
     final actionResult = await showActionSheet(
       context: context,
@@ -205,10 +224,14 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
             ),
           ),
           configs: ProImageEditorConfigs(
-            imageGeneration: const ImageGenerationConfigs(
+            imageGeneration: ImageGenerationConfigs(
               jpegQuality: 100,
               enableIsolateGeneration: true,
               pngLevel: 0,
+              jpegBackgroundColor: _jpegBackgroundColor,
+              // PNG keeps alpha so we can fix edge artifacts before JPEG save.
+              outputFormat:
+                  Platform.isAndroid ? OutputFormat.png : OutputFormat.jpg,
             ),
             layerInteraction: const LayerInteractionConfigs(
               hideToolbarOnInteraction: false,
@@ -585,3 +608,71 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     );
   }
 }
+
+bool _isPng(Uint8List bytes) {
+  if (bytes.length < 8) return false;
+  return bytes[0] == 0x89 &&
+      bytes[1] == 0x50 &&
+      bytes[2] == 0x4e &&
+      bytes[3] == 0x47 &&
+      bytes[4] == 0x0d &&
+      bytes[5] == 0x0a &&
+      bytes[6] == 0x1a &&
+      bytes[7] == 0x0a;
+}
+
+@pragma('vm:entry-point')
+Uint8List _normalizeAlphaAndEncodeJpeg(Map<String, Object> args) {
+  final Uint8List pngBytes = args["pngBytes"]! as Uint8List;
+  final int jpegBackgroundColor = args["jpegBackgroundColor"]! as int;
+  final img.Image? image = img.decodePng(pngBytes);
+  if (image == null) {
+    return Uint8List(0);
+  }
+
+  // Flatten premultiplied edge alpha and composite against the JPEG background.
+  if (image.hasAlpha) {
+    final double maxChannelValue = image.maxChannelValue.toDouble();
+    final double backgroundScale = maxChannelValue / 255.0;
+    final double backgroundRed =
+        ((jpegBackgroundColor >> 16) & 0xFF) * backgroundScale;
+    final double backgroundGreen =
+        ((jpegBackgroundColor >> 8) & 0xFF) * backgroundScale;
+    final double backgroundBlue =
+        (jpegBackgroundColor & 0xFF) * backgroundScale;
+    for (final pixel in image) {
+      final double alpha = pixel.a.toDouble();
+      if (alpha < maxChannelValue) {
+        double red = pixel.r.toDouble();
+        double green = pixel.g.toDouble();
+        double blue = pixel.b.toDouble();
+        if (alpha > 0) {
+          final double scale = maxChannelValue / alpha;
+          red = (red * scale).clamp(0, maxChannelValue);
+          green = (green * scale).clamp(0, maxChannelValue);
+          blue = (blue * scale).clamp(0, maxChannelValue);
+        } else {
+          red = 0;
+          green = 0;
+          blue = 0;
+        }
+
+        final double inverseAlpha = maxChannelValue - alpha;
+        pixel
+          ..r = ((red * alpha + backgroundRed * inverseAlpha) / maxChannelValue)
+              .round()
+          ..g = ((green * alpha + backgroundGreen * inverseAlpha) /
+                  maxChannelValue)
+              .round()
+          ..b =
+              ((blue * alpha + backgroundBlue * inverseAlpha) / maxChannelValue)
+                  .round()
+          ..a = maxChannelValue;
+      }
+    }
+  }
+
+  return Uint8List.fromList(img.encodeJpg(image, quality: 95));
+}
+
+const _jpegBackgroundColor = Color(0xFFFFFFFF);
