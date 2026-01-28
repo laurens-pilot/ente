@@ -394,6 +394,14 @@ class _ZoomableImageState extends State<ZoomableImage> {
   }
 
   void _onFileLoaded(File file) {
+    if (Platform.isAndroid && !_convertToSupportedFormat && _isHeifFile(file)) {
+      _logger.info(
+        "Android HEIF/HEIC detected for ${_photo.displayName}, converting to sRGB JPEG for display",
+      );
+      unawaited(_loadInSupportedFormat(file, "Android HEIF/HEIC conversion"));
+      return;
+    }
+
     ImageProvider imageProvider;
     if (isTooLargeImage) {
       _logger.info(
@@ -478,6 +486,10 @@ class _ZoomableImageState extends State<ZoomableImage> {
   }
 
   bool _isGIF() => _photo.displayName.toLowerCase().endsWith(".gif");
+
+  bool _isHeifFile(File file) {
+    return isHeifFileName(file.path) || isHeifFileName(_photo.displayName);
+  }
 
   bool _isRawFile() {
     final extension = _photo.displayName.toLowerCase().split('.').last;

@@ -345,6 +345,11 @@ String getExtension(String nameOrPath) {
   return fileExtension;
 }
 
+bool isHeifFileName(String nameOrPath) {
+  final extension = getExtension(nameOrPath);
+  return extension == "heic" || extension == "heif";
+}
+
 Future<Uint8List> compressThumbnail(Uint8List thumbnail) {
   return FlutterImageCompress.compressWithList(
     thumbnail,
