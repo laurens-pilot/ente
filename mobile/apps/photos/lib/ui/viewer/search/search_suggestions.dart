@@ -1,6 +1,7 @@
 import "dart:async";
 
 import "package:ente_pure_utils/ente_pure_utils.dart";
+import "package:flutter/foundation.dart" show kDebugMode;
 import 'package:flutter/material.dart';
 import "package:flutter_animate/flutter_animate.dart";
 import "package:hugeicons/hugeicons.dart";
@@ -10,6 +11,7 @@ import "package:photos/models/search/album_search_result.dart";
 import "package:photos/models/search/device_album_search_result.dart";
 import "package:photos/models/search/generic_search_result.dart";
 import "package:photos/models/search/index_of_indexed_stack.dart";
+import "package:photos/models/search/search_constants.dart";
 import 'package:photos/models/search/search_result.dart';
 import "package:photos/models/search/search_types.dart";
 import "package:photos/services/collections_service.dart";
@@ -191,6 +193,7 @@ class _SearchSuggestionsWidgetState extends State<SearchSuggestionsWidget> {
       }
       widgets.add(
         _SearchResultsSectionWidget(
+          section: section,
           title: _sectionTitle(context, section),
           icon: _sectionIcon(section),
           results: results,
@@ -264,6 +267,7 @@ enum _SearchResultsSection {
   shared,
   albums,
   magic,
+  visual,
   files,
   locations,
   moments,
@@ -277,6 +281,7 @@ const List<_SearchResultsSection> _sectionOrder = [
   _SearchResultsSection.people,
   _SearchResultsSection.shared,
   _SearchResultsSection.magic,
+  _SearchResultsSection.visual,
 ];
 
 _SearchResultsSection _sectionForResult(SearchResult result) {
@@ -290,6 +295,8 @@ _SearchResultsSection _sectionForResult(SearchResult result) {
       return _SearchResultsSection.albums;
     case ResultType.magic:
       return _SearchResultsSection.magic;
+    case ResultType.visual:
+      return _SearchResultsSection.visual;
     case ResultType.location:
     case ResultType.locationSuggestion:
       return _SearchResultsSection.locations;
@@ -318,6 +325,8 @@ String _sectionTitle(BuildContext context, _SearchResultsSection section) {
       return AppLocalizations.of(context).albums;
     case _SearchResultsSection.magic:
       return AppLocalizations.of(context).magic;
+    case _SearchResultsSection.visual:
+      return AppLocalizations.of(context).visual;
     case _SearchResultsSection.files:
       return AppLocalizations.of(context).files;
     case _SearchResultsSection.locations:
@@ -337,6 +346,8 @@ List<List<dynamic>> _sectionIcon(_SearchResultsSection section) {
       return HugeIcons.strokeRoundedImage01;
     case _SearchResultsSection.magic:
       return HugeIcons.strokeRoundedSparkles;
+    case _SearchResultsSection.visual:
+      return HugeIcons.strokeRoundedImage01;
     case _SearchResultsSection.files:
       return HugeIcons.strokeRoundedFile01;
     case _SearchResultsSection.locations:
@@ -347,11 +358,13 @@ List<List<dynamic>> _sectionIcon(_SearchResultsSection section) {
 }
 
 class _SearchResultsSectionWidget extends StatelessWidget {
+  final _SearchResultsSection section;
   final String title;
   final List<List<dynamic>> icon;
   final List<SearchResult> results;
 
   const _SearchResultsSectionWidget({
+    required this.section,
     required this.title,
     required this.icon,
     required this.results,
@@ -362,6 +375,8 @@ class _SearchResultsSectionWidget extends StatelessWidget {
     final colorScheme = getEnteColorScheme(context);
     final textTheme = getEnteTextTheme(context);
     final showTypeLabel = results.length > 1;
+    final rawFunctionGemmaToolCall =
+        _firstFunctionGemmaRawToolCallOutput(results);
     final children = <Widget>[];
     for (int i = 0; i < results.length; i++) {
       final radius = BorderRadius.circular(20);
@@ -409,11 +424,57 @@ class _SearchResultsSectionWidget extends StatelessWidget {
                 title,
                 style: textTheme.bodyBold,
               ),
+              const Spacer(),
+              if (kDebugMode &&
+                  rawFunctionGemmaToolCall != null &&
+                  section == _SearchResultsSection.magic)
+                IconButton(
+                  visualDensity:
+                      const VisualDensity(horizontal: -2, vertical: -2),
+                  icon: Icon(
+                    Icons.info_outline,
+                    color: colorScheme.strokeBase,
+                    size: 18,
+                  ),
+                  onPressed: () async {
+                    await showDialog<void>(
+                      context: context,
+                      builder: (context) {
+                        return AlertDialog(
+                          title: const Text("FunctionGemma Tool Call"),
+                          content: SingleChildScrollView(
+                            child: SelectableText(rawFunctionGemmaToolCall),
+                          ),
+                          actions: [
+                            TextButton(
+                              onPressed: () => Navigator.of(context).pop(),
+                              child: const Text("Close"),
+                            ),
+                          ],
+                        );
+                      },
+                    );
+                  },
+                ),
             ],
           ),
         ),
         Column(children: children),
       ],
     );
+  }
+
+  String? _firstFunctionGemmaRawToolCallOutput(List<SearchResult> results) {
+    for (final result in results) {
+      if (result is! GenericSearchResult) {
+        continue;
+      }
+      final toolCallOutput =
+          result.params[kFunctionGemmaRawToolCallOutput] as String?;
+      if (toolCallOutput != null && toolCallOutput.trim().isNotEmpty) {
+        return toolCallOutput;
+      }
+    }
+    return null;
   }
 }

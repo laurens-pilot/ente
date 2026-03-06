@@ -17,6 +17,7 @@ import "package:photos/models/location_tag/location_tag.dart";
 import "package:photos/models/search/generic_search_result.dart";
 import "package:photos/models/search/hierarchical/hierarchical_search_filter.dart";
 import "package:photos/models/search/hierarchical/top_level_generic_filter.dart";
+import "package:photos/models/search/search_constants.dart";
 import "package:photos/models/search/search_types.dart";
 import "package:photos/service_locator.dart";
 import "package:photos/services/account/user_service.dart";
@@ -132,11 +133,13 @@ class NaturalSearchService {
   Future<NaturalSearchExecutionResult> executeParsedCall({
     required String originalQuery,
     required NaturalSearchParsedToolCall parsedToolCall,
+    String? rawFunctionGemmaToolCallOutput,
   }) {
     return executeToolArguments(
       originalQuery: originalQuery,
       toolArguments: parsedToolCall.arguments,
       parserWarnings: parsedToolCall.warnings,
+      rawFunctionGemmaToolCallOutput: rawFunctionGemmaToolCallOutput,
     );
   }
 
@@ -144,6 +147,7 @@ class NaturalSearchService {
     required String originalQuery,
     required Map<String, dynamic> toolArguments,
     List<String> parserWarnings = const [],
+    String? rawFunctionGemmaToolCallOutput,
   }) async {
     final normalizationResult = _normalizeArguments(toolArguments);
     final normalizedArguments = normalizationResult.arguments;
@@ -444,6 +448,10 @@ class NaturalSearchService {
       filterResultType: ResultType.file,
       matchedUploadedIDs: filesToUploadedFileIDs(workingFiles),
     );
+    final searchResultParams = <String, dynamic>{
+      if (rawFunctionGemmaToolCallOutput != null)
+        kFunctionGemmaRawToolCallOutput: rawFunctionGemmaToolCallOutput,
+    };
 
     return NaturalSearchExecutionResult(
       originalQuery: originalQuery,
@@ -452,10 +460,12 @@ class NaturalSearchService {
       files: workingFiles,
       warnings: warnings,
       initialFilter: executionFilter,
+      rawFunctionGemmaToolCallOutput: rawFunctionGemmaToolCallOutput,
       searchResult: GenericSearchResult(
-        ResultType.file,
+        ResultType.magic,
         originalQuery,
         workingFiles,
+        params: searchResultParams,
         hierarchicalSearchFilter: executionFilter,
       ),
     );
@@ -470,12 +480,16 @@ class NaturalSearchService {
       toolSchemaRaw: modelInput.toolSchemaRaw,
       userQuery: modelInput.userQuery,
     );
-    final normalizedToolCallJson = await MLComputer.instance
-        .runFunctionGemmaNaturalSearch(promptPayloadJson);
-    final parsedToolCall = parseModelOutput(normalizedToolCallJson);
+    final inferenceResult =
+        await MLComputer.instance.runFunctionGemmaNaturalSearch(
+      promptPayloadJson,
+    );
+    final parsedToolCall =
+        parseModelOutput(inferenceResult.normalizedToolCallJson);
     return executeParsedCall(
       originalQuery: modelInput.userQuery,
       parsedToolCall: parsedToolCall,
+      rawFunctionGemmaToolCallOutput: inferenceResult.rawOutput,
     );
   }
 
@@ -1723,6 +1737,7 @@ class NaturalSearchExecutionResult {
   final List<EnteFile> files;
   final List<String> warnings;
   final HierarchicalSearchFilter initialFilter;
+  final String? rawFunctionGemmaToolCallOutput;
   final GenericSearchResult searchResult;
 
   NaturalSearchExecutionResult({
@@ -1732,6 +1747,7 @@ class NaturalSearchExecutionResult {
     required this.files,
     required this.warnings,
     required this.initialFilter,
+    this.rawFunctionGemmaToolCallOutput,
     required this.searchResult,
   });
 }

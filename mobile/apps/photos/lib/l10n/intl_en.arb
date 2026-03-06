@@ -502,6 +502,7 @@
   "mlConsentConfirmation": "I understand, and wish to enable machine learning",
   "magicSearch": "Magic search",
   "magic": "Magic",
+  "visual": "Visual",
   "@magic": {
     "description": "Section header for magic search results"
   },

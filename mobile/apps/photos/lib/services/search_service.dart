@@ -1440,7 +1440,7 @@ class SearchService {
     return searchResults;
   }
 
-  Future<List<GenericSearchResult>> getMagicSearchResults(
+  Future<List<GenericSearchResult>> getVisualSearchResults(
     BuildContext context,
     String query,
   ) async {
@@ -1457,7 +1457,7 @@ class SearchService {
     if (files.isNotEmpty && resultForQuery == query) {
       searchResults.add(
         GenericSearchResult(
-          ResultType.magic,
+          ResultType.visual,
           query,
           files,
           onResultTap: (context) {
@@ -1468,7 +1468,7 @@ class SearchService {
                 name: query,
                 enableGrouping: false,
                 heroTag: GenericSearchResult(
-                  ResultType.magic,
+                  ResultType.visual,
                   query,
                   files,
                   hierarchicalSearchFilter: MagicFilter(

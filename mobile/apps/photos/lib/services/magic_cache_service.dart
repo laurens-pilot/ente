@@ -148,7 +148,7 @@ GenericSearchResult? toGenericSearchResult(
   }
   final String title = getLocalizedTitle(context, prompt.title);
   return GenericSearchResult(
-    ResultType.magic,
+    ResultType.visual,
     title,
     enteFilesInMagicCache,
     params: {
@@ -164,7 +164,7 @@ GenericSearchResult? toGenericSearchResult(
           enableGrouping: prompt.recentFirst,
           fileIdToPosMap: fileIdToPositionMap,
           heroTag: GenericSearchResult(
-            ResultType.magic,
+            ResultType.visual,
             title,
             enteFilesInMagicCache,
             hierarchicalSearchFilter: MagicFilter(

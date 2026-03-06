@@ -188,7 +188,9 @@ class MLComputer extends SuperIsolate {
     });
   }
 
-  Future<String> runFunctionGemmaNaturalSearch(String promptPayloadJson) async {
+  Future<FunctionGemmaInferenceResult> runFunctionGemmaNaturalSearch(
+    String promptPayloadJson,
+  ) async {
     try {
       await _ensureLoadedFunctionGemmaModel();
       final modelPath = _functionGemmaModelPath;
@@ -197,14 +199,17 @@ class MLComputer extends SuperIsolate {
           "RustMLMissingModelPath: Missing required model path: functionGemmaModelPath",
         );
       }
-      final normalizedToolCallJson = await runInIsolate(
+      final result = await runInIsolate(
         IsolateOperation.runFunctionGemmaNaturalSearch,
         {
           "promptPayloadJson": promptPayloadJson,
           "modelPath": modelPath,
         },
-      ) as String;
-      return normalizedToolCallJson;
+      ) as Map<String, dynamic>;
+      return FunctionGemmaInferenceResult(
+        rawOutput: result["rawOutput"] as String,
+        normalizedToolCallJson: result["normalizedToolCallJson"] as String,
+      );
     } catch (e, s) {
       _logger.severe("Could not run FunctionGemma natural search", e, s);
       rethrow;
@@ -285,4 +290,14 @@ class MLComputer extends SuperIsolate {
       rethrow;
     }
   }
+}
+
+class FunctionGemmaInferenceResult {
+  final String rawOutput;
+  final String normalizedToolCallJson;
+
+  const FunctionGemmaInferenceResult({
+    required this.rawOutput,
+    required this.normalizedToolCallJson,
+  });
 }

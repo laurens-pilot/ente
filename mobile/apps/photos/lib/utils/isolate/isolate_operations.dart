@@ -265,7 +265,10 @@ Future<dynamic> isolateFunction(
           modelPath: modelPath,
         ),
       );
-      return normalizedToolCallJson;
+      return <String, dynamic>{
+        "rawOutput": normalizedToolCallJson.rawOutput,
+        "normalizedToolCallJson": normalizedToolCallJson.normalizedToolCallJson,
+      };
 
     /// MLComputer
     case IsolateOperation.computeBulkSimilarities:

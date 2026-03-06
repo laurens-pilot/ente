@@ -12,6 +12,7 @@ import "package:photos/generated/l10n.dart";
 import "package:photos/models/search/generic_search_result.dart";
 import "package:photos/models/search/index_of_indexed_stack.dart";
 import "package:photos/models/search/search_result.dart";
+import "package:photos/services/machine_learning/natural_search/natural_search_service.dart";
 import "package:photos/services/search_service.dart";
 import "package:photos/theme/ente_theme.dart";
 import "package:photos/ui/viewer/search/search_suffix_icon_widget.dart";
@@ -34,6 +35,7 @@ class SearchWidgetState extends State<SearchWidget> {
   //Debouncing + querying
   static final isLoading = ValueNotifier(false);
   final _searchService = SearchService.instance;
+  final _naturalSearchService = NaturalSearchService.instance;
   final _debouncer = Debouncer(const Duration(milliseconds: 200));
   late FocusNode focusNode;
   StreamSubscription<TabChangedEvent>? _tabChangedEvent;
@@ -219,7 +221,7 @@ class SearchWidgetState extends State<SearchWidget> {
     String query,
   ) {
     int resultCount = 0;
-    final maxResultCount = _isYearValid(query) ? 13 : 12;
+    int maxResultCount = 0;
     final streamController = StreamController<List<SearchResult>>();
 
     if (query.isEmpty) {
@@ -241,89 +243,57 @@ class SearchWidgetState extends State<SearchWidget> {
       }
     }
 
-    if (_isYearValid(query)) {
-      _searchService.getYearSearchResults(query).then((yearSearchResults) {
-        onResultsReceived(yearSearchResults);
-      });
+    void queueSearchResults<T extends SearchResult>(Future<List<T>> future) {
+      maxResultCount++;
+      future.then(
+        (results) => onResultsReceived(List<SearchResult>.from(results)),
+        onError: (Object error, StackTrace stackTrace) {
+          _logger.severe("Failed to fetch search results", error, stackTrace);
+          onResultsReceived(const <SearchResult>[]);
+        },
+      );
     }
 
-    _searchService.getHolidaySearchResults(context, query).then(
-      (holidayResults) {
-        onResultsReceived(holidayResults);
-      },
-    );
+    if (_isYearValid(query)) {
+      queueSearchResults(_searchService.getYearSearchResults(query));
+    }
 
-    _searchService.getFileTypeResults(context, query).then(
-      (fileTypeSearchResults) {
-        onResultsReceived(fileTypeSearchResults);
-      },
-    );
-
-    _searchService.getCaptionAndNameResults(query).then(
-      (captionAndDisplayNameResult) {
-        onResultsReceived(captionAndDisplayNameResult);
-      },
-    );
-
-    _searchService.getFileExtensionResults(query).then(
-      (fileExtnResult) {
-        onResultsReceived(fileExtnResult);
-      },
-    );
-
-    _searchService.getLocationResults(query).then(
-      (locationResult) {
-        onResultsReceived(locationResult);
-      },
-    );
-
-    _searchService.getAllFace(null, minClusterSize: 10).then(
-      (faceResult) {
+    queueSearchResults(_searchService.getHolidaySearchResults(context, query));
+    queueSearchResults(_searchService.getFileTypeResults(context, query));
+    queueSearchResults(_searchService.getCaptionAndNameResults(query));
+    queueSearchResults(_searchService.getFileExtensionResults(query));
+    queueSearchResults(_searchService.getLocationResults(query));
+    queueSearchResults(
+      _searchService.getAllFace(null, minClusterSize: 10).then((faceResult) {
         final List<GenericSearchResult> filteredResults = [];
         for (final result in faceResult) {
           if (result.name().toLowerCase().contains(query.toLowerCase())) {
             filteredResults.add(result);
           }
         }
-        onResultsReceived(filteredResults);
-      },
+        return filteredResults;
+      }),
     );
-
-    _searchService.getCollectionSearchResults(query).then(
-      (collectionResults) {
-        onResultsReceived(collectionResults);
-      },
+    queueSearchResults(_searchService.getCollectionSearchResults(query));
+    queueSearchResults(_searchService.getDeviceCollectionSearchResults(query));
+    queueSearchResults(_searchService.getMonthSearchResults(context, query));
+    queueSearchResults(_searchService.getDateResults(context, query));
+    queueSearchResults(_searchService.getVisualSearchResults(context, query));
+    queueSearchResults(
+      Future<List<SearchResult>>.delayed(
+        const Duration(milliseconds: 700),
+        () async {
+          if (!mounted || textController.text.trim() != query) {
+            return const <SearchResult>[];
+          }
+          final result = await _naturalSearchService.runNaturalSearchQuery(
+            query,
+          );
+          return <SearchResult>[result.searchResult];
+        },
+      ),
     );
-
-    _searchService.getDeviceCollectionSearchResults(query).then(
-      (deviceCollectionResults) {
-        onResultsReceived(deviceCollectionResults);
-      },
-    );
-
-    _searchService.getMonthSearchResults(context, query).then(
-      (monthResults) {
-        onResultsReceived(monthResults);
-      },
-    );
-
-    _searchService.getDateResults(context, query).then(
-      (possibleEvents) {
-        onResultsReceived(possibleEvents);
-      },
-    );
-
-    _searchService.getMagicSearchResults(context, query).then(
-      (magicResults) {
-        onResultsReceived(magicResults);
-      },
-    );
-
-    _searchService.getContactSearchResults(query).then(
-      (contactResults) {
-        onResultsReceived(contactResults);
-      },
-    );
+    queueSearchResults(_searchService.getContactSearchResults(query));
 
     return streamController.stream;
   }

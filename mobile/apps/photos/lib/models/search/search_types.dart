@@ -39,6 +39,7 @@ enum ResultType {
   shared,
   faces,
   magic,
+  visual,
   cameraMake,
   cameraModel,
 }

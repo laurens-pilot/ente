@@ -166,6 +166,7 @@ class SearchResultWidget extends StatelessWidget {
       case ResultType.location:
       case ResultType.locationSuggestion:
       case ResultType.magic:
+      case ResultType.visual:
         return null;
     }
   }

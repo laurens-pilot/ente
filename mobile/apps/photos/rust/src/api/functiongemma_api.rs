@@ -37,6 +37,12 @@ pub struct RunFunctionGemmaNaturalSearchRequest {
     pub model_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunFunctionGemmaNaturalSearchResult {
+    pub raw_output: String,
+    pub normalized_tool_call_json: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct FunctionGemmaPromptPayload {
     developer_prompt: String,
@@ -57,7 +63,7 @@ static FUNCTION_GEMMA_RUNTIME: Lazy<Mutex<Option<FunctionGemmaRuntime>>> =
 
 pub fn run_function_gemma_natural_search(
     req: RunFunctionGemmaNaturalSearchRequest,
-) -> Result<String, String> {
+) -> Result<RunFunctionGemmaNaturalSearchResult, String> {
     if req.model_path.trim().is_empty() {
         return Err("FunctionGemma model path is empty".to_string());
     }
@@ -103,7 +109,11 @@ pub fn run_function_gemma_natural_search(
         return Err(format!("FunctionGemma generation stream error: {message}"));
     }
 
-    normalize_tool_call_output(&generated_text)
+    let normalized_tool_call_json = normalize_tool_call_output(&generated_text)?;
+    Ok(RunFunctionGemmaNaturalSearchResult {
+        raw_output: generated_text,
+        normalized_tool_call_json,
+    })
 }
 
 pub fn release_function_gemma_runtime() -> Result<(), String> {
