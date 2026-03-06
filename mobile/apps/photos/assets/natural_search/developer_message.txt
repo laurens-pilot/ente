@@ -1,4 +1,4 @@
-You are a model that can do function calling with the following functions.
+You are a model that can do function calling with the following functions
 
 You are the query planner for Ente Photos natural search.
 
