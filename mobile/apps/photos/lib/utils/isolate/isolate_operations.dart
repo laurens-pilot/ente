@@ -12,6 +12,8 @@ import "package:photos/services/machine_learning/ml_result.dart";
 import "package:photos/services/machine_learning/semantic_search/clip/clip_text_encoder.dart";
 import "package:photos/services/machine_learning/semantic_search/clip/clip_text_tokenizer.dart";
 import "package:photos/services/machine_learning/semantic_search/query_result.dart";
+import "package:photos/src/rust/api/functiongemma_api.dart"
+    as rust_functiongemma;
 import "package:photos/src/rust/api/image_processing_api.dart"
     as rust_image_processing;
 import "package:photos/src/rust/api/ml_indexing_api.dart" as rust_ml;
@@ -50,6 +52,9 @@ enum IsolateOperation {
 
   /// [MLComputer]
   runClipText,
+
+  /// [MLComputer]
+  runFunctionGemmaNaturalSearch,
 
   /// [MLComputer]
   computeBulkSimilarities,
@@ -242,6 +247,27 @@ Future<dynamic> isolateFunction(
       return List<double>.from(result.embedding, growable: false);
 
     /// MLComputer
+    case IsolateOperation.runFunctionGemmaNaturalSearch:
+      await _ensureRustLoaded();
+
+      final promptPayloadJson = args["promptPayloadJson"] as String;
+      final modelPath = args["modelPath"] as String?;
+      if (modelPath == null || modelPath.trim().isEmpty) {
+        throw Exception(
+          "RustMLMissingModelPath: Missing required model path: functionGemmaModelPath",
+        );
+      }
+
+      final normalizedToolCallJson =
+          await rust_functiongemma.runFunctionGemmaNaturalSearch(
+        req: rust_functiongemma.RunFunctionGemmaNaturalSearchRequest(
+          promptPayloadJson: promptPayloadJson,
+          modelPath: modelPath,
+        ),
+      );
+      return normalizedToolCallJson;
+
+    /// MLComputer
     case IsolateOperation.computeBulkSimilarities:
       final imageEmbeddings =
           _isolateCache[imageEmbeddingsKey] as List<EmbeddingVector>;
@@ -375,6 +401,11 @@ Future<void> _releaseRustRuntime() async {
     await rust_ml.releaseMlRuntime();
   } catch (_) {
     // no-op: runtime release is best-effort before process-wide bridge dispose.
+  }
+  try {
+    await rust_functiongemma.releaseFunctionGemmaRuntime();
+  } catch (_) {
+    // no-op: FunctionGemma runtime release is best-effort before bridge dispose.
   }
   _isolateCache.remove(_rustMlRuntimeConfigCacheKey);
 }

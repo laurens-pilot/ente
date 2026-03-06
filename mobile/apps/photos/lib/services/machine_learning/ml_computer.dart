@@ -8,6 +8,7 @@ import "package:logging/logging.dart";
 import "package:photos/models/ml/vector.dart";
 import "package:photos/service_locator.dart" show flagService, isOfflineMode;
 import "package:photos/services/machine_learning/ml_constants.dart";
+import "package:photos/services/machine_learning/natural_search/function_gemma_natural_search_model.dart";
 import "package:photos/services/machine_learning/semantic_search/clip/clip_text_encoder.dart";
 import "package:photos/services/machine_learning/semantic_search/query_result.dart";
 import "package:photos/services/remote_assets_service.dart";
@@ -22,9 +23,11 @@ class MLComputer extends SuperIsolate {
   final _logger = Logger('MLComputer');
 
   final _initModelLock = Lock();
+  final _initFunctionGemmaLock = Lock();
   bool _isClipTokenizerInitialized = false;
   String? _clipTextModelPath;
   String? _clipTextVocabPath;
+  String? _functionGemmaModelPath;
   Future<void>? _clipTextWarmupFuture;
 
   @override
@@ -182,6 +185,47 @@ class MLComputer extends SuperIsolate {
         _logger.severe("Could not load clip text model in MLComputer", e, s);
         rethrow;
       }
+    });
+  }
+
+  Future<String> runFunctionGemmaNaturalSearch(String promptPayloadJson) async {
+    try {
+      await _ensureLoadedFunctionGemmaModel();
+      final modelPath = _functionGemmaModelPath;
+      if (modelPath == null || modelPath.trim().isEmpty) {
+        throw Exception(
+          "RustMLMissingModelPath: Missing required model path: functionGemmaModelPath",
+        );
+      }
+      final normalizedToolCallJson = await runInIsolate(
+        IsolateOperation.runFunctionGemmaNaturalSearch,
+        {
+          "promptPayloadJson": promptPayloadJson,
+          "modelPath": modelPath,
+        },
+      ) as String;
+      return normalizedToolCallJson;
+    } catch (e, s) {
+      _logger.severe("Could not run FunctionGemma natural search", e, s);
+      rethrow;
+    }
+  }
+
+  Future<void> _ensureLoadedFunctionGemmaModel() async {
+    return _initFunctionGemmaLock.synchronized(() async {
+      if (_functionGemmaModelPath != null &&
+          _functionGemmaModelPath!.trim().isNotEmpty) {
+        return;
+      }
+
+      final downloadedModelPath =
+          await FunctionGemmaNaturalSearchModel.instance.downloadModelSafe();
+      if (downloadedModelPath == null || downloadedModelPath.trim().isEmpty) {
+        throw Exception(
+          "Could not download FunctionGemma model, no suitable network available",
+        );
+      }
+      _functionGemmaModelPath = downloadedModelPath;
     });
   }
 

@@ -23,6 +23,7 @@ import "package:photos/services/account/user_service.dart";
 import "package:photos/services/collections_service.dart";
 import "package:photos/services/location_service.dart";
 import "package:photos/services/machine_learning/face_ml/person/person_service.dart";
+import "package:photos/services/machine_learning/ml_computer.dart";
 import "package:photos/services/machine_learning/semantic_search/semantic_search_service.dart";
 import "package:photos/services/search_service.dart";
 import "package:photos/services/timezone_aliases.dart";
@@ -458,6 +459,37 @@ class NaturalSearchService {
         hierarchicalSearchFilter: executionFilter,
       ),
     );
+  }
+
+  Future<NaturalSearchExecutionResult> runNaturalSearchQuery(
+    String userQuery,
+  ) async {
+    final modelInput = await buildModelInput(userQuery);
+    final promptPayloadJson = buildFunctionGemmaPromptPayloadJson(
+      developerPrompt: modelInput.developerPrompt,
+      toolSchemaRaw: modelInput.toolSchemaRaw,
+      userQuery: modelInput.userQuery,
+    );
+    final normalizedToolCallJson = await MLComputer.instance
+        .runFunctionGemmaNaturalSearch(promptPayloadJson);
+    final parsedToolCall = parseModelOutput(normalizedToolCallJson);
+    return executeParsedCall(
+      originalQuery: modelInput.userQuery,
+      parsedToolCall: parsedToolCall,
+    );
+  }
+
+  @visibleForTesting
+  static String buildFunctionGemmaPromptPayloadJson({
+    required String developerPrompt,
+    required String toolSchemaRaw,
+    required String userQuery,
+  }) {
+    return jsonEncode({
+      "developer_prompt": developerPrompt,
+      "tool_schema_json": toolSchemaRaw,
+      "user_query": userQuery,
+    });
   }
 
   @visibleForTesting
@@ -1521,7 +1553,7 @@ class NaturalSearchService {
   }
 
   static Iterable<String> _extractTaggedToolCallBlocks(String text) sync* {
-    final regex = RegExp(r"<tool_call>([\\s\\S]*?)</tool_call>");
+    final regex = RegExp(r"<tool_call>([\s\S]*?)</tool_call>");
     for (final match in regex.allMatches(text)) {
       final group = match.group(1);
       if (group != null) {

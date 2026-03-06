@@ -2,6 +2,27 @@ import "package:flutter_test/flutter_test.dart";
 import "package:photos/services/machine_learning/natural_search/natural_search_service.dart";
 
 void main() {
+  group("buildFunctionGemmaPromptPayloadJson", () {
+    test("encodes required fields for Rust inference payload", () {
+      const developerPrompt = "developer prompt";
+      const toolSchemaRaw = "{\"type\":\"function\"}";
+      const userQuery = "photos of the beach";
+
+      final payload = NaturalSearchService.buildFunctionGemmaPromptPayloadJson(
+        developerPrompt: developerPrompt,
+        toolSchemaRaw: toolSchemaRaw,
+        userQuery: userQuery,
+      );
+
+      expect(payload, contains("\"developer_prompt\""));
+      expect(payload, contains("\"tool_schema_json\""));
+      expect(payload, contains("\"user_query\""));
+      expect(payload, contains(developerPrompt));
+      expect(payload, contains(toolSchemaRaw.replaceAll("\"", "\\\"")));
+      expect(payload, contains(userQuery));
+    });
+  });
+
   group("parseToolCallPayload", () {
     test("parses <tool_call> payload", () {
       const rawOutput = """
