@@ -494,7 +494,7 @@ SPEC CHECKSUMS:
   cupertino_http: 94ac07f5ff090b8effa6c5e2c47871d48ab7c86c
   dart_ui_isolate: 46f6714abe6891313267153ef6f9748d8ecfcab1
   device_info_plus: 21fcca2080fbcd348be798aa36c3e5ed849eefbe
-  ente_photos_rust: 79732f3ba67df7b0fb22089627afb80d692c2b2d
+  ente_photos_rust: 28cd6bb93589023a2e539c1c5239756692861294
   ente_qr: 2a30f91f9e938c229ebcbc98a6f8f018d1ac665d
   ente_rust: 9c976e3d083f0ce90f31693deb99629b28d8fe4c
   ffmpeg_kit_custom: 682b4f2f1ff1f8abae5a92f6c3540f2441d5be99
