@@ -63,12 +63,6 @@ class NaturalSearchService {
 
   static const Set<String> _personOperators = {"any", "all"};
 
-  static const Set<String> _sortByValues = {
-    "relevance",
-    "newest_first",
-    "oldest_first",
-  };
-
   static const Set<String> _allowedArgumentFields = {
     "time_filter",
     "ente_album_names",
@@ -87,7 +81,6 @@ class NaturalSearchService {
     "semantic_query",
     "video_duration_seconds",
     "file_size_mb",
-    "sort_by",
     "limit",
   };
 
@@ -159,7 +152,6 @@ class NaturalSearchService {
     final allFiles = await SearchService.instance.getAllFilesForSearch();
     var workingFiles = List<EnteFile>.from(allFiles);
     final resolvedArguments = <String, dynamic>{};
-    final semanticRelevanceRank = <int, int>{};
 
     if (normalizedArguments.containsKey("ownership_scope")) {
       final result = await _applyOwnershipScopeFilter(
@@ -369,7 +361,6 @@ class NaturalSearchService {
         "matched_uploaded_ids":
             semanticResult.uploadedIDs.toList(growable: false),
       };
-      semanticRelevanceRank.addAll(semanticResult.relevanceRank);
 
       if (semanticResult.uploadedIDs.isEmpty) {
         workingFiles = [];
@@ -430,12 +421,7 @@ class NaturalSearchService {
       }
     }
 
-    final sortBy = normalizedArguments["sort_by"] as String?;
-    _sortFiles(
-      files: workingFiles,
-      sortBy: sortBy,
-      semanticRelevanceRank: semanticRelevanceRank,
-    );
+    _sortFilesChronologically(workingFiles);
 
     final limit = normalizedArguments["limit"] as int?;
     if (limit != null && limit >= 0 && workingFiles.length > limit) {
@@ -972,13 +958,6 @@ class NaturalSearchService {
             }
           }
           break;
-        case "sort_by":
-          if (value is String && _sortByValues.contains(value.trim())) {
-            normalized[key] = value.trim();
-          } else {
-            warnings.add("Ignoring invalid sort_by '$value'");
-          }
-          break;
         case "limit":
           final limit = _toInt(value);
           if (limit != null && limit > 0) {
@@ -1332,16 +1311,8 @@ class NaturalSearchService {
           await SemanticSearchService.instance.searchScreenQuery(query);
       final files = result.$2;
       final uploadedIDs = filesToUploadedFileIDs(files);
-      final rankMap = <int, int>{};
-      for (var i = 0; i < files.length; i++) {
-        final uploadedID = files[i].uploadedFileID;
-        if (uploadedID != null && !rankMap.containsKey(uploadedID)) {
-          rankMap[uploadedID] = i;
-        }
-      }
       return _SemanticResolutionResult(
         uploadedIDs: uploadedIDs,
-        relevanceRank: rankMap,
         warnings: warnings,
       );
     } catch (e, s) {
@@ -1349,7 +1320,6 @@ class NaturalSearchService {
       warnings.add("semantic_query execution failed: $e");
       return _SemanticResolutionResult(
         uploadedIDs: const <int>{},
-        relevanceRank: const <int, int>{},
         warnings: warnings,
       );
     }
@@ -1423,57 +1393,11 @@ class NaturalSearchService {
     return _NumericRangeResult(min: min, max: max, warnings: warnings);
   }
 
-  void _sortFiles({
-    required List<EnteFile> files,
-    required String? sortBy,
-    required Map<int, int> semanticRelevanceRank,
-  }) {
-    int compareByNewest(EnteFile first, EnteFile second) {
-      return (second.creationTime ?? 0).compareTo(first.creationTime ?? 0);
-    }
-
-    int compareByOldest(EnteFile first, EnteFile second) {
-      return (first.creationTime ?? 0).compareTo(second.creationTime ?? 0);
-    }
-
-    int compareByRelevance(EnteFile first, EnteFile second) {
-      final firstID = first.uploadedFileID;
-      final secondID = second.uploadedFileID;
-      final firstRank = firstID != null ? semanticRelevanceRank[firstID] : null;
-      final secondRank =
-          secondID != null ? semanticRelevanceRank[secondID] : null;
-
-      if (firstRank != null && secondRank != null) {
-        return firstRank.compareTo(secondRank);
-      }
-      if (firstRank != null) {
-        return -1;
-      }
-      if (secondRank != null) {
-        return 1;
-      }
-
-      return compareByNewest(first, second);
-    }
-
-    switch (sortBy) {
-      case "newest_first":
-        files.sort(compareByNewest);
-        break;
-      case "oldest_first":
-        files.sort(compareByOldest);
-        break;
-      case "relevance":
-        files.sort(compareByRelevance);
-        break;
-      default:
-        if (semanticRelevanceRank.isNotEmpty) {
-          files.sort(compareByRelevance);
-        } else {
-          files.sort(compareByNewest);
-        }
-        break;
-    }
+  void _sortFilesChronologically(List<EnteFile> files) {
+    files.sort(
+      (first, second) =>
+          (first.creationTime ?? 0).compareTo(second.creationTime ?? 0),
+    );
   }
 
   static ParsedToolCall _parseToolCallMap(
@@ -1847,12 +1771,10 @@ class _PlaceQueryResolutionResult {
 
 class _SemanticResolutionResult {
   final Set<int> uploadedIDs;
-  final Map<int, int> relevanceRank;
   final List<String> warnings;
 
   _SemanticResolutionResult({
     required this.uploadedIDs,
-    required this.relevanceRank,
     required this.warnings,
   });
 }

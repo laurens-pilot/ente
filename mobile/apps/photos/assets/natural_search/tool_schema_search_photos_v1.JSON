@@ -2,7 +2,7 @@
   "type": "function",
   "function": {
     "name": "search_photos_v1",
-    "description": "Search the user's photo and video library using structured filters. Return exactly one function call. Populate only filters that are explicitly requested or clearly implied. Prefer exact names from the provided entity lists for albums, people, location tags, and contacts. Use place_queries for city, region, country, or place names that are not saved user location tags. Use semantic_query only for visual content such as beach, dog, sunset, selfie, screenshot, concert, mountain, food, wedding, or receipt. All time values are local time in YYYY-MM-DDTHH:mm:ss format. end_local_exclusive is exclusive.",
+    "description": "Search the user's photo and video library using structured filters. Return exactly one function call. Populate only filters that are explicitly requested or clearly implied. Prefer exact names from the provided entity lists for albums, people, location tags, and contacts. Use place_queries for city, region, country, or place names that are not saved user location tags. Use semantic_query only for visual content such as beach, dog, sunset, selfie, screenshot, concert, mountain, food, wedding, or receipt. Results are returned chronologically by the app. All time values are local time in YYYY-MM-DDTHH:mm:ss format. end_local_exclusive is exclusive.",
     "parameters": {
       "type": "object",
       "additionalProperties": false,
@@ -212,12 +212,6 @@
               "minimum": 0
             }
           }
-        },
-
-        "sort_by": {
-          "type": "string",
-          "description": "Requested result ordering.",
-          "enum": ["relevance", "newest_first", "oldest_first"]
         },
 
         "limit": {

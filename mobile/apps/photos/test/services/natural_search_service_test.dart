@@ -27,7 +27,7 @@ void main() {
     test("parses <tool_call> payload", () {
       const rawOutput = """
 <tool_call>
-{"name":"search_photos_v1","arguments":{"limit":10,"sort_by":"newest_first"}}
+{"name":"search_photos_v1","arguments":{"limit":10}}
 </tool_call>
 """;
 
@@ -35,7 +35,7 @@ void main() {
 
       expect(parsed.name, "search_photos_v1");
       expect(parsed.arguments["limit"], 10);
-      expect(parsed.arguments["sort_by"], "newest_first");
+      expect(parsed.arguments.containsKey("sort_by"), isFalse);
     });
 
     test("parses JSON with stringified arguments", () {
@@ -84,6 +84,22 @@ void main() {
       expect(
         () => NaturalSearchService.parseToolCallPayload(rawOutput),
         throwsFormatException,
+      );
+    });
+  });
+
+  group("parseModelOutput", () {
+    test("drops obsolete sort_by argument", () {
+      const rawOutput =
+          "{\"name\":\"search_photos_v1\",\"arguments\":{\"limit\":10,\"sort_by\":\"newest_first\"}}";
+
+      final parsed = NaturalSearchService.instance.parseModelOutput(rawOutput);
+
+      expect(parsed.arguments["limit"], 10);
+      expect(parsed.arguments.containsKey("sort_by"), isFalse);
+      expect(
+        parsed.warnings,
+        contains("Ignoring unknown argument field 'sort_by'"),
       );
     });
   });

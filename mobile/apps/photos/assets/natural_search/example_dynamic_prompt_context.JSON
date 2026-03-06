@@ -3,6 +3,7 @@
   "local_timezone": "Asia/Kolkata",
   "week_start": "monday",
   "search_start_year": 2016,
+  "result_ordering": "chronological",
 
   "available_ente_album_names": ["Trips", "Family", "Favorites"],
 

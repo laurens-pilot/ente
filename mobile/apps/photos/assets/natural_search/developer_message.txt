@@ -95,8 +95,9 @@ H. Duration and size
 - If only a minimum is implied, set only `min`.
 - If only a maximum is implied, set only `max`.
 
-I. Sorting and limit
-- Set `sort_by` only when the user explicitly asks for newest, oldest, or relevance-like behavior.
+I. Result ordering and limit
+- Results are always returned in chronological order by the app.
+- Do not try to control sorting; there is no sorting argument.
 - Set `limit` only when the user explicitly asks for a count or top-k style result.
 
 J. Conservative behavior

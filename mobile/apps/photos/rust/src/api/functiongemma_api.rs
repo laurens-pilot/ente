@@ -481,13 +481,13 @@ mod tests {
     fn normalizes_tagged_tool_call_payload() {
         let raw = r#"
 <tool_call>
-{"name":"search_photos_v1","arguments":{"limit":10,"sort_by":"newest_first"}}
+{"name":"search_photos_v1","arguments":{"limit":10}}
 </tool_call>
 "#;
         let normalized = normalize_tool_call_output(raw).expect("normalization should succeed");
         assert_eq!(
             normalized,
-            r#"{"arguments":{"limit":10,"sort_by":"newest_first"},"name":"search_photos_v1"}"#
+            r#"{"arguments":{"limit":10},"name":"search_photos_v1"}"#
         );
     }
 
