@@ -207,6 +207,7 @@ class MLComputer extends SuperIsolate {
         },
       ) as Map<String, dynamic>;
       return FunctionGemmaInferenceResult(
+        prompt: result["prompt"] as String,
         rawOutput: result["rawOutput"] as String,
         normalizedToolCallJson: result["normalizedToolCallJson"] as String,
       );
@@ -293,10 +294,12 @@ class MLComputer extends SuperIsolate {
 }
 
 class FunctionGemmaInferenceResult {
+  final String prompt;
   final String rawOutput;
   final String normalizedToolCallJson;
 
   const FunctionGemmaInferenceResult({
+    required this.prompt,
     required this.rawOutput,
     required this.normalizedToolCallJson,
   });

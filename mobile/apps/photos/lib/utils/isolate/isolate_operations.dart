@@ -266,6 +266,7 @@ Future<dynamic> isolateFunction(
         ),
       );
       return <String, dynamic>{
+        "prompt": normalizedToolCallJson.prompt,
         "rawOutput": normalizedToolCallJson.rawOutput,
         "normalizedToolCallJson": normalizedToolCallJson.normalizedToolCallJson,
       };

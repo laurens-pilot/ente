@@ -128,12 +128,14 @@ class NaturalSearchService {
   Future<NaturalSearchExecutionResult> executeParsedCall({
     required String originalQuery,
     required NaturalSearchParsedToolCall parsedToolCall,
+    String? functionGemmaPrompt,
     String? rawFunctionGemmaToolCallOutput,
   }) {
     return executeToolArguments(
       originalQuery: originalQuery,
       toolArguments: parsedToolCall.arguments,
       parserWarnings: parsedToolCall.warnings,
+      functionGemmaPrompt: functionGemmaPrompt,
       rawFunctionGemmaToolCallOutput: rawFunctionGemmaToolCallOutput,
     );
   }
@@ -142,6 +144,7 @@ class NaturalSearchService {
     required String originalQuery,
     required Map<String, dynamic> toolArguments,
     List<String> parserWarnings = const [],
+    String? functionGemmaPrompt,
     String? rawFunctionGemmaToolCallOutput,
   }) async {
     final normalizationResult = _normalizeArguments(toolArguments);
@@ -447,6 +450,8 @@ class NaturalSearchService {
       matchedUploadedIDs: filesToUploadedFileIDs(workingFiles),
     );
     final searchResultParams = <String, dynamic>{
+      if (functionGemmaPrompt != null)
+        kFunctionGemmaPrompt: functionGemmaPrompt,
       if (rawFunctionGemmaToolCallOutput != null)
         kFunctionGemmaRawToolCallOutput: rawFunctionGemmaToolCallOutput,
     };
@@ -458,6 +463,7 @@ class NaturalSearchService {
       files: workingFiles,
       warnings: warnings,
       initialFilter: executionFilter,
+      functionGemmaPrompt: functionGemmaPrompt,
       rawFunctionGemmaToolCallOutput: rawFunctionGemmaToolCallOutput,
       searchResult: GenericSearchResult(
         ResultType.magic,
@@ -532,6 +538,7 @@ class NaturalSearchService {
     return executeParsedCall(
       originalQuery: modelInput.userQuery,
       parsedToolCall: parsedToolCall,
+      functionGemmaPrompt: inferenceResult.prompt,
       rawFunctionGemmaToolCallOutput: inferenceResult.rawOutput,
     );
   }
@@ -1718,6 +1725,7 @@ class NaturalSearchExecutionResult {
   final List<EnteFile> files;
   final List<String> warnings;
   final HierarchicalSearchFilter initialFilter;
+  final String? functionGemmaPrompt;
   final String? rawFunctionGemmaToolCallOutput;
   final GenericSearchResult searchResult;
 
@@ -1728,6 +1736,7 @@ class NaturalSearchExecutionResult {
     required this.files,
     required this.warnings,
     required this.initialFilter,
+    this.functionGemmaPrompt,
     this.rawFunctionGemmaToolCallOutput,
     required this.searchResult,
   });

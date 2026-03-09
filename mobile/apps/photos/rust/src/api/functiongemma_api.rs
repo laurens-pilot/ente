@@ -43,6 +43,7 @@ pub struct RunFunctionGemmaNaturalSearchRequest {
 
 #[derive(Clone, Debug)]
 pub struct RunFunctionGemmaNaturalSearchResult {
+    pub prompt: String,
     pub raw_output: String,
     pub normalized_tool_call_json: String,
 }
@@ -78,6 +79,7 @@ pub fn run_function_gemma_natural_search(
     let prompt_payload: FunctionGemmaPromptPayload = serde_json::from_str(&req.prompt_payload_json)
         .map_err(|e| format!("Invalid FunctionGemma prompt payload JSON: {e}"))?;
     let prompt = build_function_gemma_prompt(&prompt_payload)?;
+    let rendered_prompt = prompt.clone();
     let runtime = ensure_function_gemma_runtime(&req.model_path)?;
 
     let mut generated_text = String::new();
@@ -117,6 +119,7 @@ pub fn run_function_gemma_natural_search(
 
     let normalized_tool_call_json = normalize_tool_call_output(&generated_text)?;
     Ok(RunFunctionGemmaNaturalSearchResult {
+        prompt: rendered_prompt,
         raw_output: generated_text,
         normalized_tool_call_json,
     })

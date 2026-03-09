@@ -2,7 +2,8 @@ import "dart:async";
 
 import "package:ente_pure_utils/ente_pure_utils.dart";
 import "package:flutter/foundation.dart" show kDebugMode;
-import 'package:flutter/material.dart';
+import "package:flutter/material.dart";
+import "package:flutter/services.dart";
 import "package:flutter_animate/flutter_animate.dart";
 import "package:hugeicons/hugeicons.dart";
 import "package:logging/logging.dart";
@@ -12,7 +13,7 @@ import "package:photos/models/search/device_album_search_result.dart";
 import "package:photos/models/search/generic_search_result.dart";
 import "package:photos/models/search/index_of_indexed_stack.dart";
 import "package:photos/models/search/search_constants.dart";
-import 'package:photos/models/search/search_result.dart';
+import "package:photos/models/search/search_result.dart";
 import "package:photos/models/search/search_types.dart";
 import "package:photos/services/collections_service.dart";
 import "package:photos/theme/ente_theme.dart";
@@ -375,8 +376,7 @@ class _SearchResultsSectionWidget extends StatelessWidget {
     final colorScheme = getEnteColorScheme(context);
     final textTheme = getEnteTextTheme(context);
     final showTypeLabel = results.length > 1;
-    final rawFunctionGemmaToolCall =
-        _firstFunctionGemmaRawToolCallOutput(results);
+    final functionGemmaDebugInfo = _firstFunctionGemmaDebugInfo(results);
     final children = <Widget>[];
     for (int i = 0; i < results.length; i++) {
       final radius = BorderRadius.circular(20);
@@ -426,7 +426,7 @@ class _SearchResultsSectionWidget extends StatelessWidget {
               ),
               const Spacer(),
               if (kDebugMode &&
-                  rawFunctionGemmaToolCall != null &&
+                  functionGemmaDebugInfo != null &&
                   section == _SearchResultsSection.magic)
                 IconButton(
                   visualDensity:
@@ -440,12 +440,87 @@ class _SearchResultsSectionWidget extends StatelessWidget {
                     await showDialog<void>(
                       context: context,
                       builder: (context) {
+                        final promptPreview = _buildFunctionGemmaPromptPreview(
+                          functionGemmaDebugInfo.prompt,
+                        );
                         return AlertDialog(
-                          title: const Text("FunctionGemma Tool Call"),
-                          content: SingleChildScrollView(
-                            child: SelectableText(rawFunctionGemmaToolCall),
+                          title: const Text("FunctionGemma Debug"),
+                          content: SizedBox(
+                            width: MediaQuery.sizeOf(context).width * 0.8,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  "Prompt",
+                                  style: textTheme.bodyBold,
+                                ),
+                                const SizedBox(height: 8),
+                                Container(
+                                  width: double.infinity,
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: colorScheme.backgroundElevated2,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: SingleChildScrollView(
+                                    scrollDirection: Axis.horizontal,
+                                    child: SelectableText(
+                                      promptPreview,
+                                      maxLines: 1,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Text(
+                                  "Model Response",
+                                  style: textTheme.bodyBold,
+                                ),
+                                const SizedBox(height: 8),
+                                Container(
+                                  width: double.infinity,
+                                  constraints: BoxConstraints(
+                                    maxHeight:
+                                        MediaQuery.sizeOf(context).height * 0.4,
+                                  ),
+                                  padding: const EdgeInsets.all(12),
+                                  decoration: BoxDecoration(
+                                    color: colorScheme.backgroundElevated2,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: SingleChildScrollView(
+                                    child: SelectableText(
+                                      functionGemmaDebugInfo.rawOutput ??
+                                          "<missing>",
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
                           actions: [
+                            TextButton(
+                              onPressed: () async {
+                                final debugPayload =
+                                    _buildFunctionGemmaDebugPayload(
+                                  functionGemmaDebugInfo,
+                                );
+                                await Clipboard.setData(
+                                  ClipboardData(text: debugPayload),
+                                );
+                                if (!context.mounted) {
+                                  return;
+                                }
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text(
+                                      "Copied FunctionGemma prompt and response",
+                                    ),
+                                  ),
+                                );
+                              },
+                              child: const Text("Copy"),
+                            ),
                             TextButton(
                               onPressed: () => Navigator.of(context).pop(),
                               child: const Text("Close"),
@@ -464,17 +539,53 @@ class _SearchResultsSectionWidget extends StatelessWidget {
     );
   }
 
-  String? _firstFunctionGemmaRawToolCallOutput(List<SearchResult> results) {
+  _FunctionGemmaDebugInfo? _firstFunctionGemmaDebugInfo(
+    List<SearchResult> results,
+  ) {
     for (final result in results) {
       if (result is! GenericSearchResult) {
         continue;
       }
+      final prompt = result.params[kFunctionGemmaPrompt] as String?;
       final toolCallOutput =
           result.params[kFunctionGemmaRawToolCallOutput] as String?;
-      if (toolCallOutput != null && toolCallOutput.trim().isNotEmpty) {
-        return toolCallOutput;
+      final hasPrompt = prompt != null && prompt.trim().isNotEmpty;
+      final hasToolCallOutput =
+          toolCallOutput != null && toolCallOutput.trim().isNotEmpty;
+      if (hasPrompt || hasToolCallOutput) {
+        return _FunctionGemmaDebugInfo(
+          prompt: hasPrompt ? prompt : null,
+          rawOutput: hasToolCallOutput ? toolCallOutput : null,
+        );
       }
     }
     return null;
   }
+
+  String _buildFunctionGemmaPromptPreview(String? prompt) {
+    if (prompt == null || prompt.trim().isEmpty) {
+      return "<missing>";
+    }
+    return prompt.replaceAll(RegExp(r"\s+"), " ").trim();
+  }
+
+  String _buildFunctionGemmaDebugPayload(_FunctionGemmaDebugInfo debugInfo) {
+    final buffer = StringBuffer();
+    buffer.writeln("=== FUNCTIONGEMMA PROMPT ===");
+    buffer.writeln(debugInfo.prompt ?? "<missing>");
+    buffer.writeln();
+    buffer.writeln("=== FUNCTIONGEMMA MODEL RESPONSE ===");
+    buffer.writeln(debugInfo.rawOutput ?? "<missing>");
+    return buffer.toString().trimRight();
+  }
+}
+
+class _FunctionGemmaDebugInfo {
+  final String? prompt;
+  final String? rawOutput;
+
+  const _FunctionGemmaDebugInfo({
+    this.prompt,
+    this.rawOutput,
+  });
 }

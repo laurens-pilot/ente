@@ -5,4 +5,5 @@ const kClusterParamId = 'cluster_id';
 const kFileID = 'file_id';
 const kContactEmail = 'contact_email';
 const kContactCollections = 'contact_collections';
+const kFunctionGemmaPrompt = 'function_gemma_prompt';
 const kFunctionGemmaRawToolCallOutput = 'function_gemma_raw_tool_call_output';
