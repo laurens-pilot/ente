@@ -428,6 +428,16 @@ class NaturalSearchService {
       workingFiles = workingFiles.sublist(0, limit);
     }
 
+    if (kDebugMode) {
+      _logger.info(
+        "Natural search app-layer parameters for '$originalQuery':\n"
+        "normalized_tool_arguments=${jsonEncode(normalizedArguments)}\n"
+        "resolved_arguments=${jsonEncode(resolvedArguments)}\n"
+        "warnings=${jsonEncode(warnings)}\n"
+        "matched_file_count=${workingFiles.length}",
+      );
+    }
+
     final executionFilter = TopLevelGenericFilter(
       filterName: originalQuery,
       occurrence: kMostRelevantFilter,
@@ -472,6 +482,14 @@ class NaturalSearchService {
     );
     final parsedToolCall =
         parseModelOutput(inferenceResult.normalizedToolCallJson);
+    if (kDebugMode) {
+      _logger.info(
+        "FunctionGemma raw output for '${modelInput.userQuery}':\n${inferenceResult.rawOutput}",
+      );
+      _logger.info(
+        "FunctionGemma normalized tool call for '${modelInput.userQuery}':\n${jsonEncode(parsedToolCall.rawCallJson)}",
+      );
+    }
     return executeParsedCall(
       originalQuery: modelInput.userQuery,
       parsedToolCall: parsedToolCall,
