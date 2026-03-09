@@ -17,15 +17,13 @@ const END_FUNCTION_DECLARATION_TOKEN: &str = "<end_function_declaration>";
 const START_FUNCTION_RESPONSE_TOKEN: &str = "<start_function_response>";
 const ESCAPE_TOKEN: &str = "<escape>";
 
-const DEFAULT_CONTEXT_SIZE: i32 = 32_768;
-const FALLBACK_CONTEXT_SIZES: [i32; 2] = [16_384, 8_192];
-const DEFAULT_MAX_TOKENS: i32 = 256;
-const DEFAULT_TOP_K: i32 = 64;
-const DEFAULT_TOP_P: f32 = 0.95;
-const DEFAULT_TEMPERATURE: f32 = 1.0;
-const DEFAULT_REPEAT_PENALTY: f32 = 1.1;
+const DEFAULT_CONTEXT_SIZE: i32 = 16_384;
+const FALLBACK_CONTEXT_SIZES: [i32; 2] = [8_192, 4_096];
+const DEFAULT_MAX_TOKENS: i32 = 128;
+const DEFAULT_TEMPERATURE: f32 = 0.0;
+const DEFAULT_REPEAT_PENALTY: f32 = 1.0;
 const DEFAULT_SEED: i64 = 0;
-const DEFAULT_N_BATCH: i32 = 512;
+const DEFAULT_N_BATCH: i32 = 256;
 
 static FUNCTION_CALL_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)call\s*:?\s*([a-zA-Z_][a-zA-Z0-9_]*)")
@@ -94,13 +92,14 @@ pub fn run_function_gemma_natural_search(
         prompt,
         max_tokens: Some(DEFAULT_MAX_TOKENS),
         temperature: Some(DEFAULT_TEMPERATURE),
-        top_p: Some(DEFAULT_TOP_P),
-        top_k: Some(DEFAULT_TOP_K),
+        top_p: None,
+        top_k: None,
         repeat_penalty: Some(DEFAULT_REPEAT_PENALTY),
         frequency_penalty: Some(0.0),
         presence_penalty: Some(0.0),
         seed: Some(DEFAULT_SEED),
         stop_sequences: Some(vec![
+            END_FUNCTION_CALL_TOKEN.to_string(),
             "<end_of_turn>".to_string(),
             "<start_of_turn>".to_string(),
             START_FUNCTION_RESPONSE_TOKEN.to_string(),
@@ -289,7 +288,7 @@ fn default_thread_count() -> i32 {
     let count = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let bounded = count.clamp(1, 8);
+    let bounded = count.clamp(1, 4);
     i32::try_from(bounded).unwrap_or(4)
 }
 

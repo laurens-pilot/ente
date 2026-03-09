@@ -85,6 +85,8 @@ class NaturalSearchService {
   };
 
   final _logger = Logger("NaturalSearchService");
+  Future<NaturalSearchExecutionResult>? _searchScreenRequest;
+  String? _latestPendingQuery;
 
   String? _cachedToolSchemaRaw;
   Map<String, dynamic>? _cachedToolSchema;
@@ -468,6 +470,43 @@ class NaturalSearchService {
   }
 
   Future<NaturalSearchExecutionResult> runNaturalSearchQuery(
+    String userQuery,
+  ) async {
+    final normalizedQuery = userQuery.trim();
+    if (_searchScreenRequest != null) {
+      _latestPendingQuery = normalizedQuery;
+      return _searchScreenRequest!;
+    }
+
+    _searchScreenRequest = _runNaturalSearchQueryWithCoalescing(
+      normalizedQuery,
+    );
+
+    return _searchScreenRequest!;
+  }
+
+  Future<NaturalSearchExecutionResult> _runNaturalSearchQueryWithCoalescing(
+    String normalizedQuery,
+  ) async {
+    try {
+      final result = await _runNaturalSearchQueryInternal(normalizedQuery);
+      _searchScreenRequest = null;
+
+      final latestPendingQuery = _latestPendingQuery;
+      _latestPendingQuery = null;
+      if (latestPendingQuery != null && latestPendingQuery != normalizedQuery) {
+        return runNaturalSearchQuery(latestPendingQuery);
+      }
+
+      return result;
+    } catch (e) {
+      _searchScreenRequest = null;
+      _latestPendingQuery = null;
+      rethrow;
+    }
+  }
+
+  Future<NaturalSearchExecutionResult> _runNaturalSearchQueryInternal(
     String userQuery,
   ) async {
     final modelInput = await buildModelInput(userQuery);

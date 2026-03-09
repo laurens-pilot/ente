@@ -281,7 +281,7 @@ class SearchWidgetState extends State<SearchWidget> {
     queueSearchResults(_searchService.getVisualSearchResults(context, query));
     queueSearchResults(
       Future<List<SearchResult>>.delayed(
-        const Duration(milliseconds: 700),
+        const Duration(milliseconds: 1200),
         () async {
           if (!mounted || textController.text.trim() != query) {
             return const <SearchResult>[];
