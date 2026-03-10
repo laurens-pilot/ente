@@ -22,8 +22,7 @@
           "description": "Requested media type.",
           "enum": [
             "photo",
-            "video",
-            "both"
+            "video"
           ]
         },
         "ownership_scope": {
@@ -81,29 +80,13 @@
           "type": "string",
           "description": "File format or extension, such as jpg, heic, mp4, or mov."
         },
-        "video_duration_seconds": {
-          "type": "object",
-          "description": "Video duration range.",
-          "properties": {
-            "min": {
-              "type": "integer"
-            },
-            "max": {
-              "type": "integer"
-            }
-          }
+        "video_duration_query": {
+          "type": "string",
+          "description": "Raw video-duration phrase from the user, such as shorter than 2 minutes or between 30 seconds and 2 minutes."
         },
-        "file_size_mb": {
-          "type": "object",
-          "description": "File size range in MB.",
-          "properties": {
-            "min": {
-              "type": "integer"
-            },
-            "max": {
-              "type": "integer"
-            }
-          }
+        "file_size_query": {
+          "type": "string",
+          "description": "Raw file-size phrase from the user, such as larger than 50 mb or between 1 gb and 2 gb."
         },
         "limit": {
           "type": "integer",

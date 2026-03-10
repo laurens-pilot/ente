@@ -136,7 +136,7 @@ void main() {
 
     test("normalizes simplified planner arguments", () {
       const rawOutput =
-          "{\"name\":\"search_photos_v1\",\"arguments\":{\"media_type\":\"photo\",\"people_in_media\":[\"Laurens\"],\"people_mode\":\"all\",\"time_query\":\"last month\",\"visual_query\":\"Photo of a beach\",\"file_format\":\".heic\"}}";
+          "{\"name\":\"search_photos_v1\",\"arguments\":{\"media_type\":\"photo\",\"people_in_media\":[\"Laurens\"],\"people_mode\":\"all\",\"time_query\":\"last month\",\"visual_query\":\"Photo of a beach\",\"file_format\":\".heic\",\"video_duration_query\":\"shorter than 2 minutes\",\"file_size_query\":\"larger than 50 mb\"}}";
 
       final parsed = NaturalSearchService.instance.parseModelOutput(rawOutput);
 
@@ -147,7 +147,21 @@ void main() {
         "time_query": "last month",
         "visual_query": "Photo of a beach",
         "file_format": "heic",
+        "video_duration_query": "shorter than 2 minutes",
+        "file_size_query": "larger than 50 mb",
       });
+    });
+
+    test("drops legacy mixed file_types instead of normalizing to both", () {
+      const rawOutput =
+          "{\"name\":\"search_photos_v1\",\"arguments\":{\"file_types\":[\"image\",\"video\"],\"time_query\":\"last month\"}}";
+
+      final parsed = NaturalSearchService.instance.parseModelOutput(rawOutput);
+
+      expect(parsed.arguments, {
+        "time_query": "last month",
+      });
+      expect(parsed.arguments.containsKey("media_type"), isFalse);
     });
   });
 
@@ -274,6 +288,52 @@ void main() {
         ranges.first.endMicrosecondsExclusive,
         DateTime(2024, 8, 21).microsecondsSinceEpoch,
       );
+    });
+  });
+
+  group("resolveVideoDurationQueryToRangeJson", () {
+    test("resolves shorter than 2 minutes", () {
+      final range = NaturalSearchService.resolveVideoDurationQueryToRangeJson(
+        "shorter than 2 minutes",
+      );
+
+      expect(range, {
+        "max": 119,
+      });
+    });
+
+    test("resolves between 30 seconds and 2 minutes", () {
+      final range = NaturalSearchService.resolveVideoDurationQueryToRangeJson(
+        "between 30 seconds and 2 minutes",
+      );
+
+      expect(range, {
+        "min": 30,
+        "max": 120,
+      });
+    });
+  });
+
+  group("resolveFileSizeQueryToRangeJson", () {
+    test("resolves larger than 50 mb", () {
+      final range = NaturalSearchService.resolveFileSizeQueryToRangeJson(
+        "larger than 50 mb",
+      );
+
+      expect(range, {
+        "min": 52428801,
+      });
+    });
+
+    test("resolves between 1.5 gb and 2 gb", () {
+      final range = NaturalSearchService.resolveFileSizeQueryToRangeJson(
+        "between 1.5 gb and 2 gb",
+      );
+
+      expect(range, {
+        "min": 1610612736,
+        "max": 2147483648,
+      });
     });
   });
 

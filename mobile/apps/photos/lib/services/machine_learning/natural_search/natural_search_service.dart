@@ -120,6 +120,8 @@ class NaturalSearchService {
     "place_names",
     "visual_query",
     "file_format",
+    "video_duration_query",
+    "file_size_query",
     "video_duration_seconds",
     "file_size_mb",
     "limit",
@@ -140,7 +142,6 @@ class NaturalSearchService {
   static const Set<String> _mediaTypes = {
     "photo",
     "video",
-    "both",
   };
   static const Set<String> _reservedPeopleValues = {
     "all",
@@ -545,14 +546,24 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("video_duration_seconds")) {
-      final range = _resolveNumericRange(
-        normalizedArguments["video_duration_seconds"] as Map<String, dynamic>,
-      );
+    if (normalizedArguments.containsKey("video_duration_query") ||
+        normalizedArguments.containsKey("video_duration_seconds")) {
+      final range = normalizedArguments.containsKey("video_duration_query")
+          ? _resolveVideoDurationQuery(
+              normalizedArguments["video_duration_query"] as String,
+            )
+          : _resolveNumericRange(
+              normalizedArguments["video_duration_seconds"]
+                  as Map<String, dynamic>,
+            );
       warnings.addAll(range.warnings);
       if (!range.isValid) {
         workingFiles = [];
       } else {
+        if (normalizedArguments["video_duration_query"]
+            case final String query) {
+          resolvedArguments["video_duration_query"] = query;
+        }
         resolvedArguments["video_duration_seconds"] = range.toJson();
         workingFiles = workingFiles.where((file) {
           if (!file.isVideo || file.duration == null) {
@@ -563,16 +574,24 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("file_size_mb")) {
-      final range = _resolveNumericRange(
-        normalizedArguments["file_size_mb"] as Map<String, dynamic>,
-      );
+    if (normalizedArguments.containsKey("file_size_query") ||
+        normalizedArguments.containsKey("file_size_mb")) {
+      final range = normalizedArguments.containsKey("file_size_query")
+          ? _resolveFileSizeQuery(
+              normalizedArguments["file_size_query"] as String,
+            )
+          : _resolveNumericRange(
+              normalizedArguments["file_size_mb"] as Map<String, dynamic>,
+            ).scale(1024 * 1024);
       warnings.addAll(range.warnings);
       if (!range.isValid) {
         workingFiles = [];
       } else {
-        final minBytes = range.min != null ? range.min! * 1024 * 1024 : null;
-        final maxBytes = range.max != null ? range.max! * 1024 * 1024 : null;
+        if (normalizedArguments["file_size_query"] case final String query) {
+          resolvedArguments["file_size_query"] = query;
+        }
+        final minBytes = range.min;
+        final maxBytes = range.max;
         resolvedArguments["file_size_bytes"] = {
           if (minBytes != null) "min": minBytes,
           if (maxBytes != null) "max": maxBytes,
@@ -1555,6 +1574,14 @@ class NaturalSearchService {
         .trim();
   }
 
+  static String _normalizeNumericQueryText(String input) {
+    return input
+        .toLowerCase()
+        .replaceAll(RegExp(r"[^a-z0-9.\s-]"), " ")
+        .replaceAll(_whitespacePattern, " ")
+        .trim();
+  }
+
   static List<String> _extractMeaningfulContextTokens(String input) {
     return input
         .split(" ")
@@ -1848,6 +1875,12 @@ class NaturalSearchService {
             normalized["file_format"] = _normalizeFileFormatQuery(value);
           }
           break;
+        case "video_duration_query":
+        case "file_size_query":
+          if (value is String && value.trim().isNotEmpty) {
+            normalized[key] = value.trim();
+          }
+          break;
         case "video_duration_seconds":
         case "file_size_mb":
           if (value is Map<String, dynamic>) {
@@ -2096,7 +2129,7 @@ class NaturalSearchService {
         normalizedTypes.contains("live_photo");
     final hasVideo = normalizedTypes.contains("video");
     if (hasPhoto && hasVideo) {
-      return "both";
+      return null;
     }
     if (hasPhoto) {
       return "photo";
@@ -2344,12 +2377,6 @@ class NaturalSearchService {
         };
       case "video":
         return {
-          FileType.video,
-        };
-      case "both":
-        return {
-          FileType.image,
-          FileType.livePhoto,
           FileType.video,
         };
     }
@@ -2649,6 +2676,389 @@ class NaturalSearchService {
     }
 
     return _NumericRangeResult(min: min, max: max, warnings: warnings);
+  }
+
+  @visibleForTesting
+  static Map<String, int> resolveVideoDurationQueryToRangeJson(
+    String durationQuery,
+  ) {
+    return _resolveVideoDurationQuery(durationQuery).toJson();
+  }
+
+  static _NumericRangeResult _resolveVideoDurationQuery(String durationQuery) {
+    final normalized = _normalizeNumericQueryText(durationQuery);
+    if (normalized.isEmpty) {
+      return _NumericRangeResult(
+        min: null,
+        max: null,
+        warnings: ["Could not parse empty video_duration_query"],
+      );
+    }
+
+    final betweenMatch = RegExp(
+      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)?\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+    ).firstMatch(normalized);
+    if (betweenMatch != null) {
+      final firstValue = double.parse(betweenMatch.group(1)!);
+      final firstUnit = betweenMatch.group(2) ?? betweenMatch.group(4)!;
+      final secondValue = double.parse(betweenMatch.group(3)!);
+      final secondUnit = betweenMatch.group(4)!;
+      return _buildDurationRange(
+        firstValue: firstValue,
+        firstUnit: firstUnit,
+        secondValue: secondValue,
+        secondUnit: secondUnit,
+        inclusive: true,
+      );
+    }
+
+    final rangedMatch = RegExp(
+      r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)?\s*-\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+    ).firstMatch(normalized);
+    if (rangedMatch != null) {
+      final firstValue = double.parse(rangedMatch.group(1)!);
+      final firstUnit = rangedMatch.group(2) ?? rangedMatch.group(4)!;
+      final secondValue = double.parse(rangedMatch.group(3)!);
+      final secondUnit = rangedMatch.group(4)!;
+      return _buildDurationRange(
+        firstValue: firstValue,
+        firstUnit: firstUnit,
+        secondValue: secondValue,
+        secondUnit: secondUnit,
+        inclusive: true,
+      );
+    }
+
+    final inclusiveLowerMatch = RegExp(
+      r"(?:at least|minimum of|min(?:imum)? of|no less than)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (inclusiveLowerMatch != null) {
+      final value =
+          _parseDurationPhraseToSeconds(inclusiveLowerMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: value,
+          max: null,
+          warnings: const [],
+        );
+      }
+    }
+
+    final strictLowerMatch = RegExp(
+      r"(?:over|more than|longer than|above|greater than)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (strictLowerMatch != null) {
+      final value = _parseDurationPhraseToSeconds(strictLowerMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: value + 1,
+          max: null,
+          warnings: const [],
+        );
+      }
+    }
+
+    final inclusiveUpperMatch = RegExp(
+      r"(?:at most|up to|maximum of|max(?:imum)? of|no more than)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (inclusiveUpperMatch != null) {
+      final value =
+          _parseDurationPhraseToSeconds(inclusiveUpperMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: null,
+          max: value,
+          warnings: const [],
+        );
+      }
+    }
+
+    final strictUpperMatch = RegExp(
+      r"(?:under|less than|shorter than|below)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (strictUpperMatch != null) {
+      final value = _parseDurationPhraseToSeconds(strictUpperMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: null,
+          max: value > 0 ? value - 1 : 0,
+          warnings: const [],
+        );
+      }
+    }
+
+    final exactValue = _parseDurationPhraseToSeconds(normalized);
+    if (exactValue != null) {
+      return _NumericRangeResult(
+        min: exactValue,
+        max: exactValue,
+        warnings: const [],
+      );
+    }
+
+    return _NumericRangeResult(
+      min: null,
+      max: null,
+      warnings: ["Could not parse video_duration_query '$durationQuery'"],
+    );
+  }
+
+  @visibleForTesting
+  static Map<String, int> resolveFileSizeQueryToRangeJson(
+    String fileSizeQuery,
+  ) {
+    return _resolveFileSizeQuery(fileSizeQuery).toJson();
+  }
+
+  static _NumericRangeResult _resolveFileSizeQuery(String fileSizeQuery) {
+    final normalized = _normalizeNumericQueryText(fileSizeQuery);
+    if (normalized.isEmpty) {
+      return _NumericRangeResult(
+        min: null,
+        max: null,
+        warnings: ["Could not parse empty file_size_query"],
+      );
+    }
+
+    final betweenMatch = RegExp(
+      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)?\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+    ).firstMatch(normalized);
+    if (betweenMatch != null) {
+      final firstValue = double.parse(betweenMatch.group(1)!);
+      final firstUnit = betweenMatch.group(2) ?? betweenMatch.group(4)!;
+      final secondValue = double.parse(betweenMatch.group(3)!);
+      final secondUnit = betweenMatch.group(4)!;
+      return _buildSizeRange(
+        firstValue: firstValue,
+        firstUnit: firstUnit,
+        secondValue: secondValue,
+        secondUnit: secondUnit,
+      );
+    }
+
+    final rangedMatch = RegExp(
+      r"(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)?\s*-\s*(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+    ).firstMatch(normalized);
+    if (rangedMatch != null) {
+      final firstValue = double.parse(rangedMatch.group(1)!);
+      final firstUnit = rangedMatch.group(2) ?? rangedMatch.group(4)!;
+      final secondValue = double.parse(rangedMatch.group(3)!);
+      final secondUnit = rangedMatch.group(4)!;
+      return _buildSizeRange(
+        firstValue: firstValue,
+        firstUnit: firstUnit,
+        secondValue: secondValue,
+        secondUnit: secondUnit,
+      );
+    }
+
+    final inclusiveLowerMatch = RegExp(
+      r"(?:at least|minimum of|min(?:imum)? of|no less than)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (inclusiveLowerMatch != null) {
+      final value = _parseFileSizePhraseToBytes(inclusiveLowerMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: value,
+          max: null,
+          warnings: const [],
+        );
+      }
+    }
+
+    final strictLowerMatch = RegExp(
+      r"(?:over|more than|larger than|bigger than|greater than|above)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (strictLowerMatch != null) {
+      final value = _parseFileSizePhraseToBytes(strictLowerMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: value + 1,
+          max: null,
+          warnings: const [],
+        );
+      }
+    }
+
+    final inclusiveUpperMatch = RegExp(
+      r"(?:at most|up to|maximum of|max(?:imum)? of|no more than)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (inclusiveUpperMatch != null) {
+      final value = _parseFileSizePhraseToBytes(inclusiveUpperMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: null,
+          max: value,
+          warnings: const [],
+        );
+      }
+    }
+
+    final strictUpperMatch = RegExp(
+      r"(?:under|less than|smaller than|below)\s+(.+)$",
+    ).firstMatch(normalized);
+    if (strictUpperMatch != null) {
+      final value = _parseFileSizePhraseToBytes(strictUpperMatch.group(1)!);
+      if (value != null) {
+        return _NumericRangeResult(
+          min: null,
+          max: value > 0 ? value - 1 : 0,
+          warnings: const [],
+        );
+      }
+    }
+
+    final exactValue = _parseFileSizePhraseToBytes(normalized);
+    if (exactValue != null) {
+      return _NumericRangeResult(
+        min: exactValue,
+        max: exactValue,
+        warnings: const [],
+      );
+    }
+
+    return _NumericRangeResult(
+      min: null,
+      max: null,
+      warnings: ["Could not parse file_size_query '$fileSizeQuery'"],
+    );
+  }
+
+  static _NumericRangeResult _buildDurationRange({
+    required double firstValue,
+    required String firstUnit,
+    required double secondValue,
+    required String secondUnit,
+    required bool inclusive,
+  }) {
+    final firstSeconds = _durationToSeconds(firstValue, firstUnit);
+    final secondSeconds = _durationToSeconds(secondValue, secondUnit);
+    if (firstSeconds == null || secondSeconds == null) {
+      return _NumericRangeResult(
+        min: null,
+        max: null,
+        warnings: const ["Could not parse video_duration_query range"],
+      );
+    }
+    var min = firstSeconds;
+    var max = secondSeconds;
+    if (min > max) {
+      final tmp = min;
+      min = max;
+      max = tmp;
+    }
+    return _NumericRangeResult(
+      min: min,
+      max: inclusive ? max : max - 1,
+      warnings: const [],
+    );
+  }
+
+  static _NumericRangeResult _buildSizeRange({
+    required double firstValue,
+    required String firstUnit,
+    required double secondValue,
+    required String secondUnit,
+  }) {
+    final firstBytes = _fileSizeToBytes(firstValue, firstUnit);
+    final secondBytes = _fileSizeToBytes(secondValue, secondUnit);
+    if (firstBytes == null || secondBytes == null) {
+      return _NumericRangeResult(
+        min: null,
+        max: null,
+        warnings: const ["Could not parse file_size_query range"],
+      );
+    }
+    var min = firstBytes;
+    var max = secondBytes;
+    if (min > max) {
+      final tmp = min;
+      min = max;
+      max = tmp;
+    }
+    return _NumericRangeResult(min: min, max: max, warnings: const []);
+  }
+
+  static int? _parseDurationPhraseToSeconds(String phrase) {
+    final normalized = _normalizeNumericQueryText(phrase);
+    final matches = RegExp(
+      r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+    ).allMatches(normalized);
+    if (matches.isEmpty) {
+      return null;
+    }
+
+    var totalSeconds = 0.0;
+    for (final match in matches) {
+      final value = double.parse(match.group(1)!);
+      final unit = match.group(2)!;
+      final seconds = _durationToSeconds(value, unit);
+      if (seconds == null) {
+        return null;
+      }
+      totalSeconds += seconds;
+    }
+    return totalSeconds.round();
+  }
+
+  static int? _durationToSeconds(double value, String unit) {
+    switch (unit.toLowerCase()) {
+      case "h":
+      case "hr":
+      case "hrs":
+      case "hour":
+      case "hours":
+        return (value * 60 * 60).round();
+      case "m":
+      case "min":
+      case "mins":
+      case "minute":
+      case "minutes":
+        return (value * 60).round();
+      case "s":
+      case "sec":
+      case "secs":
+      case "second":
+      case "seconds":
+        return value.round();
+    }
+    return null;
+  }
+
+  static int? _parseFileSizePhraseToBytes(String phrase) {
+    final normalized = _normalizeNumericQueryText(phrase);
+    final match = RegExp(
+      r"(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+    ).firstMatch(normalized);
+    if (match == null) {
+      return null;
+    }
+    return _fileSizeToBytes(
+      double.parse(match.group(1)!),
+      match.group(2)!,
+    );
+  }
+
+  static int? _fileSizeToBytes(double value, String unit) {
+    switch (unit.toLowerCase()) {
+      case "b":
+      case "byte":
+      case "bytes":
+        return value.round();
+      case "kb":
+      case "kib":
+        return (value * 1024).round();
+      case "mb":
+      case "mib":
+        return (value * 1024 * 1024).round();
+      case "gb":
+      case "gib":
+        return (value * 1024 * 1024 * 1024).round();
+      case "tb":
+      case "tib":
+        return (value * 1024 * 1024 * 1024 * 1024).round();
+    }
+    return null;
   }
 
   void _sortFilesChronologically(List<EnteFile> files) {
@@ -3081,6 +3491,14 @@ class _NumericRangeResult {
       if (min != null) "min": min!,
       if (max != null) "max": max!,
     };
+  }
+
+  _NumericRangeResult scale(int factor) {
+    return _NumericRangeResult(
+      min: min != null ? min! * factor : null,
+      max: max != null ? max! * factor : null,
+      warnings: warnings,
+    );
   }
 }
 
