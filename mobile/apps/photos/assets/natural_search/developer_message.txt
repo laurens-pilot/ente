@@ -10,7 +10,10 @@ Do not include null values, empty arrays, duplicate fields, or invented values.
 Use exact canonical labels from runtime context when available. If a runtime-context list is absent, leave that field unset.
 
 Use:
- - `media_type` for photo or video only. Omit it when the user wants both or does not explicitly specify a media type.
+- `media_type="photo"` only when the user clearly restricts to photos, pictures, or images, for example `only photos`, `just pictures`, `photos only`, or `no videos`.
+- `media_type="video"` when the user explicitly asks for videos, clips, or movies.
+- Omit `media_type` when the user wants both or does not explicitly specify a media type.
+- Treat bare colloquial words like `photos`, `pictures`, `images`, and `pics` as generic wording; they do not by themselves require `media_type="photo"`.
 - `ownership_scope` only when the query says my, mine, shared with me, shared by, or all accessible.
 - `shared_by_contacts` only for who shared the media.
 - `album_names`, `people_in_media`, and saved `place_names` only for exact labels from runtime context.
@@ -27,8 +30,9 @@ Use:
 - `limit` only when the user asks for a number of results.
 
 Examples:
-- `photos from last month` -> `media_type="photo"`, `time_query="last month"`
+- `photos from last month` -> `time_query="last month"`
+- `only photos from last month` -> `media_type="photo"`, `time_query="last month"`
 - `videos shorter than 2 minutes` -> `media_type="video"`, `video_duration_query="shorter than 2 minutes"`
 - `files larger than 50 mb` -> `file_size_query="larger than 50 mb"`
 - `videos from August 14 till August 20 of 2024` -> `media_type="video"`, `time_query="August 14 till August 20 of 2024"`
-- `my photos on a beach in France` -> `ownership_scope="mine"`, `media_type="photo"`, `place_names=["France"]`, `visual_query="Photo of a beach"`
+- `my photos on a beach in France` -> `ownership_scope="mine"`, `place_names=["France"]`, `visual_query="Photo of a beach"`

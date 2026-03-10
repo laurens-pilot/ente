@@ -19,11 +19,8 @@
         },
         "media_type": {
           "type": "string",
-          "description": "Requested media type.",
-          "enum": [
-            "photo",
-            "video"
-          ]
+          "description": "Requested media type. Use for explicit photo-only or video requests. Bare generic words like photos, pictures, images, or pics do not by themselves require this field.",
+          "enum": ["photo", "video"]
         },
         "ownership_scope": {
           "type": "string",
@@ -52,10 +49,7 @@
         "people_mode": {
           "type": "string",
           "description": "How to combine multiple named people.",
-          "enum": [
-            "any",
-            "all"
-          ]
+          "enum": ["any", "all"]
         },
         "place_names": {
           "type": "array",
