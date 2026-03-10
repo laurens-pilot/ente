@@ -2,124 +2,30 @@
   "type": "function",
   "function": {
     "name": "search_photos_v1",
-    "description": "Search the user's photo and video library using structured filters. Return exactly one function call. Populate only filters that are explicitly requested or clearly implied. Prefer exact names from the provided entity lists for albums, people, location tags, and contacts. Use place_queries for city, region, country, or place names that are not saved user location tags. Use semantic_query only for visual content such as beach, dog, sunset, selfie, screenshot, concert, mountain, food, wedding, or receipt. Results are returned chronologically by the app. All time values are local time in YYYY-MM-DDTHH:mm:ss format. end_local_exclusive is exclusive.",
+    "description": "Plan a natural-language Ente Photos search using simple structured fields.",
     "parameters": {
       "type": "object",
-      "additionalProperties": false,
       "properties": {
-        "time_filter": {
-          "type": "object",
-          "description": "Structured time constraint. Use kind=absolute_range for one resolved range. Use kind=multiple_ranges for several explicit resolved ranges. Use the calendar kinds for recurring or calendar-based constraints so the app can expand them deterministically.",
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "type": "string",
-              "enum": [
-                "absolute_range",
-                "multiple_ranges",
-                "calendar_month",
-                "calendar_year",
-                "day_month_year",
-                "day_month_every_year",
-                "month_every_year"
-              ],
-              "description": "Type of time constraint."
-            },
-            "ranges": {
-              "type": "array",
-              "description": "Resolved local datetime ranges. Required for absolute_range and multiple_ranges. end_local_exclusive must be exclusive.",
-              "minItems": 1,
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "start_local": {
-                    "type": "string",
-                    "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$",
-                    "description": "Range start in local time."
-                  },
-                  "end_local_exclusive": {
-                    "type": "string",
-                    "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$",
-                    "description": "Exclusive range end in local time."
-                  }
-                },
-                "required": ["start_local", "end_local_exclusive"]
-              }
-            },
-            "year": {
-              "type": "integer",
-              "minimum": 1900,
-              "maximum": 2100,
-              "description": "Calendar year when needed by the selected kind."
-            },
-            "month": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 12,
-              "description": "Calendar month when needed by the selected kind."
-            },
-            "day": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 31,
-              "description": "Calendar day when needed by the selected kind."
-            }
-          },
-          "required": ["kind"]
+        "time_query": {
+          "type": "string",
+          "description": "Raw time phrase from the user, such as last month, March 2024, or August 14 till August 20 of 2024."
         },
-
-        "ente_album_names": {
+        "album_names": {
           "type": "array",
-          "description": "Exact Ente album names from the provided available_ente_album_names list.",
-          "minItems": 1,
-          "uniqueItems": true,
+          "description": "Exact saved album names from runtime context.",
           "items": {
             "type": "string"
           }
         },
-
-        "device_album_names": {
-          "type": "array",
-          "description": "Exact on-device album names from the provided available_device_album_names list.",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string"
-          }
-        },
-
-        "file_types": {
-          "type": "array",
-          "description": "Requested media types.",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "enum": ["image", "video", "live_photo"]
-          }
-        },
-
-        "filename_query": {
+        "media_type": {
           "type": "string",
-          "description": "Filename or title text to match."
+          "description": "Requested media type.",
+          "enum": [
+            "photo",
+            "video",
+            "both"
+          ]
         },
-
-        "caption_query": {
-          "type": "string",
-          "description": "Caption or description text to match."
-        },
-
-        "camera_make_query": {
-          "type": "string",
-          "description": "Camera make text, such as Apple, Canon, Sony, Nikon, or Google."
-        },
-
-        "camera_model_query": {
-          "type": "string",
-          "description": "Camera model text, such as iPhone 15 Pro, EOS R5, Pixel 8, or A7 IV."
-        },
-
         "ownership_scope": {
           "type": "string",
           "description": "Ownership or sharing scope.",
@@ -130,95 +36,78 @@
             "all_accessible"
           ]
         },
-
-        "contact_names": {
+        "shared_by_contacts": {
           "type": "array",
-          "description": "Exact contact names or emails from the provided contact lists. Use only when ownership_scope is shared_by_contacts.",
-          "minItems": 1,
-          "uniqueItems": true,
+          "description": "Exact contact names from runtime context for who shared the media.",
           "items": {
             "type": "string"
           }
         },
-
-        "person_names": {
+        "people_in_media": {
           "type": "array",
-          "description": "Exact recognized person names from the provided available_person_names list.",
-          "minItems": 1,
-          "uniqueItems": true,
+          "description": "Exact person names from runtime context.",
           "items": {
             "type": "string"
           }
         },
-
-        "person_operator": {
+        "people_mode": {
           "type": "string",
-          "description": "How to combine multiple person_names.",
-          "enum": ["any", "all"]
+          "description": "How to combine multiple named people.",
+          "enum": [
+            "any",
+            "all"
+          ]
         },
-
-        "location_tag_names": {
+        "place_names": {
           "type": "array",
-          "description": "Exact saved user location tag names from the provided available_location_tag_names list.",
-          "minItems": 1,
-          "uniqueItems": true,
+          "description": "Saved location tag names from runtime context or free-text places.",
           "items": {
             "type": "string"
           }
         },
-
-        "place_queries": {
-          "type": "array",
-          "description": "Free-text city, region, country, landmark, or place names for place database resolution. Use this for places that are not saved user location tags.",
-          "minItems": 1,
-          "uniqueItems": true,
-          "items": {
-            "type": "string"
-          }
-        },
-
-        "semantic_query": {
+        "visual_query": {
           "type": "string",
-          "description": "Visual or semantic query for CLIP/Magic search. Use this for what is visually present in the photo or video."
+          "description": "Visible content query."
         },
-
+        "text_query": {
+          "type": "string",
+          "description": "Caption, description, or filename text."
+        },
+        "camera_query": {
+          "type": "string",
+          "description": "Camera make or model query."
+        },
+        "file_format": {
+          "type": "string",
+          "description": "File format or extension, such as jpg, heic, mp4, or mov."
+        },
         "video_duration_seconds": {
           "type": "object",
-          "description": "Video duration range in seconds.",
-          "additionalProperties": false,
+          "description": "Video duration range.",
           "properties": {
             "min": {
-              "type": "integer",
-              "minimum": 0
+              "type": "integer"
             },
             "max": {
-              "type": "integer",
-              "minimum": 0
+              "type": "integer"
             }
           }
         },
-
         "file_size_mb": {
           "type": "object",
-          "description": "File size range in megabytes.",
-          "additionalProperties": false,
+          "description": "File size range in MB.",
           "properties": {
             "min": {
-              "type": "integer",
-              "minimum": 0
+              "type": "integer"
             },
             "max": {
-              "type": "integer",
-              "minimum": 0
+              "type": "integer"
             }
           }
         },
-
         "limit": {
           "type": "integer",
-          "minimum": 1,
-          "maximum": 500,
-          "description": "Maximum number of results to return."
+          "description": "Maximum result count."
         }
       }
     }

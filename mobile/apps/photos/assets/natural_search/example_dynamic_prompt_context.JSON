@@ -4,16 +4,10 @@
   "week_start": "monday",
   "search_start_year": 2016,
   "result_ordering": "chronological",
-
-  "available_ente_album_names": ["Trips", "Family", "Favorites"],
-
-  "available_device_album_names": ["Camera", "Screenshots", "WhatsApp Images"],
-
-  "available_person_names": ["Alice", "Bob", "Mom"],
-
+  "available_album_names": ["Trips", "Family", "Favorites"],
+  "available_people_in_media": ["Alice", "Bob", "Mom"],
   "available_location_tag_names": ["Home", "Goa", "Paris"],
-
-  "available_contact_names": [
+  "available_shared_by_contacts": [
     "Alice Johnson <alice@example.com>",
     "Bob Lee <bob@example.com>"
   ]

@@ -30,6 +30,14 @@ import "package:photos/services/search_service.dart";
 import "package:photos/services/timezone_aliases.dart";
 import "package:photos/utils/file_util.dart";
 
+enum NaturalSearchContextEntityKind {
+  album,
+  deviceAlbum,
+  person,
+  locationTag,
+  contact,
+}
+
 class NaturalSearchService {
   NaturalSearchService._privateConstructor();
 
@@ -43,6 +51,9 @@ class NaturalSearchService {
   static const String _examplePromptContextAssetPath =
       "assets/natural_search/example_dynamic_prompt_context.JSON";
   static const String _toolName = "search_photos_v1";
+  static const Set<String> _supportedToolNames = {
+    _toolName,
+  };
 
   static const Set<String> _timeFilterKinds = {
     "absolute_range",
@@ -62,9 +73,56 @@ class NaturalSearchService {
   };
 
   static const Set<String> _personOperators = {"any", "all"};
+  static const Set<String> _schemaLeakageArgumentFields = {
+    "additionalProperties",
+    "properties",
+    "required",
+    "description",
+    "type",
+    "items",
+    "enum",
+    "minimum",
+    "maximum",
+    "pattern",
+    "minItems",
+    "uniqueItems",
+  };
+  static const Set<String> _listArgumentFields = {
+    "album_names",
+    "shared_by_contacts",
+    "people_in_media",
+    "place_names",
+    "ente_album_names",
+    "device_album_names",
+    "file_types",
+    "contact_names",
+    "person_names",
+    "location_tag_names",
+    "place_queries",
+  };
+  static const Set<String> _objectArgumentFields = {
+    "time_filter",
+    "video_duration_seconds",
+    "file_size_mb",
+  };
 
   static const Set<String> _allowedArgumentFields = {
+    "time_query",
     "time_filter",
+    "album_names",
+    "media_type",
+    "text_query",
+    "camera_query",
+    "ownership_scope",
+    "shared_by_contacts",
+    "people_in_media",
+    "people_mode",
+    "place_names",
+    "visual_query",
+    "file_format",
+    "video_duration_seconds",
+    "file_size_mb",
+    "limit",
     "ente_album_names",
     "device_album_names",
     "file_types",
@@ -72,17 +130,131 @@ class NaturalSearchService {
     "caption_query",
     "camera_make_query",
     "camera_model_query",
-    "ownership_scope",
     "contact_names",
     "person_names",
     "person_operator",
     "location_tag_names",
     "place_queries",
     "semantic_query",
-    "video_duration_seconds",
-    "file_size_mb",
-    "limit",
   };
+  static const Set<String> _mediaTypes = {
+    "photo",
+    "video",
+    "both",
+  };
+  static const Set<String> _reservedPeopleValues = {
+    "all",
+    "any",
+    "me",
+    "my",
+    "mine",
+    "person",
+    "people",
+    "someone",
+  };
+  static const Set<String> _queryStopWords = {
+    "a",
+    "an",
+    "all",
+    "any",
+    "at",
+    "by",
+    "day",
+    "days",
+    "find",
+    "for",
+    "from",
+    "give",
+    "image",
+    "images",
+    "in",
+    "last",
+    "me",
+    "month",
+    "months",
+    "movie",
+    "movies",
+    "my",
+    "of",
+    "on",
+    "or",
+    "past",
+    "photo",
+    "photos",
+    "picture",
+    "pictures",
+    "search",
+    "show",
+    "the",
+    "this",
+    "to",
+    "video",
+    "videos",
+    "week",
+    "weeks",
+    "with",
+    "year",
+    "years",
+  };
+  static const Set<String> _albumIntentTokens = {
+    "album",
+    "albums",
+    "collection",
+    "collections",
+    "folder",
+    "folders",
+  };
+  static const Set<String> _sharingIntentTokens = {
+    "receive",
+    "received",
+    "sent",
+    "share",
+    "shared",
+    "shares",
+    "sharing",
+  };
+  static const Map<String, int> _monthNameToNumber = {
+    "january": 1,
+    "jan": 1,
+    "february": 2,
+    "feb": 2,
+    "march": 3,
+    "mar": 3,
+    "april": 4,
+    "apr": 4,
+    "may": 5,
+    "june": 6,
+    "jun": 6,
+    "july": 7,
+    "jul": 7,
+    "august": 8,
+    "aug": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "october": 10,
+    "oct": 10,
+    "november": 11,
+    "nov": 11,
+    "december": 12,
+    "dec": 12,
+  };
+  static const Map<String, int> _numberWordToInt = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+  };
+  static final RegExp _nonAlphaNumericPattern = RegExp(r"[^a-z0-9]+");
+  static final RegExp _whitespacePattern = RegExp(r"\s+");
 
   final _logger = Logger("NaturalSearchService");
   Future<NaturalSearchExecutionResult>? _searchScreenRequest;
@@ -97,12 +269,11 @@ class NaturalSearchService {
     final normalizedQuery = userQuery.trim();
     final toolSchema = await _loadToolSchema();
     final developerPromptBase = await _loadDeveloperPrompt();
-    final dynamicContext = await _buildDynamicPromptContext();
-    const encoder = JsonEncoder.withIndent("  ");
-    final promptContextJson = encoder.convert(dynamicContext);
+    final dynamicContext = await _buildDynamicPromptContext(normalizedQuery);
+    final promptContextJson = jsonEncode(dynamicContext);
 
     final developerPrompt =
-        "$developerPromptBase\n\nRuntime context JSON:\n$promptContextJson";
+        "$developerPromptBase\nRuntime context JSON:$promptContextJson";
 
     return NaturalSearchModelInput(
       userQuery: normalizedQuery,
@@ -116,11 +287,20 @@ class NaturalSearchService {
   NaturalSearchParsedToolCall parseModelOutput(String rawOutput) {
     final parsed = parseToolCallPayload(rawOutput);
     final normalizedArguments = _normalizeArguments(parsed.arguments);
+    final validationIssues = detectCorruptedToolCallIssues(
+      parsed.arguments,
+      normalizedArguments.arguments,
+    );
 
     return NaturalSearchParsedToolCall(
       name: parsed.name,
       arguments: normalizedArguments.arguments,
-      warnings: [...parsed.warnings, ...normalizedArguments.warnings],
+      warnings: [
+        ...parsed.warnings,
+        ...normalizedArguments.warnings,
+        ...validationIssues.map((issue) => "Tool call validation: $issue"),
+      ],
+      validationIssues: validationIssues,
       rawCallJson: parsed.rawCallJson,
     );
   }
@@ -148,11 +328,18 @@ class NaturalSearchService {
     String? rawFunctionGemmaToolCallOutput,
   }) async {
     final normalizationResult = _normalizeArguments(toolArguments);
-    final normalizedArguments = normalizationResult.arguments;
+    var normalizedArguments = normalizationResult.arguments;
     final warnings = <String>[
       ...parserWarnings,
       ...normalizationResult.warnings,
     ];
+
+    final pruningResult = await _pruneArgumentsForExecution(
+      originalQuery: originalQuery,
+      normalizedArguments: normalizedArguments,
+    );
+    normalizedArguments = pruningResult.arguments;
+    warnings.addAll(pruningResult.warnings);
 
     final allFiles = await SearchService.instance.getAllFilesForSearch();
     var workingFiles = List<EnteFile>.from(allFiles);
@@ -168,18 +355,25 @@ class NaturalSearchService {
       warnings.addAll(result.warnings);
     }
 
-    if (normalizedArguments.containsKey("time_filter")) {
-      final timeFilter =
-          normalizedArguments["time_filter"] as Map<String, dynamic>;
-      final ranges = resolveTimeFilterToRanges(
-        timeFilter,
-        searchStartYearOverride: searchStartYear,
-        nowOverride: DateTime.now(),
-      );
-      if (ranges.isEmpty) {
-        warnings.add("time_filter resolved to 0 ranges; skipping time filter");
+    final timeRanges = normalizedArguments.containsKey("time_query")
+        ? resolveTimeQueryToRanges(
+            normalizedArguments["time_query"] as String,
+            searchStartYearOverride: searchStartYear,
+            nowOverride: DateTime.now(),
+          )
+        : normalizedArguments.containsKey("time_filter")
+            ? resolveTimeFilterToRanges(
+                normalizedArguments["time_filter"] as Map<String, dynamic>,
+                searchStartYearOverride: searchStartYear,
+                nowOverride: DateTime.now(),
+              )
+            : const <TimeRangeMicros>[];
+    if (normalizedArguments.containsKey("time_query") ||
+        normalizedArguments.containsKey("time_filter")) {
+      if (timeRanges.isEmpty) {
+        warnings.add("time query resolved to 0 ranges; skipping time filter");
       } else {
-        resolvedArguments["time_ranges_micros"] = ranges
+        resolvedArguments["time_ranges_micros"] = timeRanges
             .map(
               (range) => {
                 "start_microseconds": range.startMicroseconds,
@@ -187,12 +381,15 @@ class NaturalSearchService {
               },
             )
             .toList(growable: false);
+        if (normalizedArguments["time_query"] case final String timeQuery) {
+          resolvedArguments["time_query"] = timeQuery;
+        }
         workingFiles = workingFiles.where((file) {
           final createdAt = file.creationTime;
           if (createdAt == null) {
             return false;
           }
-          for (final range in ranges) {
+          for (final range in timeRanges) {
             if (range.contains(createdAt)) {
               return true;
             }
@@ -202,48 +399,36 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("ente_album_names")) {
-      final requestedNames =
-          (normalizedArguments["ente_album_names"] as List<String>);
-      final resolution = _resolveEnteAlbumIDs(requestedNames);
-      if (resolution.collectionIds.isEmpty) {
-        warnings.add("No matching Ente albums found for ente_album_names");
+    if (normalizedArguments.containsKey("album_names")) {
+      final requestedNames = normalizedArguments["album_names"] as List<String>;
+      final resolution = await _resolveAlbumNames(requestedNames);
+      warnings.addAll(resolution.warnings);
+      resolvedArguments["album_names_resolved"] = {
+        "album_names": requestedNames,
+        "ente_album_collection_ids":
+            resolution.collectionIds.toList(growable: false),
+        "device_album_path_ids": resolution.pathIDs.toList(growable: false),
+      };
+
+      if (resolution.collectionIds.isEmpty && resolution.localIDs.isEmpty) {
         workingFiles = [];
       } else {
-        resolvedArguments["ente_album_collection_ids"] =
-            resolution.collectionIds.toList(growable: false);
         workingFiles = workingFiles.where((file) {
-          final collectionID = file.collectionID;
-          return collectionID != null &&
-              resolution.collectionIds.contains(collectionID);
+          final collectionMatch = file.collectionID != null &&
+              resolution.collectionIds.contains(file.collectionID);
+          final deviceMatch = file.localID != null &&
+              resolution.localIDs.contains(file.localID);
+          return collectionMatch || deviceMatch;
         }).toList(growable: false);
       }
-      warnings.addAll(resolution.warnings);
     }
 
-    if (normalizedArguments.containsKey("device_album_names")) {
-      final requestedNames =
-          (normalizedArguments["device_album_names"] as List<String>);
-      final resolution = await _resolveDeviceAlbumLocalIDs(requestedNames);
-      if (resolution.localIDs.isEmpty) {
-        warnings.add("No matching device albums found for device_album_names");
-        workingFiles = [];
-      } else {
-        resolvedArguments["device_album_path_ids"] =
-            resolution.pathIDs.toList(growable: false);
-        workingFiles = workingFiles.where((file) {
-          final localID = file.localID;
-          return localID != null && resolution.localIDs.contains(localID);
-        }).toList(growable: false);
-      }
-      warnings.addAll(resolution.warnings);
-    }
-
-    if (normalizedArguments.containsKey("file_types")) {
-      final fileTypes =
-          _resolveFileTypes(normalizedArguments["file_types"] as List<String>);
+    if (normalizedArguments.containsKey("media_type")) {
+      final fileTypes = _resolveMediaType(
+        normalizedArguments["media_type"] as String,
+      );
       if (fileTypes.isEmpty) {
-        warnings.add("No valid file types resolved from file_types");
+        warnings.add("No valid file types resolved from media_type");
         workingFiles = [];
       } else {
         resolvedArguments["file_types"] =
@@ -254,47 +439,41 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("filename_query")) {
-      final query = normalizedArguments["filename_query"] as String;
+    if (normalizedArguments.containsKey("text_query")) {
+      final query = normalizedArguments["text_query"] as String;
+      final normalizedQuery = query.toLowerCase();
       workingFiles = workingFiles.where((file) {
-        return file.displayName.toLowerCase().contains(query.toLowerCase());
-      }).toList(growable: false);
-    }
-
-    if (normalizedArguments.containsKey("caption_query")) {
-      final query = normalizedArguments["caption_query"] as String;
-      workingFiles = workingFiles.where((file) {
+        final filenameMatched =
+            file.displayName.toLowerCase().contains(normalizedQuery);
         final caption = file.caption;
-        return caption != null &&
-            caption.toLowerCase().contains(query.toLowerCase());
+        final captionMatched =
+            caption != null && caption.toLowerCase().contains(normalizedQuery);
+        return filenameMatched || captionMatched;
       }).toList(growable: false);
     }
 
-    if (normalizedArguments.containsKey("camera_make_query")) {
-      final query = normalizedArguments["camera_make_query"] as String;
+    if (normalizedArguments.containsKey("camera_query")) {
+      final query = normalizedArguments["camera_query"] as String;
+      final normalizedQuery = query.toLowerCase();
       workingFiles = workingFiles.where((file) {
         final make = file.cameraMake;
-        return make != null && make.toLowerCase().contains(query.toLowerCase());
-      }).toList(growable: false);
-    }
-
-    if (normalizedArguments.containsKey("camera_model_query")) {
-      final query = normalizedArguments["camera_model_query"] as String;
-      workingFiles = workingFiles.where((file) {
         final model = file.cameraModel;
-        return model != null &&
-            model.toLowerCase().contains(query.toLowerCase());
+        final makeMatched =
+            make != null && make.toLowerCase().contains(normalizedQuery);
+        final modelMatched =
+            model != null && model.toLowerCase().contains(normalizedQuery);
+        return makeMatched || modelMatched;
       }).toList(growable: false);
     }
 
-    if (normalizedArguments.containsKey("person_names")) {
+    if (normalizedArguments.containsKey("people_in_media")) {
       final requestedNames =
-          normalizedArguments["person_names"] as List<String>;
-      final personOperator =
-          (normalizedArguments["person_operator"] as String?) ?? "any";
+          normalizedArguments["people_in_media"] as List<String>;
+      final peopleMode =
+          (normalizedArguments["people_mode"] as String?) ?? "any";
       final resolution = await _resolvePersonUploadedIDs(
         requestedNames,
-        personOperator,
+        peopleMode,
       );
       warnings.addAll(resolution.warnings);
       resolvedArguments["person_ids"] = resolution.personIDs;
@@ -310,43 +489,14 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("location_tag_names")) {
-      final requestedNames =
-          normalizedArguments["location_tag_names"] as List<String>;
-      final resolution = await _resolveLocationTags(requestedNames);
-      warnings.addAll(resolution.warnings);
-      resolvedArguments["location_tag_names_resolved"] =
-          resolution.tags.map((tag) => tag.name).toList(growable: false);
-
-      if (resolution.tags.isEmpty) {
-        workingFiles = [];
-      } else {
-        workingFiles = workingFiles.where((file) {
-          if (!file.hasLocation) {
-            return false;
-          }
-          for (final tag in resolution.tags) {
-            if (isFileInsideLocationTag(
-              tag.centerPoint,
-              file.location!,
-              tag.radius,
-            )) {
-              return true;
-            }
-          }
-          return false;
-        }).toList(growable: false);
-      }
-    }
-
-    if (normalizedArguments.containsKey("place_queries")) {
-      final placeQueries = normalizedArguments["place_queries"] as List<String>;
-      final resolution = await _resolveFilesForPlaceQueries(
+    if (normalizedArguments.containsKey("place_names")) {
+      final placeNames = normalizedArguments["place_names"] as List<String>;
+      final resolution = await _resolveFilesForPlaceNames(
         files: workingFiles,
-        placeQueries: placeQueries,
+        placeNames: placeNames,
       );
       warnings.addAll(resolution.warnings);
-      resolvedArguments["place_query_matches"] = resolution.matchesSummary;
+      resolvedArguments["place_names_resolved"] = resolution.matchesSummary;
       if (resolution.files.isEmpty) {
         workingFiles = [];
       } else {
@@ -357,12 +507,12 @@ class NaturalSearchService {
       }
     }
 
-    if (normalizedArguments.containsKey("semantic_query")) {
-      final semanticQuery = normalizedArguments["semantic_query"] as String;
-      final semanticResult = await _resolveSemanticQuery(semanticQuery);
+    if (normalizedArguments.containsKey("visual_query")) {
+      final visualQuery = normalizedArguments["visual_query"] as String;
+      final semanticResult = await _resolveSemanticQuery(visualQuery);
       warnings.addAll(semanticResult.warnings);
-      resolvedArguments["semantic_query_resolved"] = {
-        "query": semanticQuery,
+      resolvedArguments["visual_query_resolved"] = {
+        "query": visualQuery,
         "matched_uploaded_ids":
             semanticResult.uploadedIDs.toList(growable: false),
       };
@@ -374,6 +524,23 @@ class NaturalSearchService {
           final uploadedID = file.uploadedFileID;
           return uploadedID != null &&
               semanticResult.uploadedIDs.contains(uploadedID);
+        }).toList(growable: false);
+      }
+    }
+
+    if (normalizedArguments.containsKey("file_format")) {
+      final fileFormatQuery = normalizedArguments["file_format"] as String;
+      final acceptedFormats = _resolveFileFormatAliases(fileFormatQuery);
+      if (acceptedFormats.isEmpty) {
+        warnings.add("No valid file formats resolved from file_format");
+        workingFiles = [];
+      } else {
+        resolvedArguments["file_formats"] = acceptedFormats.toList(
+          growable: false,
+        );
+        workingFiles = workingFiles.where((file) {
+          final fileFormat = getExtension(file.displayName);
+          return acceptedFormats.contains(fileFormat);
         }).toList(growable: false);
       }
     }
@@ -527,6 +694,18 @@ class NaturalSearchService {
     );
     final parsedToolCall =
         parseModelOutput(inferenceResult.normalizedToolCallJson);
+    if (parsedToolCall.validationIssues.isNotEmpty) {
+      final validationMessage = parsedToolCall.validationIssues.join("; ");
+      if (kDebugMode) {
+        _logger.warning(
+          "FunctionGemma tool call failed validation for '${modelInput.userQuery}', continuing in debug mode: $validationMessage",
+        );
+      } else {
+        throw FormatException(
+          "FunctionGemma produced an invalid tool call: $validationMessage",
+        );
+      }
+    }
     if (kDebugMode) {
       _logger.info(
         "FunctionGemma raw output for '${modelInput.userQuery}':\n${inferenceResult.rawOutput}",
@@ -593,6 +772,226 @@ class NaturalSearchService {
     throw FormatException(
       "Tool-call payload must be a JSON object. Got ${decoded.runtimeType}",
     );
+  }
+
+  @visibleForTesting
+  static List<String> detectCorruptedToolCallIssues(
+    Map<String, dynamic> rawArguments,
+    Map<String, dynamic> normalizedArguments,
+  ) {
+    final issues = <String>{};
+
+    _collectSchemaLeakageIssues(
+      rawArguments,
+      path: "arguments",
+      issues: issues,
+    );
+
+    if (rawArguments.containsKey("kind")) {
+      issues.add(
+        "Unexpected top-level 'kind' in arguments; expected time_filter.kind",
+      );
+    }
+
+    for (final entry in rawArguments.entries) {
+      final key = entry.key;
+      final value = entry.value;
+      if (_listArgumentFields.contains(key) && value is! List) {
+        issues.add("Field '$key' must be an array, got ${value.runtimeType}");
+      }
+      if (_objectArgumentFields.contains(key) &&
+          value is! Map<String, dynamic>) {
+        issues.add("Field '$key' must be an object, got ${value.runtimeType}");
+      }
+    }
+
+    if (rawArguments.isNotEmpty && normalizedArguments.isEmpty) {
+      issues.add("No valid executable arguments remained after normalization");
+    }
+
+    return issues.toList(growable: false);
+  }
+
+  static void _collectSchemaLeakageIssues(
+    dynamic value, {
+    required String path,
+    required Set<String> issues,
+  }) {
+    if (value is Map<String, dynamic>) {
+      for (final entry in value.entries) {
+        final key = entry.key;
+        final nextPath = "$path.$key";
+        if (_schemaLeakageArgumentFields.contains(key)) {
+          issues.add("Unexpected schema keyword '$nextPath' in arguments");
+        }
+        _collectSchemaLeakageIssues(
+          entry.value,
+          path: nextPath,
+          issues: issues,
+        );
+      }
+      return;
+    }
+
+    if (value is List) {
+      for (var index = 0; index < value.length; index++) {
+        _collectSchemaLeakageIssues(
+          value[index],
+          path: "$path[$index]",
+          issues: issues,
+        );
+      }
+    }
+  }
+
+  @visibleForTesting
+  static List<TimeRangeMicros> resolveTimeQueryToRanges(
+    String timeQuery, {
+    required int searchStartYearOverride,
+    required DateTime nowOverride,
+  }) {
+    final normalized = _normalizeContextText(timeQuery);
+    if (normalized.isEmpty) {
+      return const [];
+    }
+
+    final startOfToday = DateTime(
+      nowOverride.year,
+      nowOverride.month,
+      nowOverride.day,
+    );
+    if (normalized == "today") {
+      return [_buildDayRange(startOfToday)];
+    }
+    if (normalized == "yesterday") {
+      return [_buildDayRange(startOfToday.subtract(const Duration(days: 1)))];
+    }
+    if (normalized == "this week") {
+      final start = _startOfWeekMonday(startOfToday);
+      return [_buildRange(start, start.add(const Duration(days: 7)))];
+    }
+    if (normalized == "last week") {
+      final start = _startOfWeekMonday(startOfToday).subtract(
+        const Duration(days: 7),
+      );
+      return [_buildRange(start, start.add(const Duration(days: 7)))];
+    }
+    if (normalized == "this month") {
+      final start = DateTime(nowOverride.year, nowOverride.month, 1);
+      return [_buildRange(start, _addMonths(start, 1))];
+    }
+    if (normalized == "last month") {
+      final start = DateTime(nowOverride.year, nowOverride.month - 1, 1);
+      return [
+        _buildRange(start, DateTime(nowOverride.year, nowOverride.month, 1)),
+      ];
+    }
+    if (normalized == "this year") {
+      final start = DateTime(nowOverride.year, 1, 1);
+      return [_buildRange(start, DateTime(nowOverride.year + 1, 1, 1))];
+    }
+    if (normalized == "last year") {
+      final start = DateTime(nowOverride.year - 1, 1, 1);
+      return [_buildRange(start, DateTime(nowOverride.year, 1, 1))];
+    }
+
+    final rollingWindowMatch = RegExp(
+      r"^(?:past|last) (\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) (day|days|week|weeks|month|months|year|years)$",
+    ).firstMatch(normalized);
+    if (rollingWindowMatch != null) {
+      final amount = _parseIntOrWord(rollingWindowMatch.group(1));
+      final unit = rollingWindowMatch.group(2);
+      if (amount != null && unit != null) {
+        final start = _subtractCalendarUnit(nowOverride, amount, unit);
+        return [_buildRange(start, nowOverride)];
+      }
+    }
+
+    final yearsAgoMatch = RegExp(
+      r"^(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve) years ago$",
+    ).firstMatch(normalized);
+    if (yearsAgoMatch != null) {
+      final yearsAgo = _parseIntOrWord(yearsAgoMatch.group(1));
+      if (yearsAgo != null && yearsAgo > 0) {
+        final year = nowOverride.year - yearsAgo;
+        return [
+          _buildRange(DateTime(year, 1, 1), DateTime(year + 1, 1, 1)),
+        ];
+      }
+    }
+
+    final explicitRange = _tryParseExplicitDateRange(normalized);
+    if (explicitRange != null) {
+      return [explicitRange];
+    }
+
+    final calendarMonthMatch = RegExp(
+      r"^(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec) (\d{4})$",
+    ).firstMatch(normalized);
+    if (calendarMonthMatch != null) {
+      final month = _monthNameToNumber[calendarMonthMatch.group(1)!];
+      final year = int.tryParse(calendarMonthMatch.group(2)!);
+      if (month != null && year != null) {
+        final start = DateTime(year, month, 1);
+        return [_buildRange(start, _addMonths(start, 1))];
+      }
+    }
+
+    final calendarYearMatch = RegExp(r"^(\d{4})$").firstMatch(normalized);
+    if (calendarYearMatch != null) {
+      final year = int.tryParse(calendarYearMatch.group(1)!);
+      if (year != null) {
+        return [_buildRange(DateTime(year, 1, 1), DateTime(year + 1, 1, 1))];
+      }
+    }
+
+    final specificDate = _tryParseLooseDate(normalized);
+    if (specificDate != null) {
+      return [_buildDayRange(specificDate.toDateTime())];
+    }
+
+    final recurringMonthMatch = RegExp(
+      r"^every (january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)$",
+    ).firstMatch(normalized);
+    if (recurringMonthMatch != null) {
+      final month = _monthNameToNumber[recurringMonthMatch.group(1)!];
+      if (month != null) {
+        return _buildRecurringMonthRanges(
+          month: month,
+          currentYear: nowOverride.year,
+          searchStartYear: searchStartYearOverride,
+        );
+      }
+    }
+
+    final recurringDayMonth = _tryParseLooseDate(
+      normalized,
+      defaultYear: nowOverride.year,
+    );
+    if (recurringDayMonth != null &&
+        !RegExp(r"\d{4}").hasMatch(normalized) &&
+        _monthNameToNumber.keys.any(normalized.contains)) {
+      final ranges = <TimeRangeMicros>[];
+      for (var year = searchStartYearOverride;
+          year <= nowOverride.year;
+          year++) {
+        if (!_isValidGregorianDate(
+          day: recurringDayMonth.day,
+          month: recurringDayMonth.month,
+          year: year,
+        )) {
+          continue;
+        }
+        ranges.add(
+          _buildDayRange(
+            DateTime(year, recurringDayMonth.month, recurringDayMonth.day),
+          ),
+        );
+      }
+      return ranges;
+    }
+
+    return const [];
   }
 
   @visibleForTesting
@@ -733,6 +1132,189 @@ class NaturalSearchService {
     return const [];
   }
 
+  static TimeRangeMicros _buildRange(DateTime start, DateTime endExclusive) {
+    return TimeRangeMicros(
+      startMicroseconds: start.microsecondsSinceEpoch,
+      endMicrosecondsExclusive: endExclusive.microsecondsSinceEpoch,
+    );
+  }
+
+  static TimeRangeMicros _buildDayRange(DateTime dayStart) {
+    return _buildRange(dayStart, dayStart.add(const Duration(days: 1)));
+  }
+
+  static DateTime _startOfWeekMonday(DateTime value) {
+    return value.subtract(Duration(days: value.weekday - DateTime.monday));
+  }
+
+  static DateTime _addMonths(DateTime value, int monthDelta) {
+    final targetMonthIndex = value.month + monthDelta;
+    final year = value.year + ((targetMonthIndex - 1) ~/ 12);
+    final month = ((targetMonthIndex - 1) % 12) + 1;
+    final day = value.day.clamp(1, _daysInMonth(year, month));
+    return DateTime(
+      year,
+      month,
+      day,
+      value.hour,
+      value.minute,
+      value.second,
+    );
+  }
+
+  static int _daysInMonth(int year, int month) {
+    return DateTime(year, month + 1, 0).day;
+  }
+
+  static DateTime _subtractCalendarUnit(
+    DateTime value,
+    int amount,
+    String unit,
+  ) {
+    switch (unit) {
+      case "day":
+      case "days":
+        return value.subtract(Duration(days: amount));
+      case "week":
+      case "weeks":
+        return value.subtract(Duration(days: amount * 7));
+      case "month":
+      case "months":
+        return _addMonths(value, -amount);
+      case "year":
+      case "years":
+        return DateTime(
+          value.year - amount,
+          value.month,
+          value.day.clamp(1, _daysInMonth(value.year - amount, value.month)),
+          value.hour,
+          value.minute,
+          value.second,
+        );
+    }
+    return value;
+  }
+
+  static int? _parseIntOrWord(String? input) {
+    if (input == null || input.isEmpty) {
+      return null;
+    }
+    return int.tryParse(input) ?? _numberWordToInt[input];
+  }
+
+  static TimeRangeMicros? _tryParseExplicitDateRange(String normalizedQuery) {
+    final query = normalizedQuery.startsWith("from ")
+        ? normalizedQuery.substring(5)
+        : normalizedQuery;
+    for (final separator in const [" till ", " to ", " until ", " through "]) {
+      final separatorIndex = query.indexOf(separator);
+      if (separatorIndex == -1) {
+        continue;
+      }
+
+      final left = query.substring(0, separatorIndex).trim();
+      final right = query.substring(separatorIndex + separator.length).trim();
+      var rightDate = _tryParseLooseDate(right);
+      var leftDate = _tryParseLooseDate(
+        left,
+        defaultYear: rightDate?.year,
+        defaultMonth: rightDate?.month,
+      );
+      rightDate ??= _tryParseLooseDate(
+        right,
+        defaultYear: leftDate?.year,
+        defaultMonth: leftDate?.month,
+      );
+      leftDate ??= _tryParseLooseDate(
+        left,
+        defaultYear: rightDate?.year,
+        defaultMonth: rightDate?.month,
+      );
+
+      if (leftDate == null || rightDate == null) {
+        continue;
+      }
+
+      final start = leftDate.toDateTime();
+      final endExclusive = rightDate.toDateTime().add(const Duration(days: 1));
+      if (!endExclusive.isAfter(start)) {
+        continue;
+      }
+      return _buildRange(start, endExclusive);
+    }
+    return null;
+  }
+
+  static _ResolvedCalendarDate? _tryParseLooseDate(
+    String input, {
+    int? defaultYear,
+    int? defaultMonth,
+  }) {
+    final normalized = _normalizeContextText(input).replaceAll(" of ", " ");
+    final dayMonthYearMatch = RegExp(
+      r"^(\d{1,2}) (january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec)(?: (\d{4}))?$",
+    ).firstMatch(normalized);
+    if (dayMonthYearMatch != null) {
+      final day = int.tryParse(dayMonthYearMatch.group(1)!);
+      final month = _monthNameToNumber[dayMonthYearMatch.group(2)!];
+      final year =
+          int.tryParse(dayMonthYearMatch.group(3) ?? "") ?? defaultYear;
+      if (day != null &&
+          month != null &&
+          year != null &&
+          _isValidGregorianDate(day: day, month: month, year: year)) {
+        return _ResolvedCalendarDate(year: year, month: month, day: day);
+      }
+    }
+
+    final monthDayYearMatch = RegExp(
+      r"^(january|jan|february|feb|march|mar|april|apr|may|june|jun|july|jul|august|aug|september|sep|sept|october|oct|november|nov|december|dec) (\d{1,2})(?: (\d{4}))?$",
+    ).firstMatch(normalized);
+    if (monthDayYearMatch != null) {
+      final month = _monthNameToNumber[monthDayYearMatch.group(1)!];
+      final day = int.tryParse(monthDayYearMatch.group(2)!);
+      final year =
+          int.tryParse(monthDayYearMatch.group(3) ?? "") ?? defaultYear;
+      if (day != null &&
+          month != null &&
+          year != null &&
+          _isValidGregorianDate(day: day, month: month, year: year)) {
+        return _ResolvedCalendarDate(year: year, month: month, day: day);
+      }
+    }
+
+    final dayYearMatch =
+        RegExp(r"^(\d{1,2})(?: (\d{4}))?$").firstMatch(normalized);
+    if (dayYearMatch != null && defaultMonth != null) {
+      final day = int.tryParse(dayYearMatch.group(1)!);
+      final year = int.tryParse(dayYearMatch.group(2) ?? "") ?? defaultYear;
+      if (day != null &&
+          year != null &&
+          _isValidGregorianDate(day: day, month: defaultMonth, year: year)) {
+        return _ResolvedCalendarDate(
+          year: year,
+          month: defaultMonth,
+          day: day,
+        );
+      }
+    }
+
+    return null;
+  }
+
+  static List<TimeRangeMicros> _buildRecurringMonthRanges({
+    required int month,
+    required int currentYear,
+    required int searchStartYear,
+  }) {
+    final ranges = <TimeRangeMicros>[];
+    for (var year = searchStartYear; year <= currentYear; year++) {
+      final start = DateTime(year, month, 1);
+      ranges.add(_buildRange(start, _addMonths(start, 1)));
+    }
+    return ranges;
+  }
+
   Future<Map<String, dynamic>> _loadToolSchema() async {
     if (_cachedToolSchema != null) {
       return _cachedToolSchema!;
@@ -742,7 +1324,7 @@ class NaturalSearchService {
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException("Tool schema JSON must be an object");
     }
-    _cachedToolSchemaRaw = raw;
+    _cachedToolSchemaRaw = jsonEncode(decoded);
     _cachedToolSchema = decoded;
     return decoded;
   }
@@ -771,26 +1353,216 @@ class NaturalSearchService {
     return Map<String, dynamic>.from(decoded);
   }
 
-  Future<Map<String, dynamic>> _buildDynamicPromptContext() async {
+  Future<Map<String, dynamic>> _buildDynamicPromptContext(
+    String userQuery,
+  ) async {
     final context = await _loadExamplePromptContext();
+    context.remove("available_album_names");
+    context.remove("available_people_in_media");
+    context.remove("available_location_tag_names");
+    context.remove("available_shared_by_contacts");
 
     context["current_local_datetime"] = _formatLocalDateTime(DateTime.now());
     context["local_timezone"] = await _resolveLocalTimezone();
     context["week_start"] = "monday";
     context["search_start_year"] = searchStartYear;
+    context["result_ordering"] = "chronological";
 
-    context["available_ente_album_names"] =
-        _getCanonicalEnteAlbumNames().toList(growable: false);
-    context["available_device_album_names"] =
-        (await _getCanonicalDeviceAlbumNames()).toList(growable: false);
-    context["available_person_names"] =
-        (await _getCanonicalPersonNames()).toList(growable: false);
-    context["available_location_tag_names"] =
-        (await _getCanonicalLocationTagNames()).toList(growable: false);
-    context["available_contact_names"] =
-        _getCanonicalContactNames().toList(growable: false);
+    final albumNames = selectRelevantContextCandidates(
+      userQuery: userQuery,
+      candidates: await _getCanonicalAlbumNames(),
+      entityKind: NaturalSearchContextEntityKind.album,
+      maxResults: 10,
+    );
+    if (albumNames.isNotEmpty) {
+      context["available_album_names"] = albumNames;
+    }
+
+    final personNames = selectRelevantContextCandidates(
+      userQuery: userQuery,
+      candidates: await _getCanonicalPersonNames(),
+      entityKind: NaturalSearchContextEntityKind.person,
+      maxResults: 8,
+    );
+    if (personNames.isNotEmpty) {
+      context["available_people_in_media"] = personNames;
+    }
+
+    final locationTagNames = selectRelevantContextCandidates(
+      userQuery: userQuery,
+      candidates: await _getCanonicalLocationTagNames(),
+      entityKind: NaturalSearchContextEntityKind.locationTag,
+      maxResults: 8,
+    );
+    if (locationTagNames.isNotEmpty) {
+      context["available_location_tag_names"] = locationTagNames;
+    }
+
+    final contactNames = selectRelevantContextCandidates(
+      userQuery: userQuery,
+      candidates: _getCanonicalContactNames(),
+      entityKind: NaturalSearchContextEntityKind.contact,
+      maxResults: 6,
+    );
+    if (contactNames.isNotEmpty) {
+      context["available_shared_by_contacts"] = contactNames;
+    }
 
     return context;
+  }
+
+  Future<SplayTreeSet<String>> _getCanonicalAlbumNames() async {
+    final names = _getCanonicalEnteAlbumNames();
+    names.addAll(await _getCanonicalDeviceAlbumNames());
+    return names;
+  }
+
+  @visibleForTesting
+  static List<String> selectRelevantContextCandidates({
+    required String userQuery,
+    required Iterable<String> candidates,
+    required NaturalSearchContextEntityKind entityKind,
+    int maxResults = 12,
+  }) {
+    final normalizedQuery = _normalizeContextText(userQuery);
+    if (normalizedQuery.isEmpty) {
+      return const [];
+    }
+
+    final queryTokens =
+        _extractMeaningfulContextTokens(normalizedQuery).toSet();
+    final hasAlbumIntent = queryTokens.any(_albumIntentTokens.contains);
+    final hasSharingIntent = queryTokens.any(_sharingIntentTokens.contains) ||
+        normalizedQuery.contains("shared by") ||
+        normalizedQuery.contains("shared with");
+    final scoredCandidates = <_ScoredContextCandidate>[];
+
+    for (final candidate in candidates) {
+      final normalizedCandidate = _normalizeContextText(candidate);
+      if (normalizedCandidate.isEmpty) {
+        continue;
+      }
+
+      if (_shouldSkipContextCandidate(
+        entityKind: entityKind,
+        normalizedQuery: normalizedQuery,
+        normalizedCandidate: normalizedCandidate,
+      )) {
+        continue;
+      }
+
+      final candidateTokens = _extractMeaningfulContextTokens(
+        normalizedCandidate,
+      ).toSet();
+      final hasExactPhraseMatch = _containsWholePhrase(
+        normalizedQuery,
+        normalizedCandidate,
+      );
+      final matchedTokenCount =
+          candidateTokens.intersection(queryTokens).length;
+
+      switch (entityKind) {
+        case NaturalSearchContextEntityKind.album:
+        case NaturalSearchContextEntityKind.deviceAlbum:
+          final hasDistinctivePhraseMatch = hasExactPhraseMatch &&
+              (candidateTokens.length > 1 ||
+                  _isDistinctiveContextCandidate(normalizedCandidate));
+          if (!hasAlbumIntent && !hasDistinctivePhraseMatch) {
+            continue;
+          }
+          if (!hasDistinctivePhraseMatch && matchedTokenCount == 0) {
+            continue;
+          }
+          break;
+        case NaturalSearchContextEntityKind.contact:
+          if (!hasSharingIntent && !hasExactPhraseMatch) {
+            continue;
+          }
+          if (!hasExactPhraseMatch && matchedTokenCount == 0) {
+            continue;
+          }
+          break;
+        case NaturalSearchContextEntityKind.person:
+        case NaturalSearchContextEntityKind.locationTag:
+          if (!hasExactPhraseMatch && matchedTokenCount == 0) {
+            continue;
+          }
+          break;
+      }
+
+      final score = (hasExactPhraseMatch ? 100 : 0) +
+          (matchedTokenCount * 10) +
+          (candidateTokens.length > 1 ? 2 : 0);
+      scoredCandidates.add(
+        _ScoredContextCandidate(candidate: candidate, score: score),
+      );
+    }
+
+    scoredCandidates.sort((a, b) {
+      final scoreComparison = b.score.compareTo(a.score);
+      if (scoreComparison != 0) {
+        return scoreComparison;
+      }
+      return a.candidate.toLowerCase().compareTo(b.candidate.toLowerCase());
+    });
+
+    final selected = <String>{};
+    final results = <String>[];
+    for (final candidate in scoredCandidates) {
+      if (selected.add(candidate.candidate)) {
+        results.add(candidate.candidate);
+      }
+      if (results.length >= maxResults) {
+        break;
+      }
+    }
+
+    return results;
+  }
+
+  static bool _shouldSkipContextCandidate({
+    required NaturalSearchContextEntityKind entityKind,
+    required String normalizedQuery,
+    required String normalizedCandidate,
+  }) {
+    final isAlbumKind = entityKind == NaturalSearchContextEntityKind.album ||
+        entityKind == NaturalSearchContextEntityKind.deviceAlbum;
+    if (!isAlbumKind) {
+      return false;
+    }
+
+    return normalizedCandidate == "camera" &&
+        (normalizedQuery.contains("camera make") ||
+            normalizedQuery.contains("camera model"));
+  }
+
+  static bool _isDistinctiveContextCandidate(String normalizedCandidate) {
+    if (normalizedCandidate.contains(RegExp(r"[0-9]"))) {
+      return true;
+    }
+    return normalizedCandidate.contains(" ");
+  }
+
+  static bool _containsWholePhrase(String text, String phrase) {
+    return " $text ".contains(" $phrase ");
+  }
+
+  static String _normalizeContextText(String input) {
+    return input
+        .toLowerCase()
+        .replaceAll(_nonAlphaNumericPattern, " ")
+        .replaceAll(_whitespacePattern, " ")
+        .trim();
+  }
+
+  static List<String> _extractMeaningfulContextTokens(String input) {
+    return input
+        .split(" ")
+        .map((token) => token.trim())
+        .where(
+          (token) => token.length >= 2 && !_queryStopWords.contains(token),
+        )
+        .toList(growable: false);
   }
 
   SplayTreeSet<String> _getCanonicalEnteAlbumNames() {
@@ -918,6 +1690,11 @@ class NaturalSearchService {
       }
 
       switch (key) {
+        case "time_query":
+          if (value is String && value.trim().isNotEmpty) {
+            normalized["time_query"] = value.trim();
+          }
+          break;
         case "time_filter":
           if (value is Map<String, dynamic>) {
             final kind = value["kind"];
@@ -965,30 +1742,90 @@ class NaturalSearchService {
                 .add("Ignoring invalid time_filter type ${value.runtimeType}");
           }
           break;
+        case "album_names":
         case "ente_album_names":
         case "device_album_names":
+          final albumNames = _normalizeStringList(value);
+          if (albumNames.isNotEmpty) {
+            _mergeStringListArgument(normalized, "album_names", albumNames);
+          }
+          break;
+        case "shared_by_contacts":
         case "contact_names":
+          final contacts = _normalizeStringList(value);
+          if (contacts.isNotEmpty) {
+            _mergeStringListArgument(
+              normalized,
+              "shared_by_contacts",
+              contacts,
+            );
+          }
+          break;
+        case "people_in_media":
         case "person_names":
+          final people = _normalizeStringList(value);
+          if (people.isNotEmpty) {
+            _mergeStringListArgument(normalized, "people_in_media", people);
+          }
+          break;
+        case "place_names":
         case "location_tag_names":
         case "place_queries":
-          final array = _normalizeStringList(value);
-          if (array.isNotEmpty) {
-            normalized[key] = array;
+          final places = _normalizeStringList(value);
+          if (places.isNotEmpty) {
+            _mergeStringListArgument(normalized, "place_names", places);
+          }
+          break;
+        case "media_type":
+          if (value is String) {
+            final mediaType = value.trim().toLowerCase();
+            if (_mediaTypes.contains(mediaType)) {
+              normalized["media_type"] = mediaType;
+            } else {
+              warnings.add("Ignoring invalid media_type '$value'");
+            }
           }
           break;
         case "file_types":
           final array = _normalizeStringList(value);
-          if (array.isNotEmpty) {
-            normalized[key] = array;
+          final mediaType = _mediaTypeFromLegacyFileTypes(array);
+          if (mediaType != null) {
+            normalized["media_type"] = mediaType;
           }
           break;
+        case "text_query":
         case "filename_query":
         case "caption_query":
+          if (value is String && value.trim().isNotEmpty) {
+            _mergeSingularStringArgument(
+              normalized,
+              "text_query",
+              value.trim(),
+              warnings,
+            );
+          }
+          break;
+        case "camera_query":
         case "camera_make_query":
         case "camera_model_query":
+          if (value is String && value.trim().isNotEmpty) {
+            _mergeSingularStringArgument(
+              normalized,
+              "camera_query",
+              value.trim(),
+              warnings,
+            );
+          }
+          break;
+        case "visual_query":
         case "semantic_query":
           if (value is String && value.trim().isNotEmpty) {
-            normalized[key] = value.trim();
+            _mergeSingularStringArgument(
+              normalized,
+              "visual_query",
+              value.trim(),
+              warnings,
+            );
           }
           break;
         case "ownership_scope":
@@ -998,11 +1835,17 @@ class NaturalSearchService {
             warnings.add("Ignoring invalid ownership_scope '$value'");
           }
           break;
+        case "people_mode":
         case "person_operator":
           if (value is String && _personOperators.contains(value.trim())) {
-            normalized[key] = value.trim();
+            normalized["people_mode"] = value.trim();
           } else {
             warnings.add("Ignoring invalid person_operator '$value'");
+          }
+          break;
+        case "file_format":
+          if (value is String && value.trim().isNotEmpty) {
+            normalized["file_format"] = _normalizeFileFormatQuery(value);
           }
           break;
         case "video_duration_seconds":
@@ -1031,12 +1874,311 @@ class NaturalSearchService {
       }
     }
 
-    if (normalized.containsKey("person_names") &&
-        !normalized.containsKey("person_operator")) {
-      normalized["person_operator"] = "any";
+    if (normalized.containsKey("people_in_media") &&
+        !normalized.containsKey("people_mode")) {
+      normalized["people_mode"] = "any";
+    }
+    if (normalized.containsKey("shared_by_contacts") &&
+        !normalized.containsKey("ownership_scope")) {
+      normalized["ownership_scope"] = "shared_by_contacts";
     }
 
     return _NormalizationResult(arguments: normalized, warnings: warnings);
+  }
+
+  Future<ArgumentPruningResult> _pruneArgumentsForExecution({
+    required String originalQuery,
+    required Map<String, dynamic> normalizedArguments,
+  }) async {
+    final canonicalAlbumNames = await _getCanonicalAlbumNames();
+    final canonicalPersonNames = await _getCanonicalPersonNames();
+    final canonicalContactNames = _getCanonicalContactNames();
+
+    return pruneArgumentsForQueryConsistency(
+      originalQuery: originalQuery,
+      normalizedArguments: normalizedArguments,
+      canonicalAlbumNames: canonicalAlbumNames,
+      canonicalPersonNames: canonicalPersonNames,
+      canonicalContactNames: canonicalContactNames,
+      searchStartYearOverride: searchStartYear,
+      nowOverride: DateTime.now(),
+    );
+  }
+
+  @visibleForTesting
+  static ArgumentPruningResult pruneArgumentsForQueryConsistency({
+    required String originalQuery,
+    required Map<String, dynamic> normalizedArguments,
+    required Set<String> canonicalAlbumNames,
+    required Set<String> canonicalPersonNames,
+    required Set<String> canonicalContactNames,
+    required int searchStartYearOverride,
+    required DateTime nowOverride,
+  }) {
+    final pruned = Map<String, dynamic>.from(normalizedArguments);
+    final warnings = <String>[];
+    final normalizedQuery = _normalizeContextText(originalQuery);
+    final queryTokens =
+        _extractMeaningfulContextTokens(normalizedQuery).toSet();
+    final hasAlbumIntent = queryTokens.any(_albumIntentTokens.contains);
+    final hasSharingIntent = queryTokens.any(_sharingIntentTokens.contains) ||
+        normalizedQuery.contains("shared by") ||
+        normalizedQuery.contains("shared with");
+
+    if (pruned["album_names"] case final List<String> albumNames) {
+      final retainedAlbumNames = albumNames.where((albumName) {
+        final normalizedAlbumName = _normalizeContextText(albumName);
+        if (normalizedAlbumName.isEmpty) {
+          warnings.add("Dropping empty album_names value");
+          return false;
+        }
+        if (!_containsValueIgnoreCase(canonicalAlbumNames, albumName)) {
+          warnings.add("Dropping unknown album_names value '$albumName'");
+          return false;
+        }
+        if (!_containsWholePhrase(normalizedQuery, normalizedAlbumName)) {
+          warnings.add(
+            "Dropping album_names value '$albumName' because it is not grounded in the query",
+          );
+          return false;
+        }
+        if (_looksLikeTemporalValue(
+              normalizedAlbumName,
+              searchStartYearOverride: searchStartYearOverride,
+              nowOverride: nowOverride,
+            ) &&
+            !hasAlbumIntent) {
+          warnings.add(
+            "Dropping album_names value '$albumName' because it looks like a time phrase",
+          );
+          return false;
+        }
+        return true;
+      }).toList(growable: false);
+      if (retainedAlbumNames.isEmpty) {
+        pruned.remove("album_names");
+      } else {
+        pruned["album_names"] = retainedAlbumNames;
+      }
+    }
+
+    if (pruned["people_in_media"] case final List<String> peopleInMedia) {
+      final retainedPeople = peopleInMedia.where((personName) {
+        final normalizedPersonName = _normalizeContextText(personName);
+        if (normalizedPersonName.isEmpty) {
+          warnings.add("Dropping empty people_in_media value");
+          return false;
+        }
+        if (_reservedPeopleValues.contains(normalizedPersonName)) {
+          warnings.add(
+            "Dropping invalid people_in_media value '$personName'",
+          );
+          return false;
+        }
+        if (!_containsValueIgnoreCase(canonicalPersonNames, personName)) {
+          warnings.add("Dropping unknown people_in_media value '$personName'");
+          return false;
+        }
+        if (!_containsWholePhrase(normalizedQuery, normalizedPersonName)) {
+          warnings.add(
+            "Dropping people_in_media value '$personName' because it is not grounded in the query",
+          );
+          return false;
+        }
+        if (_looksLikeTemporalValue(
+          normalizedPersonName,
+          searchStartYearOverride: searchStartYearOverride,
+          nowOverride: nowOverride,
+        )) {
+          warnings.add(
+            "Dropping people_in_media value '$personName' because it looks like a time phrase",
+          );
+          return false;
+        }
+        return true;
+      }).toList(growable: false);
+      if (retainedPeople.isEmpty) {
+        pruned.remove("people_in_media");
+        pruned.remove("people_mode");
+      } else {
+        pruned["people_in_media"] = retainedPeople;
+      }
+    }
+
+    if (pruned["shared_by_contacts"] case final List<String> sharedByContacts) {
+      final retainedContacts = sharedByContacts.where((contactName) {
+        if (!_containsValueIgnoreCase(canonicalContactNames, contactName)) {
+          warnings.add(
+            "Dropping unknown shared_by_contacts value '$contactName'",
+          );
+          return false;
+        }
+        if (!hasSharingIntent) {
+          warnings.add(
+            "Dropping shared_by_contacts because the query has no sharing intent",
+          );
+          return false;
+        }
+        final contactTokens =
+            _extractMeaningfulContextTokens(_normalizeContextText(contactName))
+                .toSet();
+        if (contactTokens.intersection(queryTokens).isEmpty) {
+          warnings.add(
+            "Dropping shared_by_contacts value '$contactName' because it is not grounded in the query",
+          );
+          return false;
+        }
+        return true;
+      }).toList(growable: false);
+      if (retainedContacts.isEmpty) {
+        pruned.remove("shared_by_contacts");
+      } else {
+        pruned["shared_by_contacts"] = retainedContacts;
+      }
+    }
+
+    if (pruned["ownership_scope"] case final String ownershipScope) {
+      if (!_shouldKeepOwnershipScopeForQuery(
+        originalQuery,
+        ownershipScope,
+        hasSharingIntent: hasSharingIntent,
+        hasSharedByContacts: pruned.containsKey("shared_by_contacts"),
+      )) {
+        warnings.add(
+          "Dropping ownership_scope '$ownershipScope' because it is not grounded in the query",
+        );
+        pruned.remove("ownership_scope");
+      }
+    }
+
+    return ArgumentPruningResult(arguments: pruned, warnings: warnings);
+  }
+
+  static void _mergeStringListArgument(
+    Map<String, dynamic> normalized,
+    String key,
+    List<String> values,
+  ) {
+    final merged = <String>[
+      ...((normalized[key] as List<String>?) ?? const <String>[]),
+    ];
+    for (final value in values) {
+      if (!merged.contains(value)) {
+        merged.add(value);
+      }
+    }
+    if (merged.isNotEmpty) {
+      normalized[key] = merged;
+    }
+  }
+
+  static void _mergeSingularStringArgument(
+    Map<String, dynamic> normalized,
+    String key,
+    String value,
+    List<String> warnings,
+  ) {
+    final existing = normalized[key] as String?;
+    if (existing == null || existing == value) {
+      normalized[key] = value;
+      return;
+    }
+    warnings.add("Ignoring conflicting value for '$key': '$value'");
+  }
+
+  static String? _mediaTypeFromLegacyFileTypes(List<String> fileTypes) {
+    if (fileTypes.isEmpty) {
+      return null;
+    }
+
+    final normalizedTypes = fileTypes.map((type) => type.toLowerCase()).toSet();
+    final hasPhoto = normalizedTypes.contains("image") ||
+        normalizedTypes.contains("live_photo");
+    final hasVideo = normalizedTypes.contains("video");
+    if (hasPhoto && hasVideo) {
+      return "both";
+    }
+    if (hasPhoto) {
+      return "photo";
+    }
+    if (hasVideo) {
+      return "video";
+    }
+    return null;
+  }
+
+  static String _normalizeFileFormatQuery(String fileFormat) {
+    final normalized = fileFormat.trim().toLowerCase();
+    return normalized.startsWith(".") ? normalized.substring(1) : normalized;
+  }
+
+  static bool _containsValueIgnoreCase(
+    Iterable<String> values,
+    String candidate,
+  ) {
+    final normalizedCandidate = candidate.trim().toLowerCase();
+    return values.any(
+      (value) => value.trim().toLowerCase() == normalizedCandidate,
+    );
+  }
+
+  static bool _looksLikeTemporalValue(
+    String value, {
+    required int searchStartYearOverride,
+    required DateTime nowOverride,
+  }) {
+    if (resolveTimeQueryToRanges(
+      value,
+      searchStartYearOverride: searchStartYearOverride,
+      nowOverride: nowOverride,
+    ).isNotEmpty) {
+      return true;
+    }
+    return RegExp(r"^\d{4}$").hasMatch(value);
+  }
+
+  static bool _shouldKeepOwnershipScopeForQuery(
+    String originalQuery,
+    String ownershipScope, {
+    required bool hasSharingIntent,
+    required bool hasSharedByContacts,
+  }) {
+    final normalizedQuery = " ${_normalizeContextText(originalQuery)} ";
+    switch (ownershipScope) {
+      case "mine":
+        return normalizedQuery.contains(" my ") ||
+            normalizedQuery.contains(" mine ") ||
+            normalizedQuery.contains(" own ");
+      case "shared_with_me":
+        return normalizedQuery.contains("shared with me") ||
+            normalizedQuery.contains("sent to me") ||
+            normalizedQuery.contains("for me");
+      case "shared_by_contacts":
+        return hasSharingIntent || hasSharedByContacts;
+      case "all_accessible":
+        return normalizedQuery.contains("all accessible") ||
+            normalizedQuery.contains("everything i can access") ||
+            normalizedQuery.contains("everything accessible") ||
+            normalizedQuery.contains("all my accessible");
+    }
+    return false;
+  }
+
+  static Set<String> _resolveFileFormatAliases(String fileFormat) {
+    final normalized = _normalizeFileFormatQuery(fileFormat);
+    switch (normalized) {
+      case "jpg":
+      case "jpeg":
+        return {"jpg", "jpeg"};
+      case "heic":
+      case "heif":
+        return {"heic", "heif"};
+      case "tif":
+      case "tiff":
+        return {"tif", "tiff"};
+      default:
+        return normalized.isEmpty ? const <String>{} : {normalized};
+    }
   }
 
   Future<_OwnershipFilterResult> _applyOwnershipScopeFilter({
@@ -1073,7 +2215,7 @@ class NaturalSearchService {
         );
       case "shared_by_contacts":
         final requestedContacts =
-            (arguments["contact_names"] as List<String>?) ?? const [];
+            (arguments["shared_by_contacts"] as List<String>?) ?? const [];
         final contactResolution = _resolveContacts(requestedContacts);
 
         final ownerIDs = contactResolution.users
@@ -1121,48 +2263,27 @@ class NaturalSearchService {
     );
   }
 
-  _EntityIDResolutionResult _resolveEnteAlbumIDs(List<String> requestedNames) {
+  Future<_AlbumResolutionResult> _resolveAlbumNames(
+    List<String> requestedNames,
+  ) async {
     final warnings = <String>[];
-    final normalizedToCollections = <String, Set<int>>{};
-
+    final normalizedToCollectionIDs = <String, Set<int>>{};
     final collections = CollectionsService.instance.getCollectionsForUI(
       includedShared: true,
       includeCollab: true,
     );
-
     for (final collection in collections) {
       final name = collection.displayName.trim();
       if (name.isEmpty) {
         continue;
       }
-      normalizedToCollections
+      normalizedToCollectionIDs
           .putIfAbsent(name.toLowerCase(), () => <int>{})
           .add(collection.id);
     }
 
-    final resolvedIDs = <int>{};
-    for (final requestedName in requestedNames) {
-      final ids = normalizedToCollections[requestedName.toLowerCase()];
-      if (ids == null || ids.isEmpty) {
-        warnings.add("No Ente album found for '$requestedName'");
-        continue;
-      }
-      resolvedIDs.addAll(ids);
-    }
-
-    return _EntityIDResolutionResult(
-      collectionIds: resolvedIDs,
-      warnings: warnings,
-    );
-  }
-
-  Future<_DeviceAlbumResolutionResult> _resolveDeviceAlbumLocalIDs(
-    List<String> requestedNames,
-  ) async {
-    final warnings = <String>[];
-    final deviceCollections = await FilesDB.instance.getDeviceCollections();
-
     final normalizedToPathIDs = <String, Set<String>>{};
+    final deviceCollections = await FilesDB.instance.getDeviceCollections();
     for (final collection in deviceCollections) {
       final name = collection.name.trim();
       if (name.isEmpty) {
@@ -1173,49 +2294,66 @@ class NaturalSearchService {
           .add(collection.id);
     }
 
-    final requestedPathIDs = <String>{};
+    final collectionIds = <int>{};
+    final pathIDs = <String>{};
     for (final requestedName in requestedNames) {
-      final pathIDs = normalizedToPathIDs[requestedName.toLowerCase()];
-      if (pathIDs == null || pathIDs.isEmpty) {
-        warnings.add("No device album found for '$requestedName'");
-        continue;
+      final normalizedName = requestedName.trim().toLowerCase();
+      var matched = false;
+
+      final matchedCollectionIds = normalizedToCollectionIDs[normalizedName];
+      if (matchedCollectionIds != null && matchedCollectionIds.isNotEmpty) {
+        collectionIds.addAll(matchedCollectionIds);
+        matched = true;
       }
-      requestedPathIDs.addAll(pathIDs);
+
+      final matchedPathIDs = normalizedToPathIDs[normalizedName];
+      if (matchedPathIDs != null && matchedPathIDs.isNotEmpty) {
+        pathIDs.addAll(matchedPathIDs);
+        matched = true;
+      }
+
+      if (!matched) {
+        warnings.add("No album found for '$requestedName'");
+      }
     }
 
     final pathIDToLocalIDMap =
         await FilesDB.instance.getDevicePathIDToLocalIDMap();
     final localIDs = <String>{};
-    for (final pathID in requestedPathIDs) {
+    for (final pathID in pathIDs) {
       final ids = pathIDToLocalIDMap[pathID];
       if (ids != null) {
         localIDs.addAll(ids);
       }
     }
 
-    return _DeviceAlbumResolutionResult(
+    return _AlbumResolutionResult(
+      collectionIds: collectionIds,
       localIDs: localIDs,
-      pathIDs: requestedPathIDs,
+      pathIDs: pathIDs,
       warnings: warnings,
     );
   }
 
-  Set<FileType> _resolveFileTypes(List<String> fileTypes) {
-    final resolvedTypes = <FileType>{};
-    for (final fileType in fileTypes) {
-      switch (fileType) {
-        case "image":
-          resolvedTypes.add(FileType.image);
-          break;
-        case "video":
-          resolvedTypes.add(FileType.video);
-          break;
-        case "live_photo":
-          resolvedTypes.add(FileType.livePhoto);
-          break;
-      }
+  Set<FileType> _resolveMediaType(String mediaType) {
+    switch (mediaType) {
+      case "photo":
+        return {
+          FileType.image,
+          FileType.livePhoto,
+        };
+      case "video":
+        return {
+          FileType.video,
+        };
+      case "both":
+        return {
+          FileType.image,
+          FileType.livePhoto,
+          FileType.video,
+        };
     }
-    return resolvedTypes;
+    return const <FileType>{};
   }
 
   Future<_PersonResolutionResult> _resolvePersonUploadedIDs(
@@ -1286,29 +2424,85 @@ class NaturalSearchService {
     );
   }
 
-  Future<_LocationTagResolutionResult> _resolveLocationTags(
-    List<String> requestedNames,
-  ) async {
+  Future<_PlaceQueryResolutionResult> _resolveFilesForPlaceNames({
+    required List<EnteFile> files,
+    required List<String> placeNames,
+  }) async {
     final warnings = <String>[];
-    final locationTags = await locationService.getLocationTags();
-    final map = <String, List<LocationTag>>{};
+    if (files.isEmpty) {
+      return _PlaceQueryResolutionResult(
+        files: const [],
+        matchesSummary: const <String, dynamic>{},
+        warnings: warnings,
+      );
+    }
 
+    final locationTags = await locationService.getLocationTags();
+    final normalizedToTags = <String, List<LocationTag>>{};
     for (final localEntity in locationTags) {
       final tag = localEntity.item;
-      map.putIfAbsent(tag.name.toLowerCase(), () => <LocationTag>[]).add(tag);
+      normalizedToTags
+          .putIfAbsent(tag.name.trim().toLowerCase(), () => <LocationTag>[])
+          .add(tag);
     }
 
-    final resolvedTags = <LocationTag>[];
-    for (final requestedName in requestedNames) {
-      final tags = map[requestedName.toLowerCase()];
-      if (tags == null || tags.isEmpty) {
-        warnings.add("No location tag found for '$requestedName'");
-        continue;
+    final matchedTags = <LocationTag>[];
+    final freeTextPlaces = <String>[];
+    final matchedTagNames = <String>[];
+    for (final placeName in placeNames) {
+      final normalizedName = placeName.trim().toLowerCase();
+      final exactTags = normalizedToTags[normalizedName];
+      if (exactTags != null && exactTags.isNotEmpty) {
+        matchedTags.addAll(exactTags);
+        matchedTagNames.add(placeName);
+      } else {
+        freeTextPlaces.add(placeName);
       }
-      resolvedTags.addAll(tags);
     }
 
-    return _LocationTagResolutionResult(tags: resolvedTags, warnings: warnings);
+    final matchedFiles = <EnteFile>{};
+    final matchesSummary = <String, dynamic>{};
+
+    if (matchedTags.isNotEmpty) {
+      matchesSummary["location_tag_names"] = matchedTagNames;
+      matchedFiles.addAll(
+        files.where((file) {
+          if (!file.hasLocation) {
+            return false;
+          }
+          for (final tag in matchedTags) {
+            if (isFileInsideLocationTag(
+              tag.centerPoint,
+              file.location!,
+              tag.radius,
+            )) {
+              return true;
+            }
+          }
+          return false;
+        }),
+      );
+    }
+
+    if (freeTextPlaces.isNotEmpty) {
+      final placeQueryResolution = await _resolveFilesForPlaceQueries(
+        files: files,
+        placeQueries: freeTextPlaces,
+      );
+      warnings.addAll(placeQueryResolution.warnings);
+      matchesSummary["place_queries"] = placeQueryResolution.matchesSummary;
+      matchedFiles.addAll(placeQueryResolution.files);
+    }
+
+    if (matchedFiles.isEmpty && matchedTags.isEmpty && freeTextPlaces.isEmpty) {
+      warnings.add("No place names resolved from place_names");
+    }
+
+    return _PlaceQueryResolutionResult(
+      files: matchedFiles.toList(growable: false),
+      matchesSummary: matchesSummary,
+      warnings: warnings,
+    );
   }
 
   Future<_PlaceQueryResolutionResult> _resolveFilesForPlaceQueries({
@@ -1497,9 +2691,9 @@ class NaturalSearchService {
       throw const FormatException("Tool call must include a non-empty 'name'");
     }
     final trimmedName = name.trim();
-    if (trimmedName != _toolName) {
+    if (!_supportedToolNames.contains(trimmedName)) {
       throw FormatException(
-        "Unexpected tool call '$trimmedName'. Expected '$_toolName'",
+        "Unexpected tool call '$trimmedName'. Expected one of ${_supportedToolNames.toList(growable: false)}",
       );
     }
 
@@ -1694,12 +2888,14 @@ class NaturalSearchParsedToolCall {
   final String name;
   final Map<String, dynamic> arguments;
   final List<String> warnings;
+  final List<String> validationIssues;
   final Map<String, dynamic> rawCallJson;
 
   NaturalSearchParsedToolCall({
     required this.name,
     required this.arguments,
     required this.warnings,
+    required this.validationIssues,
     required this.rawCallJson,
   });
 }
@@ -1767,6 +2963,26 @@ class _NormalizationResult {
   });
 }
 
+class ArgumentPruningResult {
+  final Map<String, dynamic> arguments;
+  final List<String> warnings;
+
+  ArgumentPruningResult({
+    required this.arguments,
+    required this.warnings,
+  });
+}
+
+class _ScoredContextCandidate {
+  final String candidate;
+  final int score;
+
+  _ScoredContextCandidate({
+    required this.candidate,
+    required this.score,
+  });
+}
+
 class _OwnershipFilterResult {
   final List<EnteFile> files;
   final Map<String, dynamic> resolvedArguments;
@@ -1779,22 +2995,14 @@ class _OwnershipFilterResult {
   });
 }
 
-class _EntityIDResolutionResult {
+class _AlbumResolutionResult {
   final Set<int> collectionIds;
-  final List<String> warnings;
-
-  _EntityIDResolutionResult({
-    required this.collectionIds,
-    required this.warnings,
-  });
-}
-
-class _DeviceAlbumResolutionResult {
   final Set<String> localIDs;
   final Set<String> pathIDs;
   final List<String> warnings;
 
-  _DeviceAlbumResolutionResult({
+  _AlbumResolutionResult({
+    required this.collectionIds,
     required this.localIDs,
     required this.pathIDs,
     required this.warnings,
@@ -1809,16 +3017,6 @@ class _PersonResolutionResult {
   _PersonResolutionResult({
     required this.uploadedIDs,
     required this.personIDs,
-    required this.warnings,
-  });
-}
-
-class _LocationTagResolutionResult {
-  final List<LocationTag> tags;
-  final List<String> warnings;
-
-  _LocationTagResolutionResult({
-    required this.tags,
     required this.warnings,
   });
 }
@@ -1884,4 +3082,18 @@ class _NumericRangeResult {
       if (max != null) "max": max!,
     };
   }
+}
+
+class _ResolvedCalendarDate {
+  final int year;
+  final int month;
+  final int day;
+
+  const _ResolvedCalendarDate({
+    required this.year,
+    required this.month,
+    required this.day,
+  });
+
+  DateTime toDateTime() => DateTime(year, month, day);
 }
