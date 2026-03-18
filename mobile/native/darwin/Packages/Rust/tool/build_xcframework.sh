@@ -38,9 +38,39 @@ cp "$MODULEMAP_SRC" "$HEADER_DIR/module.modulemap"
 export IPHONEOS_DEPLOYMENT_TARGET=13.0
 export CMAKE_OSX_DEPLOYMENT_TARGET=13.0
 
+bundle_llama_extra_static_libs() {
+  local target="$1"
+  local final_static_lib="$RUST_DIR/target/$target/release/$LIB_NAME"
+
+  if [[ ! -f "$final_static_lib" ]]; then
+    return 0
+  fi
+
+  # Only bundle cpp-httplib when the produced archive still has unresolved
+  # httplib symbols. If upstream starts packaging it correctly later, this
+  # becomes a no-op instead of duplicating definitions.
+  if ! nm "$final_static_lib" 2>/dev/null | c++filt | grep -q ' U httplib::'; then
+    return 0
+  fi
+
+  local extra_lib
+  extra_lib="$(find "$RUST_DIR/target/$target/release/build" -path '*llama-cpp-sys-2-*/out/build/vendor/cpp-httplib/libcpp-httplib.a' | head -n 1 || true)"
+  if [[ -z "$extra_lib" ]]; then
+    return 0
+  fi
+
+  local merged_static_lib="${final_static_lib}.merged"
+  rm -f "$merged_static_lib"
+  libtool -static -o "$merged_static_lib" "$final_static_lib" "$extra_lib"
+  mv "$merged_static_lib" "$final_static_lib"
+}
+
 cargo rustc --manifest-path "$RUST_DIR/Cargo.toml" --release --target aarch64-apple-ios --lib --crate-type staticlib
 cargo rustc --manifest-path "$RUST_DIR/Cargo.toml" --release --target aarch64-apple-ios-sim --lib --crate-type staticlib
 cargo rustc --manifest-path "$RUST_DIR/Cargo.toml" --release --target x86_64-apple-ios --lib --crate-type staticlib
+bundle_llama_extra_static_libs aarch64-apple-ios
+bundle_llama_extra_static_libs aarch64-apple-ios-sim
+bundle_llama_extra_static_libs x86_64-apple-ios
 
 cp "$RUST_DIR/target/aarch64-apple-ios/release/$LIB_NAME" "$ROOT/build/ios/$LIB_NAME"
 
@@ -55,6 +85,8 @@ export CMAKE_OSX_DEPLOYMENT_TARGET=10.15
 
 cargo rustc --manifest-path "$RUST_DIR/Cargo.toml" --release --target aarch64-apple-darwin --lib --crate-type staticlib
 cargo rustc --manifest-path "$RUST_DIR/Cargo.toml" --release --target x86_64-apple-darwin --lib --crate-type staticlib
+bundle_llama_extra_static_libs aarch64-apple-darwin
+bundle_llama_extra_static_libs x86_64-apple-darwin
 
 lipo -create \
   "$RUST_DIR/target/aarch64-apple-darwin/release/$LIB_NAME" \

@@ -90,6 +90,86 @@ FLUTTER_EXPORT_BUILD_ENVIRONMENT=(
   "$PODS_ROOT/../Flutter/flutter_export_environment.sh" # iOS
 )
 
+rust_build_dir_name() {
+  case "$CARGOKIT_CONFIGURATION" in
+    Debug*)
+      echo "debug"
+      ;;
+    *)
+      echo "release"
+      ;;
+  esac
+}
+
+rust_target_for_darwin_arch() {
+  case "$CARGOKIT_DARWIN_PLATFORM_NAME:$1" in
+    macosx:x86_64)
+      echo "x86_64-apple-darwin"
+      ;;
+    macosx:arm64)
+      echo "aarch64-apple-darwin"
+      ;;
+    iphoneos:arm64)
+      echo "aarch64-apple-ios"
+      ;;
+    iphonesimulator:x86_64)
+      echo "x86_64-apple-ios"
+      ;;
+    iphonesimulator:arm64)
+      echo "aarch64-apple-ios-sim"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+find_llama_extra_static_libs() {
+  local rust_build_dir
+  rust_build_dir="$(rust_build_dir_name)"
+
+  local arch
+  local rust_target
+  local pattern
+  local latest_match
+
+  for arch in $CARGOKIT_DARWIN_ARCHS; do
+    rust_target="$(rust_target_for_darwin_arch "$arch")" || continue
+    pattern="$TARGET_TEMP_DIR/$rust_target/$rust_build_dir/build/llama-cpp-sys-2-*/out/build/vendor/cpp-httplib/libcpp-httplib.a"
+    latest_match="$(ls -t $pattern 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$latest_match" ]]; then
+      printf '%s\n' "$latest_match"
+    fi
+  done
+}
+
+bundle_llama_extra_static_libs() {
+  local final_static_lib
+  final_static_lib="$(find "$CARGOKIT_OUTPUT_DIR" -maxdepth 1 -name 'lib*.a' | head -n 1 || true)"
+  if [[ -z "$final_static_lib" ]]; then
+    return 0
+  fi
+
+  # Only bundle cpp-httplib when the produced archive still has unresolved
+  # httplib symbols. If upstream starts packaging it correctly later, this
+  # becomes a no-op instead of duplicating definitions.
+  if ! nm "$final_static_lib" 2>/dev/null | c++filt | grep -q ' U httplib::'; then
+    return 0
+  fi
+
+  local extra_libs
+  extra_libs="$(find_llama_extra_static_libs)"
+  if [[ -z "$extra_libs" ]]; then
+    return 0
+  fi
+
+  local merged_static_lib="${final_static_lib}.merged"
+  rm -f "$merged_static_lib"
+  # Paths are inside DerivedData / build directories and do not contain spaces.
+  libtool -static -o "$merged_static_lib" "$final_static_lib" $extra_libs
+  mv "$merged_static_lib" "$final_static_lib"
+}
+
 for path in "${FLUTTER_EXPORT_BUILD_ENVIRONMENT[@]}"
 do
   if [[ -f "$path" ]]; then
@@ -98,6 +178,7 @@ do
 done
 
 sh "$BASEDIR/run_build_tool.sh" build-pod "$@"
+bundle_llama_extra_static_libs
 
 # Make a symlink from built framework to phony file, which will be used as input to
 # build script. This should force rebuild (podspec currently doesn't support alwaysOutOfDate
