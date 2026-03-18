@@ -1,6 +1,7 @@
 import "dart:async";
 
 import "package:ente_pure_utils/ente_pure_utils.dart";
+import "package:flutter/foundation.dart";
 import "package:flutter/material.dart";
 import "package:flutter/scheduler.dart";
 import "package:hugeicons/hugeicons.dart";
@@ -231,7 +232,9 @@ class SearchWidgetState extends State<SearchWidget> {
     }
 
     void onResultsReceived(List<SearchResult> results) {
-      streamController.sink.add(results);
+      if (!streamController.isClosed) {
+        streamController.sink.add(results);
+      }
       resultCount++;
       if (resultCount == maxResultCount) {
         streamController.close();
@@ -243,13 +246,24 @@ class SearchWidgetState extends State<SearchWidget> {
       }
     }
 
-    void queueSearchResults<T extends SearchResult>(Future<List<T>> future) {
+    void queueSearchResults<T extends SearchResult>(
+      Future<List<T>> future, {
+      bool emitEmptyOnError = true,
+    }) {
       maxResultCount++;
       future.then(
         (results) => onResultsReceived(List<SearchResult>.from(results)),
         onError: (Object error, StackTrace stackTrace) {
           _logger.severe("Failed to fetch search results", error, stackTrace);
-          onResultsReceived(const <SearchResult>[]);
+          if (emitEmptyOnError) {
+            onResultsReceived(const <SearchResult>[]);
+            return;
+          }
+
+          resultCount++;
+          if (resultCount == maxResultCount && !streamController.isClosed) {
+            streamController.close();
+          }
         },
       );
     }
@@ -292,6 +306,7 @@ class SearchWidgetState extends State<SearchWidget> {
           return <SearchResult>[result.searchResult];
         },
       ),
+      emitEmptyOnError: kDebugMode,
     );
     queueSearchResults(_searchService.getContactSearchResults(query));
 
