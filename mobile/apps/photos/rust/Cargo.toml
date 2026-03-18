@@ -10,7 +10,7 @@ crate-type = ["cdylib", "staticlib"]
 flutter_rust_bridge = "=2.11.1"
 usearch = "2.21.3"
 ente_media_inspector = { path = "../../../../rust/photos" }
-inference_rs = { path = "../../../../rust/llmchat/inference" }
+inference_rs = { path = "../../../../rust/ensu/inference" }
 fast_image_resize = { version = "5.5.0", features = ["image", "rayon"] }
 image = { version = "0.25.5", default-features = true }
 imageproc = "0.25.0"
