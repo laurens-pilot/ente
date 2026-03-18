@@ -214,6 +214,26 @@ class NaturalSearchService {
     "shares",
     "sharing",
   };
+  static const Map<String, Set<String>> _groundingAliases = {
+    "mom": {"mom", "mother", "mum", "mama"},
+    "mother": {"mom", "mother", "mum", "mama"},
+    "mum": {"mom", "mother", "mum", "mama"},
+    "mama": {"mom", "mother", "mum", "mama"},
+    "dad": {"dad", "father", "daddy", "papa"},
+    "father": {"dad", "father", "daddy", "papa"},
+    "daddy": {"dad", "father", "daddy", "papa"},
+    "papa": {"dad", "father", "daddy", "papa"},
+    "grandma": {"grandma", "grandmother", "granny", "nani", "dadi"},
+    "grandmother": {"grandma", "grandmother", "granny", "nani", "dadi"},
+    "granny": {"grandma", "grandmother", "granny", "nani", "dadi"},
+    "nani": {"grandma", "grandmother", "granny", "nani", "dadi"},
+    "dadi": {"grandma", "grandmother", "granny", "nani", "dadi"},
+    "grandpa": {"grandpa", "grandfather", "grampa", "nana", "dada"},
+    "grandfather": {"grandpa", "grandfather", "grampa", "nana", "dada"},
+    "grampa": {"grandpa", "grandfather", "grampa", "nana", "dada"},
+    "nana": {"grandpa", "grandfather", "grampa", "nana", "dada"},
+    "dada": {"grandpa", "grandfather", "grampa", "nana", "dada"},
+  };
   static const Map<String, int> _monthNameToNumber = {
     "january": 1,
     "jan": 1,
@@ -254,6 +274,10 @@ class NaturalSearchService {
     "eleven": 11,
     "twelve": 12,
   };
+  static const String _durationUnitPattern =
+      r"(?:hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)";
+  static const String _fileSizeUnitPattern =
+      r"(?:bytes?|kilobytes?|megabytes?|gigabytes?|terabytes?|kibibytes?|mebibytes?|gibibytes?|tebibytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)";
   static final RegExp _nonAlphaNumericPattern = RegExp(r"[^a-z0-9]+");
   static final RegExp _whitespacePattern = RegExp(r"\s+");
 
@@ -611,8 +635,6 @@ class NaturalSearchService {
         }).toList(growable: false);
       }
     }
-
-    _sortFilesChronologically(workingFiles);
 
     final limit = normalizedArguments["limit"] as int?;
     if (limit != null && limit >= 0 && workingFiles.length > limit) {
@@ -1385,7 +1407,6 @@ class NaturalSearchService {
     context["local_timezone"] = await _resolveLocalTimezone();
     context["week_start"] = "monday";
     context["search_start_year"] = searchStartYear;
-    context["result_ordering"] = "chronological";
 
     final albumNames = selectRelevantContextCandidates(
       userQuery: userQuery,
@@ -1477,8 +1498,10 @@ class NaturalSearchService {
         normalizedQuery,
         normalizedCandidate,
       );
-      final matchedTokenCount =
-          candidateTokens.intersection(queryTokens).length;
+      final matchedTokenCount = _countGroundedTokenMatches(
+        queryTokens: queryTokens,
+        candidateTokens: candidateTokens,
+      );
 
       switch (entityKind) {
         case NaturalSearchContextEntityKind.album:
@@ -1489,7 +1512,12 @@ class NaturalSearchService {
           if (!hasAlbumIntent && !hasDistinctivePhraseMatch) {
             continue;
           }
-          if (!hasDistinctivePhraseMatch && matchedTokenCount == 0) {
+          if (!hasDistinctivePhraseMatch &&
+              !_hasSufficientGroundedOverlap(
+                queryTokens: queryTokens,
+                candidateTokens: candidateTokens,
+                minimumMatches: candidateTokens.length > 1 ? 2 : 1,
+              )) {
             continue;
           }
           break;
@@ -1497,13 +1525,21 @@ class NaturalSearchService {
           if (!hasSharingIntent && !hasExactPhraseMatch) {
             continue;
           }
-          if (!hasExactPhraseMatch && matchedTokenCount == 0) {
+          if (!hasExactPhraseMatch &&
+              !_hasSufficientGroundedOverlap(
+                queryTokens: queryTokens,
+                candidateTokens: candidateTokens,
+              )) {
             continue;
           }
           break;
         case NaturalSearchContextEntityKind.person:
         case NaturalSearchContextEntityKind.locationTag:
-          if (!hasExactPhraseMatch && matchedTokenCount == 0) {
+          if (!hasExactPhraseMatch &&
+              !_hasSufficientGroundedOverlap(
+                queryTokens: queryTokens,
+                candidateTokens: candidateTokens,
+              )) {
             continue;
           }
           break;
@@ -1575,11 +1611,33 @@ class NaturalSearchService {
   }
 
   static String _normalizeNumericQueryText(String input) {
-    return input
+    final normalized = input
         .toLowerCase()
         .replaceAll(RegExp(r"[^a-z0-9.\s-]"), " ")
         .replaceAll(_whitespacePattern, " ")
         .trim();
+    return _replaceNumericWordsInQuery(normalized);
+  }
+
+  static String _replaceNumericWordsInQuery(String input) {
+    var normalized = input;
+    normalized = normalized.replaceAllMapped(
+      RegExp(
+        r"\b(a|an)\s+"
+        r"(hour|hours|hr|hrs|h|minute|minutes|min|mins|m|second|seconds|sec|secs|s|"
+        r"byte|bytes|kilobyte|kilobytes|megabyte|megabytes|gigabyte|gigabytes|terabyte|terabytes|"
+        r"kibibyte|kibibytes|mebibyte|mebibytes|gibibyte|gibibytes|tebibyte|tebibytes|"
+        r"b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+      ),
+      (match) => "1 ${match.group(2)}",
+    );
+    for (final entry in _numberWordToInt.entries) {
+      normalized = normalized.replaceAll(
+        RegExp(r"\b" + RegExp.escape(entry.key) + r"\b"),
+        entry.value.toString(),
+      );
+    }
+    return normalized;
   }
 
   static List<String> _extractMeaningfulContextTokens(String input) {
@@ -1590,6 +1648,168 @@ class NaturalSearchService {
           (token) => token.length >= 2 && !_queryStopWords.contains(token),
         )
         .toList(growable: false);
+  }
+
+  static bool _tokenMatchesGrounding(
+    String candidateToken,
+    Set<String> queryTokens,
+  ) {
+    if (queryTokens.contains(candidateToken)) {
+      return true;
+    }
+
+    final candidateAliases = _groundingAliases[candidateToken];
+    if (candidateAliases != null &&
+        candidateAliases.any(queryTokens.contains)) {
+      return true;
+    }
+
+    for (final queryToken in queryTokens) {
+      final queryAliases = _groundingAliases[queryToken];
+      if (queryAliases != null && queryAliases.contains(candidateToken)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  static int _countGroundedTokenMatches({
+    required Set<String> queryTokens,
+    required Set<String> candidateTokens,
+  }) {
+    var matchCount = 0;
+    for (final candidateToken in candidateTokens) {
+      if (_tokenMatchesGrounding(candidateToken, queryTokens)) {
+        matchCount++;
+      }
+    }
+    return matchCount;
+  }
+
+  static bool _hasSufficientGroundedOverlap({
+    required Set<String> queryTokens,
+    required Set<String> candidateTokens,
+    int minimumMatches = 1,
+  }) {
+    if (candidateTokens.isEmpty) {
+      return false;
+    }
+    return _countGroundedTokenMatches(
+          queryTokens: queryTokens,
+          candidateTokens: candidateTokens,
+        ) >=
+        minimumMatches;
+  }
+
+  static bool _isGroundedTextConstraint({
+    required String normalizedQuery,
+    required Set<String> queryTokens,
+    required String value,
+    int minimumMatches = 1,
+  }) {
+    final normalizedValue = _normalizeContextText(value);
+    if (normalizedValue.isEmpty) {
+      return false;
+    }
+    if (_containsWholePhrase(normalizedQuery, normalizedValue)) {
+      return true;
+    }
+    return _hasSufficientGroundedOverlap(
+      queryTokens: queryTokens,
+      candidateTokens: _extractMeaningfulContextTokens(normalizedValue).toSet(),
+      minimumMatches: minimumMatches,
+    );
+  }
+
+  static bool _queryMentionsMediaType(
+    String mediaType,
+    String normalizedQuery,
+  ) {
+    final mentionsPhoto = RegExp(
+      r"(^|\s)(photo|photos|picture|pictures|image|images|live photo|live photos)($|\s)",
+    ).hasMatch(normalizedQuery);
+    final mentionsVideo = RegExp(
+      r"(^|\s)(video|videos|movie|movies|clip|clips|reel|reels)($|\s)",
+    ).hasMatch(normalizedQuery);
+    switch (mediaType) {
+      case "photo":
+        return mentionsPhoto;
+      case "video":
+        return mentionsVideo;
+    }
+    return false;
+  }
+
+  static bool _queryMentionsTime(
+    String normalizedQuery,
+    Set<String> queryTokens, {
+    required int searchStartYearOverride,
+    required DateTime nowOverride,
+  }) {
+    if (RegExp(
+      r"(^|\s)(today|yesterday|week|weeks|month|months|year|years|ago|past|last|this|every|from|until|through|between|before|after|during|since)($|\s)",
+    ).hasMatch(normalizedQuery)) {
+      return true;
+    }
+    if (RegExp(r"\b\d{4}\b").hasMatch(normalizedQuery)) {
+      return true;
+    }
+    if (_monthNameToNumber.keys.any(
+      (monthToken) => normalizedQuery.contains(" $monthToken "),
+    )) {
+      return true;
+    }
+    return resolveTimeQueryToRanges(
+      normalizedQuery.trim(),
+      searchStartYearOverride: searchStartYearOverride,
+      nowOverride: nowOverride,
+    ).isNotEmpty;
+  }
+
+  static bool _queryMentionsFileFormat(
+    String fileFormat,
+    String normalizedQuery,
+  ) {
+    final aliases = _resolveFileFormatAliases(fileFormat);
+    for (final alias in aliases) {
+      if (RegExp(r"(^|\s)" + RegExp.escape(alias) + r"($|\s)")
+          .hasMatch(normalizedQuery)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _queryMentionsVideoDuration(String normalizedQuery) {
+    return RegExp(
+      r"(^|\s)(duration|second|seconds|sec|secs|minute|minutes|min|mins|hour|hours|hr|hrs|long|longer|short|shorter|clip|clips)($|\s)",
+    ).hasMatch(normalizedQuery);
+  }
+
+  static bool _queryMentionsFileSize(String normalizedQuery) {
+    return RegExp(
+      r"(^|\s)(size|sized|byte|bytes|kb|mb|gb|tb|kib|mib|gib|tib|kilobyte|kilobytes|megabyte|megabytes|gigabyte|gigabytes|terabyte|terabytes|small|smaller|large|larger|big|bigger)($|\s)",
+    ).hasMatch(normalizedQuery);
+  }
+
+  static bool _queryMentionsLimit(
+    int limit,
+    String normalizedQuery,
+    Set<String> queryTokens,
+  ) {
+    if (RegExp("(^|\\s)${RegExp.escape(limit.toString())}(\$|\\s)")
+        .hasMatch(normalizedQuery)) {
+      return true;
+    }
+
+    for (final entry in _numberWordToInt.entries) {
+      if (entry.value == limit && queryTokens.contains(entry.key)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   SplayTreeSet<String> _getCanonicalEnteAlbumNames() {
@@ -1957,6 +2177,30 @@ class NaturalSearchService {
     final hasSharingIntent = queryTokens.any(_sharingIntentTokens.contains) ||
         normalizedQuery.contains("shared by") ||
         normalizedQuery.contains("shared with");
+    final hasTimeIntent = _queryMentionsTime(
+      " $normalizedQuery ",
+      queryTokens,
+      searchStartYearOverride: searchStartYearOverride,
+      nowOverride: nowOverride,
+    );
+
+    if (pruned["time_query"] case final String timeQuery) {
+      if (!hasTimeIntent) {
+        warnings.add(
+          "Dropping time_query '$timeQuery' because the query has no time intent",
+        );
+        pruned.remove("time_query");
+      }
+    }
+
+    if (pruned["time_filter"] case final Map<String, dynamic> _) {
+      if (!hasTimeIntent) {
+        warnings.add(
+          "Dropping time_filter because the query has no time intent",
+        );
+        pruned.remove("time_filter");
+      }
+    }
 
     if (pruned["album_names"] case final List<String> albumNames) {
       final retainedAlbumNames = albumNames.where((albumName) {
@@ -1969,7 +2213,14 @@ class NaturalSearchService {
           warnings.add("Dropping unknown album_names value '$albumName'");
           return false;
         }
-        if (!_containsWholePhrase(normalizedQuery, normalizedAlbumName)) {
+        final albumTokens =
+            _extractMeaningfulContextTokens(normalizedAlbumName).toSet();
+        if (!_containsWholePhrase(normalizedQuery, normalizedAlbumName) &&
+            !_hasSufficientGroundedOverlap(
+              queryTokens: queryTokens,
+              candidateTokens: albumTokens,
+              minimumMatches: albumTokens.length > 1 ? 2 : 1,
+            )) {
           warnings.add(
             "Dropping album_names value '$albumName' because it is not grounded in the query",
           );
@@ -2012,7 +2263,13 @@ class NaturalSearchService {
           warnings.add("Dropping unknown people_in_media value '$personName'");
           return false;
         }
-        if (!_containsWholePhrase(normalizedQuery, normalizedPersonName)) {
+        final personTokens =
+            _extractMeaningfulContextTokens(normalizedPersonName).toSet();
+        if (!_containsWholePhrase(normalizedQuery, normalizedPersonName) &&
+            !_hasSufficientGroundedOverlap(
+              queryTokens: queryTokens,
+              candidateTokens: personTokens,
+            )) {
           warnings.add(
             "Dropping people_in_media value '$personName' because it is not grounded in the query",
           );
@@ -2055,7 +2312,10 @@ class NaturalSearchService {
         final contactTokens =
             _extractMeaningfulContextTokens(_normalizeContextText(contactName))
                 .toSet();
-        if (contactTokens.intersection(queryTokens).isEmpty) {
+        if (!_hasSufficientGroundedOverlap(
+          queryTokens: queryTokens,
+          candidateTokens: contactTokens,
+        )) {
           warnings.add(
             "Dropping shared_by_contacts value '$contactName' because it is not grounded in the query",
           );
@@ -2081,6 +2341,139 @@ class NaturalSearchService {
           "Dropping ownership_scope '$ownershipScope' because it is not grounded in the query",
         );
         pruned.remove("ownership_scope");
+      }
+    }
+
+    if (pruned["media_type"] case final String mediaType) {
+      if (!_queryMentionsMediaType(mediaType, normalizedQuery)) {
+        warnings.add(
+          "Dropping media_type '$mediaType' because it is not grounded in the query",
+        );
+        pruned.remove("media_type");
+      }
+    }
+
+    if (pruned["place_names"] case final List<String> placeNames) {
+      final retainedPlaces = placeNames.where((placeName) {
+        if (_isGroundedTextConstraint(
+          normalizedQuery: normalizedQuery,
+          queryTokens: queryTokens,
+          value: placeName,
+        )) {
+          return true;
+        }
+        warnings.add(
+          "Dropping place_names value '$placeName' because it is not grounded in the query",
+        );
+        return false;
+      }).toList(growable: false);
+      if (retainedPlaces.isEmpty) {
+        pruned.remove("place_names");
+      } else {
+        pruned["place_names"] = retainedPlaces;
+      }
+    }
+
+    if (pruned["visual_query"] case final String visualQuery) {
+      if (!_isGroundedTextConstraint(
+        normalizedQuery: normalizedQuery,
+        queryTokens: queryTokens,
+        value: visualQuery,
+      )) {
+        warnings.add(
+          "Dropping visual_query '$visualQuery' because it is not grounded in the query",
+        );
+        pruned.remove("visual_query");
+      }
+    }
+
+    if (pruned["text_query"] case final String textQuery) {
+      if (!_isGroundedTextConstraint(
+        normalizedQuery: normalizedQuery,
+        queryTokens: queryTokens,
+        value: textQuery,
+      )) {
+        warnings.add(
+          "Dropping text_query '$textQuery' because it is not grounded in the query",
+        );
+        pruned.remove("text_query");
+      }
+    }
+
+    if (pruned["camera_query"] case final String cameraQuery) {
+      if (!_isGroundedTextConstraint(
+        normalizedQuery: normalizedQuery,
+        queryTokens: queryTokens,
+        value: cameraQuery,
+      )) {
+        warnings.add(
+          "Dropping camera_query '$cameraQuery' because it is not grounded in the query",
+        );
+        pruned.remove("camera_query");
+      }
+    }
+
+    if (pruned["file_format"] case final String fileFormat) {
+      if (!_queryMentionsFileFormat(fileFormat, normalizedQuery)) {
+        warnings.add(
+          "Dropping file_format '$fileFormat' because it is not grounded in the query",
+        );
+        pruned.remove("file_format");
+      }
+    }
+
+    if (pruned["video_duration_query"] case final String videoDurationQuery) {
+      if (!_queryMentionsVideoDuration(normalizedQuery) &&
+          !_isGroundedTextConstraint(
+            normalizedQuery: normalizedQuery,
+            queryTokens: queryTokens,
+            value: videoDurationQuery,
+          )) {
+        warnings.add(
+          "Dropping video_duration_query '$videoDurationQuery' because it is not grounded in the query",
+        );
+        pruned.remove("video_duration_query");
+      }
+    }
+
+    if (pruned["file_size_query"] case final String fileSizeQuery) {
+      if (!_queryMentionsFileSize(normalizedQuery) &&
+          !_isGroundedTextConstraint(
+            normalizedQuery: normalizedQuery,
+            queryTokens: queryTokens,
+            value: fileSizeQuery,
+          )) {
+        warnings.add(
+          "Dropping file_size_query '$fileSizeQuery' because it is not grounded in the query",
+        );
+        pruned.remove("file_size_query");
+      }
+    }
+
+    if (pruned["video_duration_seconds"] case final Map<String, dynamic> _) {
+      if (!_queryMentionsVideoDuration(normalizedQuery)) {
+        warnings.add(
+          "Dropping video_duration_seconds because it is not grounded in the query",
+        );
+        pruned.remove("video_duration_seconds");
+      }
+    }
+
+    if (pruned["file_size_mb"] case final Map<String, dynamic> _) {
+      if (!_queryMentionsFileSize(normalizedQuery)) {
+        warnings.add(
+          "Dropping file_size_mb because it is not grounded in the query",
+        );
+        pruned.remove("file_size_mb");
+      }
+    }
+
+    if (pruned["limit"] case final int limit) {
+      if (!_queryMentionsLimit(limit, normalizedQuery, queryTokens)) {
+        warnings.add(
+          "Dropping limit '$limit' because it is not grounded in the query",
+        );
+        pruned.remove("limit");
       }
     }
 
@@ -2696,7 +3089,11 @@ class NaturalSearchService {
     }
 
     final betweenMatch = RegExp(
-      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)?\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*"
+      "($_durationUnitPattern)?"
+      r"\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*"
+      "($_durationUnitPattern)"
+      r"\b",
     ).firstMatch(normalized);
     if (betweenMatch != null) {
       final firstValue = double.parse(betweenMatch.group(1)!);
@@ -2713,7 +3110,11 @@ class NaturalSearchService {
     }
 
     final rangedMatch = RegExp(
-      r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)?\s*-\s*(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+      r"(\d+(?:\.\d+)?)\s*"
+      "($_durationUnitPattern)?"
+      r"\s*-\s*(\d+(?:\.\d+)?)\s*"
+      "($_durationUnitPattern)"
+      r"\b",
     ).firstMatch(normalized);
     if (rangedMatch != null) {
       final firstValue = double.parse(rangedMatch.group(1)!);
@@ -2821,7 +3222,11 @@ class NaturalSearchService {
     }
 
     final betweenMatch = RegExp(
-      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)?\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+      r"(?:between|from)\s+(\d+(?:\.\d+)?)\s*"
+      "($_fileSizeUnitPattern)?"
+      r"\s+(?:and|to)\s+(\d+(?:\.\d+)?)\s*"
+      "($_fileSizeUnitPattern)"
+      r"\b",
     ).firstMatch(normalized);
     if (betweenMatch != null) {
       final firstValue = double.parse(betweenMatch.group(1)!);
@@ -2837,7 +3242,11 @@ class NaturalSearchService {
     }
 
     final rangedMatch = RegExp(
-      r"(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)?\s*-\s*(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+      r"(\d+(?:\.\d+)?)\s*"
+      "($_fileSizeUnitPattern)?"
+      r"\s*-\s*(\d+(?:\.\d+)?)\s*"
+      "($_fileSizeUnitPattern)"
+      r"\b",
     ).firstMatch(normalized);
     if (rangedMatch != null) {
       final firstValue = double.parse(rangedMatch.group(1)!);
@@ -2982,7 +3391,9 @@ class NaturalSearchService {
   static int? _parseDurationPhraseToSeconds(String phrase) {
     final normalized = _normalizeNumericQueryText(phrase);
     final matches = RegExp(
-      r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|hr|h|minutes?|minute|mins?|min|m|seconds?|second|secs?|sec|s)\b",
+      r"(\d+(?:\.\d+)?)\s*"
+      "($_durationUnitPattern)"
+      r"\b",
     ).allMatches(normalized);
     if (matches.isEmpty) {
       return null;
@@ -3028,7 +3439,9 @@ class NaturalSearchService {
   static int? _parseFileSizePhraseToBytes(String phrase) {
     final normalized = _normalizeNumericQueryText(phrase);
     final match = RegExp(
-      r"(\d+(?:\.\d+)?)\s*(bytes?|b|kb|kib|mb|mib|gb|gib|tb|tib)\b",
+      r"(\d+(?:\.\d+)?)\s*"
+      "($_fileSizeUnitPattern)"
+      r"\b",
     ).firstMatch(normalized);
     if (match == null) {
       return null;
@@ -3045,27 +3458,40 @@ class NaturalSearchService {
       case "byte":
       case "bytes":
         return value.round();
+      case "kilobyte":
+      case "kilobytes":
       case "kb":
       case "kib":
         return (value * 1024).round();
+      case "megabyte":
+      case "megabytes":
       case "mb":
       case "mib":
         return (value * 1024 * 1024).round();
+      case "gigabyte":
+      case "gigabytes":
       case "gb":
       case "gib":
         return (value * 1024 * 1024 * 1024).round();
+      case "terabyte":
+      case "terabytes":
       case "tb":
       case "tib":
         return (value * 1024 * 1024 * 1024 * 1024).round();
+      case "kibibyte":
+      case "kibibytes":
+        return (value * 1024).round();
+      case "mebibyte":
+      case "mebibytes":
+        return (value * 1024 * 1024).round();
+      case "gibibyte":
+      case "gibibytes":
+        return (value * 1024 * 1024 * 1024).round();
+      case "tebibyte":
+      case "tebibytes":
+        return (value * 1024 * 1024 * 1024 * 1024).round();
     }
     return null;
-  }
-
-  void _sortFilesChronologically(List<EnteFile> files) {
-    files.sort(
-      (first, second) =>
-          (first.creationTime ?? 0).compareTo(second.creationTime ?? 0),
-    );
   }
 
   static ParsedToolCall _parseToolCallMap(

@@ -289,6 +289,24 @@ void main() {
         DateTime(2024, 8, 21).microsecondsSinceEpoch,
       );
     });
+
+    test("resolves rolling window with number words", () {
+      final ranges = NaturalSearchService.resolveTimeQueryToRanges(
+        "past two months",
+        searchStartYearOverride: 2016,
+        nowOverride: now,
+      );
+
+      expect(ranges.length, 1);
+      expect(
+        ranges.first.startMicroseconds,
+        DateTime(2026, 1, 10, 11, 29, 6).microsecondsSinceEpoch,
+      );
+      expect(
+        ranges.first.endMicrosecondsExclusive,
+        now.microsecondsSinceEpoch,
+      );
+    });
   });
 
   group("resolveVideoDurationQueryToRangeJson", () {
@@ -312,6 +330,27 @@ void main() {
         "max": 120,
       });
     });
+
+    test("resolves number words and shorthand units", () {
+      final range = NaturalSearchService.resolveVideoDurationQueryToRangeJson(
+        "shorter than two mins",
+      );
+
+      expect(range, {
+        "max": 119,
+      });
+    });
+
+    test("resolves exact mixed-unit duration", () {
+      final range = NaturalSearchService.resolveVideoDurationQueryToRangeJson(
+        "1 hr 30 min",
+      );
+
+      expect(range, {
+        "min": 5400,
+        "max": 5400,
+      });
+    });
   });
 
   group("resolveFileSizeQueryToRangeJson", () {
@@ -333,6 +372,37 @@ void main() {
       expect(range, {
         "min": 1610612736,
         "max": 2147483648,
+      });
+    });
+
+    test("resolves full unit words", () {
+      final range = NaturalSearchService.resolveFileSizeQueryToRangeJson(
+        "larger than 50 megabytes",
+      );
+
+      expect(range, {
+        "min": 52428801,
+      });
+    });
+
+    test("resolves number words with full unit words", () {
+      final range = NaturalSearchService.resolveFileSizeQueryToRangeJson(
+        "between one gigabyte and two gigabytes",
+      );
+
+      expect(range, {
+        "min": 1073741824,
+        "max": 2147483648,
+      });
+    });
+
+    test("resolves article-based file-size phrases", () {
+      final range = NaturalSearchService.resolveFileSizeQueryToRangeJson(
+        "under a gigabyte",
+      );
+
+      expect(range, {
+        "max": 1073741823,
       });
     });
   });
@@ -388,6 +458,74 @@ void main() {
         "time_query": "last month",
       });
     });
+
+    test("grounds free-text filters and drops ungrounded ones", () {
+      final pruningResult =
+          NaturalSearchService.pruneArgumentsForQueryConsistency(
+        originalQuery:
+            "show me 5 heic photos on a beach in France shot on iPhone from last month",
+        normalizedArguments: {
+          "media_type": "photo",
+          "place_names": ["France", "Amsterdam"],
+          "visual_query": "Photo of a beach",
+          "text_query": "birthday",
+          "camera_query": "iPhone",
+          "file_format": "heic",
+          "limit": 5,
+          "time_query": "last month",
+        },
+        canonicalAlbumNames: const <String>{},
+        canonicalPersonNames: const <String>{},
+        canonicalContactNames: const <String>{},
+        searchStartYearOverride: 2016,
+        nowOverride: DateTime(2026, 3, 10, 11, 29, 6),
+      );
+
+      expect(pruningResult.arguments, {
+        "media_type": "photo",
+        "place_names": ["France"],
+        "visual_query": "Photo of a beach",
+        "camera_query": "iPhone",
+        "file_format": "heic",
+        "limit": 5,
+        "time_query": "last month",
+      });
+      expect(
+        pruningResult.warnings,
+        contains(
+          "Dropping place_names value 'Amsterdam' because it is not grounded in the query",
+        ),
+      );
+      expect(
+        pruningResult.warnings,
+        contains(
+          "Dropping text_query 'birthday' because it is not grounded in the query",
+        ),
+      );
+    });
+
+    test("retains people aliases and album token overlap", () {
+      final pruningResult =
+          NaturalSearchService.pruneArgumentsForQueryConsistency(
+        originalQuery: "photos of my mother from the nyc trip album",
+        normalizedArguments: {
+          "album_names": ["Trip to NYC"],
+          "people_in_media": ["Mom"],
+          "people_mode": "any",
+        },
+        canonicalAlbumNames: {"Trip to NYC"},
+        canonicalPersonNames: {"Mom"},
+        canonicalContactNames: const <String>{},
+        searchStartYearOverride: 2016,
+        nowOverride: DateTime(2026, 3, 10, 11, 29, 6),
+      );
+
+      expect(pruningResult.arguments, {
+        "album_names": ["Trip to NYC"],
+        "people_in_media": ["Mom"],
+        "people_mode": "any",
+      });
+    });
   });
 
   group("selectRelevantContextCandidates", () {
@@ -418,6 +556,22 @@ void main() {
 
       expect(people, ["Laurens"]);
       expect(locations, ["Amsterdam"]);
+    });
+
+    test("supports people aliases and album token overlap", () {
+      final people = NaturalSearchService.selectRelevantContextCandidates(
+        userQuery: "photos of my mother",
+        candidates: const ["Mom", "Dad"],
+        entityKind: NaturalSearchContextEntityKind.person,
+      );
+      final albums = NaturalSearchService.selectRelevantContextCandidates(
+        userQuery: "photos from the nyc trip album",
+        candidates: const ["Trip to NYC", "Favorites"],
+        entityKind: NaturalSearchContextEntityKind.album,
+      );
+
+      expect(people, ["Mom"]);
+      expect(albums, ["Trip to NYC"]);
     });
 
     test("only includes contact names when query suggests sharing", () {
