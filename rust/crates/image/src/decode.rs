@@ -2,7 +2,7 @@ use std::{
     any::Any,
     ffi::OsStr,
     fs::File,
-    io::{BufRead, BufReader, Cursor, Seek},
+    io::{BufRead, BufReader, Cursor, Read, Seek},
     panic::{self, AssertUnwindSafe},
     path::Path,
     sync::Once,
@@ -36,11 +36,35 @@ use crate::{
 static IMAGE_DECODER_HOOKS_INIT: Once = Once::new();
 
 const RAW_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-const RAW_MAX_PIXELS: u128 = 256_000_000;
+/// RAW development goes through a planar f32 intermediate (~12 bytes per pixel)
+/// on top of the u16 mosaic and Rgb16 output, so peak memory is roughly 18
+/// bytes per pixel. 200M pixels keeps headroom above the largest current
+/// sensors (Phase One IQ4 at ~151MP) while bounding worst-case allocations.
+const RAW_MAX_PIXELS: u128 = 200_000_000;
 const RAW_EXTENSIONS: &[&str] = &[
     "3fr", "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "fff", "iiq",
     "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "qtk", "raf", "raw", "rw2",
     "rwl", "srw", "x3f",
+];
+/// Magic-byte prefixes of RAW containers that must be routed to the RAW
+/// pipeline first. TIFF magic is included because most RAW formats
+/// (NEF/ARW/CR2/DNG/PEF/SRW/...) are TIFF containers whose first IFD is often
+/// a decodable thumbnail, so the image crate would "succeed" and silently
+/// return that thumbnail. The rawler probe rejects plain TIFF files quickly,
+/// letting those fall through to the image crate. The list need not be
+/// exhaustive: formats missed here are still caught by the RAW extension
+/// routing or by the RAW fallback after an image crate failure.
+const RAW_MAGIC_PREFIXES: &[&[u8]] = &[
+    b"II*\0",    // TIFF little-endian (NEF/ARW/CR2/DNG/PEF/SRW/3FR/IIQ/...)
+    b"MM\0*",    // TIFF big-endian
+    b"II\x1a\0", // Canon CRW
+    b"IIU\0",    // Panasonic RW2/RWL
+    b"IIRO",     // Olympus ORF
+    b"IIRS",     // Olympus ORF
+    b"MMOR",     // Olympus ORF (big-endian)
+    b"FUJIFILM", // Fujifilm RAF
+    b"FOVb",     // Sigma X3F
+    b"\0MRM",    // Minolta MRW
 ];
 
 struct DecodedDynamicImage {
@@ -55,8 +79,7 @@ impl DecodedDynamicImage {
 }
 
 pub fn decode_image_from_path(image_path: &str) -> ImageResult<DecodedImage> {
-    let decoded_dynamic = decode_dynamic_from_path(image_path)?;
-    let oriented = orient_decoded_image(decoded_dynamic, image_path).into_rgb8();
+    let oriented = decode_dynamic_from_path(image_path)?.into_rgb8();
 
     Ok(DecodedImage {
         dimensions: Dimensions {
@@ -68,8 +91,7 @@ pub fn decode_image_from_path(image_path: &str) -> ImageResult<DecodedImage> {
 }
 
 pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> {
-    let decoded_dynamic = decode_dynamic_from_bytes(image_bytes)?;
-    let oriented = orient_decoded_image_from_bytes(decoded_dynamic, image_bytes).into_rgb8();
+    let oriented = decode_dynamic_from_bytes(image_bytes)?.into_rgb8();
 
     Ok(DecodedImage {
         dimensions: Dimensions {
@@ -80,24 +102,124 @@ pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> 
     })
 }
 
+/// Decode an image from a path and apply EXIF orientation.
+///
+/// RAW candidates go to the RAW pipeline first (see [`RAW_MAGIC_PREFIXES`] for
+/// why the image crate must not see them first). How RAW failures are handled
+/// depends on the strength of the RAW signal:
+///
+/// - Extension and magic both say RAW: the file is committed to the RAW
+///   pipeline and every failure — oversized input, unmatched camera model,
+///   decode/develop error — is a hard error. Falling back would let the image
+///   crate decode the embedded preview of a TIFF-based RAW and silently
+///   return a thumbnail-sized image.
+/// - Only one signal says RAW (a `.tif` export carrying TIFF magic, or a
+///   misnamed file whose magic disagrees): the RAW attempt is opportunistic
+///   and any RAW failure falls back to the image crate. This matters because
+///   rawler's probe dispatches TIFF containers on the EXIF `Make` tag alone,
+///   so a plain TIFF exported from a camera photo can pass the probe and only
+///   fail later in `raw_image()` — such files must keep decoding as TIFFs.
+///
+/// The size guardrail runs before the RAW source is constructed because
+/// constructing it materializes the entire input (`RawSource::new` mmaps with
+/// populate, `RawSource::new_from_slice` copies, and a failed probe copies
+/// the buffer again for the naked-RAW lookup).
 fn decode_dynamic_from_path(image_path: &str) -> ImageResult<DynamicImage> {
-    if path_extension_is_raw(Path::new(image_path)) {
-        return decode_raw_from_path(image_path);
+    let extension_is_raw = path_extension_is_raw(Path::new(image_path));
+    let magic_is_raw = file_magic_looks_like_raw(image_path);
+    if !extension_is_raw && !magic_is_raw {
+        let decoded = decode_with_image_crate(image_path)?;
+        return Ok(orient_decoded_image(decoded, image_path));
     }
 
-    decode_with_image_crate(image_path)
+    let input_bytes = std::fs::metadata(image_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+
+    if extension_is_raw && magic_is_raw {
+        validate_raw_input_size(input_bytes, image_path)?;
+        return match decode_raw_from_path(image_path)? {
+            RawDecodeOutcome::Decoded(decoded) => Ok(decoded),
+            RawDecodeOutcome::ProbeRejected(probe_error) => Err(ImageError::Decode(format!(
+                "'{image_path}' looks like a camera RAW but no RAW decoder matched (camera model not supported by rawler?), refusing thumbnail fallback: {probe_error}"
+            ))),
+        };
+    }
+
+    let raw_failure = if input_bytes <= RAW_MAX_INPUT_BYTES {
+        match decode_raw_from_path(image_path) {
+            Ok(RawDecodeOutcome::Decoded(decoded)) => return Ok(decoded),
+            Ok(RawDecodeOutcome::ProbeRejected(probe_error)) => probe_error,
+            Err(ImageError::Decode(raw_error)) => raw_error,
+            Err(other) => return Err(other),
+        }
+    } else {
+        format!("RAW decode skipped: {input_bytes} bytes exceeds {RAW_MAX_INPUT_BYTES} bytes")
+    };
+
+    match decode_with_image_crate(image_path) {
+        Ok(decoded) => Ok(orient_decoded_image(decoded, image_path)),
+        Err(ImageError::Decode(fallback_error)) => Err(ImageError::Decode(format!(
+            "{raw_failure}; image crate fallback also failed: {fallback_error}"
+        ))),
+        Err(other) => Err(other),
+    }
 }
 
+/// Decode an image from bytes and apply EXIF orientation.
+///
+/// Mirrors [`decode_dynamic_from_path`], but bytes carry no file name, so
+/// there is never a second RAW signal to corroborate the magic bytes: the RAW
+/// attempt is always opportunistic and any RAW failure falls back to the
+/// image crate (this branch carries every plain TIFF decoded from bytes).
+/// Bytes that don't look like RAW still get a RAW fallback after an image
+/// crate failure, to catch RAW containers whose magic is not in
+/// [`RAW_MAGIC_PREFIXES`]. Oversized input skips the RAW attempt entirely so
+/// that `RawSource::new_from_slice` never copies more than
+/// [`RAW_MAX_INPUT_BYTES`].
 fn decode_dynamic_from_bytes(image_bytes: &[u8]) -> ImageResult<DynamicImage> {
-    match decode_bytes_with_image_crate(image_bytes) {
-        Ok(decoded) => Ok(decoded),
-        Err(primary_error) => match decode_raw_from_bytes(image_bytes) {
-            Ok(decoded) => Ok(decoded),
-            Err(ImageError::Decode(raw_error)) => Err(ImageError::Decode(format!(
-                "failed to decode image with image crate: {primary_error}; RAW fallback also failed: {raw_error}"
+    let within_raw_size_limit = image_bytes.len() as u64 <= RAW_MAX_INPUT_BYTES;
+
+    if bytes_look_like_raw(image_bytes) {
+        let raw_failure = if within_raw_size_limit {
+            match decode_raw_from_bytes(image_bytes) {
+                Ok(RawDecodeOutcome::Decoded(decoded)) => return Ok(decoded),
+                Ok(RawDecodeOutcome::ProbeRejected(probe_error)) => probe_error,
+                Err(ImageError::Decode(raw_error)) => raw_error,
+                Err(other) => return Err(other),
+            }
+        } else {
+            format!(
+                "RAW decode skipped: {} bytes exceeds {RAW_MAX_INPUT_BYTES} bytes",
+                image_bytes.len()
+            )
+        };
+
+        return match decode_bytes_with_image_crate(image_bytes) {
+            Ok(decoded) => Ok(orient_decoded_image_from_bytes(decoded, image_bytes)),
+            Err(ImageError::Decode(fallback_error)) => Err(ImageError::Decode(format!(
+                "{raw_failure}; image crate fallback also failed: {fallback_error}"
             ))),
             Err(other) => Err(other),
-        },
+        };
+    }
+
+    match decode_bytes_with_image_crate(image_bytes) {
+        Ok(decoded) => Ok(orient_decoded_image_from_bytes(decoded, image_bytes)),
+        Err(primary_error) => {
+            if !within_raw_size_limit {
+                return Err(primary_error);
+            }
+            let raw_failure = match decode_raw_from_bytes(image_bytes) {
+                Ok(RawDecodeOutcome::Decoded(decoded)) => return Ok(decoded),
+                Ok(RawDecodeOutcome::ProbeRejected(probe_error)) => probe_error,
+                Err(ImageError::Decode(raw_error)) => raw_error,
+                Err(other) => return Err(other),
+            };
+            Err(ImageError::Decode(format!(
+                "failed to decode image with image crate: {primary_error}; RAW fallback also failed: {raw_failure}"
+            )))
+        }
     }
 }
 
@@ -182,9 +304,24 @@ fn should_attempt_tiff_fallback(format: Option<ImageFormat>) -> bool {
     matches!(format, Some(ImageFormat::Tiff))
 }
 
-fn decode_raw_from_path(image_path: &str) -> ImageResult<DynamicImage> {
+/// Outcome of routing an input through the RAW pipeline.
+///
+/// `ProbeRejected` is separated from hard errors so that callers can apply
+/// their fallback policy (see [`decode_dynamic_from_path`]): in the committed
+/// domain (extension and magic both say RAW) a rejection is a hard error,
+/// while opportunistic callers treat rejections and decode failures alike and
+/// fall back to the image crate. Size guardrails are enforced by the callers
+/// before the `RawSource` is constructed, because construction materializes
+/// the entire input.
+enum RawDecodeOutcome {
+    /// Successfully decoded, developed, and oriented.
+    Decoded(DynamicImage),
+    /// rawler does not recognize the input as a supported camera RAW.
+    ProbeRejected(String),
+}
+
+fn decode_raw_from_path(image_path: &str) -> ImageResult<RawDecodeOutcome> {
     catch_raw_decode_panic(image_path, || {
-        validate_raw_input_size_from_path(image_path)?;
         let source = RawSource::new(Path::new(image_path)).map_err(|e| {
             ImageError::Decode(format!("failed to open RAW image file '{image_path}': {e}"))
         })?;
@@ -192,19 +329,33 @@ fn decode_raw_from_path(image_path: &str) -> ImageResult<DynamicImage> {
     })
 }
 
-fn decode_raw_from_bytes(image_bytes: &[u8]) -> ImageResult<DynamicImage> {
+fn decode_raw_from_bytes(image_bytes: &[u8]) -> ImageResult<RawDecodeOutcome> {
     catch_raw_decode_panic("<bytes>", || {
-        validate_raw_input_size(image_bytes.len() as u64, "<bytes>")?;
         let source = RawSource::new_from_slice(image_bytes);
         decode_raw_source_to_dynamic_image(&source, "<bytes>")
     })
 }
 
+/// Decode and develop a RAW image. The returned image is already oriented:
+/// EXIF orientation must come from the RAW metadata because the kamadak-exif
+/// pass in [`orient_decoded_image`] cannot read most RAW containers
+/// (CR3/RAF/RW2/ORF have non-TIFF magic or store EXIF in proprietary boxes).
 fn decode_raw_source_to_dynamic_image(
     source: &RawSource,
     source_name: &str,
-) -> ImageResult<DynamicImage> {
-    let raw_image = rawler::decode(source, &RawDecodeParams::default())
+) -> ImageResult<RawDecodeOutcome> {
+    let decode_params = RawDecodeParams::default();
+    let decoder = match rawler::get_decoder(source) {
+        Ok(decoder) => decoder,
+        Err(probe_error) => {
+            return Ok(RawDecodeOutcome::ProbeRejected(format!(
+                "input not recognized as a supported camera RAW: {probe_error}"
+            )));
+        }
+    };
+
+    let raw_image = decoder
+        .raw_image(source, &decode_params, false)
         .map_err(|e| ImageError::Decode(format!("failed to decode RAW image: {e}")))?;
     validate_raw_dimensions(raw_image.width, raw_image.height, source_name)?;
 
@@ -218,12 +369,31 @@ fn decode_raw_source_to_dynamic_image(
     })?;
     validate_raw_dimensions(image.width() as usize, image.height() as usize, source_name)?;
 
-    Ok(image)
+    // Orientation is best effort: a metadata read failure should not discard
+    // an otherwise successfully developed image.
+    let orientation = match decoder.raw_metadata(source, &decode_params) {
+        Ok(metadata) => metadata
+            .exif
+            .orientation
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| (1..=8).contains(value)),
+        Err(err) => {
+            eprintln!(
+                "[ml][decode] failed to read RAW metadata for '{source_name}': {err}; skipping orientation"
+            );
+            None
+        }
+    };
+
+    Ok(RawDecodeOutcome::Decoded(match orientation {
+        Some(orientation) => apply_exif_orientation_dynamic(image, orientation),
+        None => image,
+    }))
 }
 
-fn catch_raw_decode_panic<F>(source_name: &str, decode: F) -> ImageResult<DynamicImage>
+fn catch_raw_decode_panic<T, F>(source_name: &str, decode: F) -> ImageResult<T>
 where
-    F: FnOnce() -> ImageResult<DynamicImage>,
+    F: FnOnce() -> ImageResult<T>,
 {
     match panic::catch_unwind(AssertUnwindSafe(decode)) {
         Ok(result) => result,
@@ -232,15 +402,6 @@ where
             panic_payload_message(payload)
         ))),
     }
-}
-
-fn validate_raw_input_size_from_path(image_path: &str) -> ImageResult<()> {
-    let metadata = std::fs::metadata(image_path).map_err(|e| {
-        ImageError::Decode(format!(
-            "failed to read RAW image metadata for '{image_path}': {e}"
-        ))
-    })?;
-    validate_raw_input_size(metadata.len(), image_path)
 }
 
 fn validate_raw_input_size(input_bytes: u64, source_name: &str) -> ImageResult<()> {
@@ -567,16 +728,44 @@ fn path_extension_is_raw(path: &Path) -> bool {
         })
 }
 
+fn bytes_look_like_raw(image_bytes: &[u8]) -> bool {
+    if image_bytes.len() >= 12 && &image_bytes[4..8] == b"ftyp" {
+        // Canon CR3 is an ISO-BMFF container with the "crx " brand.
+        return &image_bytes[8..12] == b"crx ";
+    }
+
+    RAW_MAGIC_PREFIXES
+        .iter()
+        .any(|prefix| image_bytes.starts_with(prefix))
+}
+
+fn file_magic_looks_like_raw(image_path: &str) -> bool {
+    let Ok(file) = File::open(image_path) else {
+        return false;
+    };
+
+    let mut magic = Vec::with_capacity(16);
+    if file.take(16).read_to_end(&mut magic).is_err() {
+        return false;
+    }
+
+    bytes_look_like_raw(&magic)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, panic, path::Path};
+    use std::{ffi::OsStr, io::Cursor, panic, path::Path};
 
     use image::hooks::decoding_hook_registered;
-    use image::{ColorType, ImageEncoder, ImageFormat, codecs::png::PngEncoder};
+    use image::{
+        ColorType, ImageEncoder, ImageFormat,
+        codecs::{png::PngEncoder, tiff::TiffEncoder},
+    };
     use moxcms::ColorProfile;
 
     use super::{
-        bytes_look_like_heif, catch_raw_decode_panic, decode_image_from_bytes, init_image_decoders,
+        ImageResult, bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic,
+        decode_image_from_bytes, decode_image_from_path, init_image_decoders,
         path_extension_is_raw, should_attempt_tiff_fallback,
     };
 
@@ -615,10 +804,121 @@ mod tests {
     }
 
     #[test]
+    fn detects_raw_magic_bytes() {
+        assert!(bytes_look_like_raw(b"II*\0rest")); // TIFF LE (NEF/ARW/CR2/DNG)
+        assert!(bytes_look_like_raw(b"MM\0*rest")); // TIFF BE
+        assert!(bytes_look_like_raw(b"IIU\0rest")); // Panasonic RW2
+        assert!(bytes_look_like_raw(b"IIRO rest")); // Olympus ORF
+        assert!(bytes_look_like_raw(b"FUJIFILMCCD-RAW")); // Fujifilm RAF
+        assert!(bytes_look_like_raw(b"\0\0\0\x18ftypcrx \0\0\0\0")); // Canon CR3
+
+        assert!(!bytes_look_like_raw(b"\0\0\0\x18ftypheic\0\0\0\0")); // HEIC
+        assert!(!bytes_look_like_raw(b"\x89PNG\r\n\x1a\n"));
+        assert!(!bytes_look_like_raw(b"\xff\xd8\xff\xe0")); // JPEG
+        assert!(!bytes_look_like_raw(b""));
+    }
+
+    #[test]
+    fn plain_tiff_bytes_fall_through_to_image_crate() {
+        // TIFF magic routes to the RAW pipeline first; a plain TIFF must be
+        // rejected by the rawler probe and still decode via the image crate.
+        let mut encoded = Vec::new();
+        TiffEncoder::new(Cursor::new(&mut encoded))
+            .write_image(&[10u8, 20, 30], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        assert!(bytes_look_like_raw(&encoded));
+
+        let decoded = decode_image_from_bytes(&encoded).unwrap();
+
+        assert_eq!(decoded.dimensions.width, 1);
+        assert_eq!(decoded.dimensions.height, 1);
+        assert_eq!(decoded.rgb, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn misnamed_raw_extension_falls_back_to_image_crate() {
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(&[9u8, 8, 7], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ente_image_misnamed_{}_{:?}.dng",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &png).unwrap();
+
+        let decoded = decode_image_from_path(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        let decoded = decoded.expect("misnamed PNG with RAW extension should fall back");
+        assert_eq!(decoded.dimensions.width, 1);
+        assert_eq!(decoded.dimensions.height, 1);
+        assert_eq!(decoded.rgb, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn camera_exif_tiff_bytes_still_decode_as_tiff() {
+        // A plain TIFF exported from a camera photo keeps the camera's EXIF
+        // Make/Model tags. rawler's probe dispatches TIFF containers on the
+        // Make tag alone, so it may accept this file as a Sony ARW and only
+        // fail once actual RAW data is requested. The RAW attempt from bytes
+        // is opportunistic, so the file must still decode via the image crate.
+        let tiff_bytes = encode_rgb8_tiff_with_camera_exif(&[40, 50, 60], "SONY", "ILCE-7M3");
+        assert!(bytes_look_like_raw(&tiff_bytes));
+
+        let decoded = decode_image_from_bytes(&tiff_bytes).unwrap();
+
+        assert_eq!(decoded.dimensions.width, 1);
+        assert_eq!(decoded.dimensions.height, 1);
+        assert_eq!(decoded.rgb, vec![40, 50, 60]);
+    }
+
+    fn encode_rgb8_tiff_with_camera_exif(pixel: &[u8; 3], make: &str, model: &str) -> Vec<u8> {
+        use tiff::{
+            encoder::{TiffEncoder as TiffCrateEncoder, colortype::RGB8},
+            tags::Tag,
+        };
+
+        let mut encoded = Cursor::new(Vec::new());
+        let mut tiff_encoder = TiffCrateEncoder::new(&mut encoded).unwrap();
+        let mut image = tiff_encoder.new_image::<RGB8>(1, 1).unwrap();
+        image.encoder().write_tag(Tag::Make, make).unwrap();
+        image.encoder().write_tag(Tag::Model, model).unwrap();
+        image.write_data(pixel).unwrap();
+        encoded.into_inner()
+    }
+
+    #[test]
+    fn unrecognized_raw_with_raw_extension_and_magic_errors_instead_of_thumbnail() {
+        // A plain TIFF named .nef stands in for a RAW from a camera model
+        // missing in rawler's database: extension and magic both say RAW, the
+        // probe rejects it. This must be a hard error, not an image crate
+        // fallback that could decode an embedded preview.
+        let mut tiff = Vec::new();
+        TiffEncoder::new(Cursor::new(&mut tiff))
+            .write_image(&[10u8, 20, 30], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ente_image_unknown_camera_{}_{:?}.nef",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &tiff).unwrap();
+
+        let result = decode_image_from_path(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        let error = result.expect_err("unrecognized RAW-claiming file should not decode");
+        assert!(error.to_string().contains("refusing thumbnail fallback"));
+    }
+
+    #[test]
     fn raw_decode_panics_are_returned_as_decode_errors() {
         let previous_hook = panic::take_hook();
         panic::set_hook(Box::new(|_| {}));
-        let result = catch_raw_decode_panic("panic.raw", || panic!("synthetic panic"));
+        let result: ImageResult<()> =
+            catch_raw_decode_panic("panic.raw", || panic!("synthetic panic"));
         panic::set_hook(previous_hook);
 
         let error = result.expect_err("panic should be converted to an error");
