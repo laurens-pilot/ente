@@ -11,5 +11,6 @@ ente_heic = { package = "heic_decoder", git = "https://github.com/ente/heic-deco
     "image-integration",
 ] }
 moxcms = "0.8.1"
+rawler = "=0.7.2"
 thiserror.workspace = true
 tiff = "0.10.3"

@@ -1,7 +1,9 @@
 use std::{
+    any::Any,
     ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, Cursor, Seek},
+    panic::{self, AssertUnwindSafe},
     path::Path,
     sync::Once,
 };
@@ -18,6 +20,7 @@ use image::{
     DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, hooks::decoding_hook_registered,
 };
 use jxl_oxide::integration::register_image_decoding_hook as register_jxl_decoding_hook;
+use rawler::{decoders::RawDecodeParams, imgop::develop::RawDevelop, rawsource::RawSource};
 use tiff::{
     ColorType as TiffColorType,
     decoder::{Decoder as TiffDecoder, DecodingResult as TiffDecodingResult},
@@ -32,6 +35,14 @@ use crate::{
 
 static IMAGE_DECODER_HOOKS_INIT: Once = Once::new();
 
+const RAW_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+const RAW_MAX_PIXELS: u128 = 256_000_000;
+const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "fff", "iiq",
+    "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "qtk", "raf", "raw", "rw2",
+    "rwl", "srw", "x3f",
+];
+
 struct DecodedDynamicImage {
     image: DynamicImage,
     icc_profile: Option<Vec<u8>>,
@@ -44,7 +55,7 @@ impl DecodedDynamicImage {
 }
 
 pub fn decode_image_from_path(image_path: &str) -> ImageResult<DecodedImage> {
-    let decoded_dynamic = decode_with_image_crate(image_path)?;
+    let decoded_dynamic = decode_dynamic_from_path(image_path)?;
     let oriented = orient_decoded_image(decoded_dynamic, image_path).into_rgb8();
 
     Ok(DecodedImage {
@@ -57,7 +68,7 @@ pub fn decode_image_from_path(image_path: &str) -> ImageResult<DecodedImage> {
 }
 
 pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> {
-    let decoded_dynamic = decode_bytes_with_image_crate(image_bytes)?;
+    let decoded_dynamic = decode_dynamic_from_bytes(image_bytes)?;
     let oriented = orient_decoded_image_from_bytes(decoded_dynamic, image_bytes).into_rgb8();
 
     Ok(DecodedImage {
@@ -67,6 +78,27 @@ pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> 
         },
         rgb: oriented.into_raw(),
     })
+}
+
+fn decode_dynamic_from_path(image_path: &str) -> ImageResult<DynamicImage> {
+    if path_extension_is_raw(Path::new(image_path)) {
+        return decode_raw_from_path(image_path);
+    }
+
+    decode_with_image_crate(image_path)
+}
+
+fn decode_dynamic_from_bytes(image_bytes: &[u8]) -> ImageResult<DynamicImage> {
+    match decode_bytes_with_image_crate(image_bytes) {
+        Ok(decoded) => Ok(decoded),
+        Err(primary_error) => match decode_raw_from_bytes(image_bytes) {
+            Ok(decoded) => Ok(decoded),
+            Err(ImageError::Decode(raw_error)) => Err(ImageError::Decode(format!(
+                "failed to decode image with image crate: {primary_error}; RAW fallback also failed: {raw_error}"
+            ))),
+            Err(other) => Err(other),
+        },
+    }
 }
 
 fn decode_with_image_crate(image_path: &str) -> ImageResult<DynamicImage> {
@@ -148,6 +180,103 @@ where
 
 fn should_attempt_tiff_fallback(format: Option<ImageFormat>) -> bool {
     matches!(format, Some(ImageFormat::Tiff))
+}
+
+fn decode_raw_from_path(image_path: &str) -> ImageResult<DynamicImage> {
+    catch_raw_decode_panic(image_path, || {
+        validate_raw_input_size_from_path(image_path)?;
+        let source = RawSource::new(Path::new(image_path)).map_err(|e| {
+            ImageError::Decode(format!("failed to open RAW image file '{image_path}': {e}"))
+        })?;
+        decode_raw_source_to_dynamic_image(&source, image_path)
+    })
+}
+
+fn decode_raw_from_bytes(image_bytes: &[u8]) -> ImageResult<DynamicImage> {
+    catch_raw_decode_panic("<bytes>", || {
+        validate_raw_input_size(image_bytes.len() as u64, "<bytes>")?;
+        let source = RawSource::new_from_slice(image_bytes);
+        decode_raw_source_to_dynamic_image(&source, "<bytes>")
+    })
+}
+
+fn decode_raw_source_to_dynamic_image(
+    source: &RawSource,
+    source_name: &str,
+) -> ImageResult<DynamicImage> {
+    let raw_image = rawler::decode(source, &RawDecodeParams::default())
+        .map_err(|e| ImageError::Decode(format!("failed to decode RAW image: {e}")))?;
+    validate_raw_dimensions(raw_image.width, raw_image.height, source_name)?;
+
+    let developed = RawDevelop::default()
+        .develop_intermediate(&raw_image)
+        .map_err(|e| ImageError::Decode(format!("failed to develop RAW image: {e}")))?;
+    let image = developed.to_dynamic_image().ok_or_else(|| {
+        ImageError::Decode(format!(
+            "failed to materialize developed RAW image for '{source_name}'"
+        ))
+    })?;
+    validate_raw_dimensions(image.width() as usize, image.height() as usize, source_name)?;
+
+    Ok(image)
+}
+
+fn catch_raw_decode_panic<F>(source_name: &str, decode: F) -> ImageResult<DynamicImage>
+where
+    F: FnOnce() -> ImageResult<DynamicImage>,
+{
+    match panic::catch_unwind(AssertUnwindSafe(decode)) {
+        Ok(result) => result,
+        Err(payload) => Err(ImageError::Decode(format!(
+            "RAW decoder panicked while decoding '{source_name}': {}",
+            panic_payload_message(payload)
+        ))),
+    }
+}
+
+fn validate_raw_input_size_from_path(image_path: &str) -> ImageResult<()> {
+    let metadata = std::fs::metadata(image_path).map_err(|e| {
+        ImageError::Decode(format!(
+            "failed to read RAW image metadata for '{image_path}': {e}"
+        ))
+    })?;
+    validate_raw_input_size(metadata.len(), image_path)
+}
+
+fn validate_raw_input_size(input_bytes: u64, source_name: &str) -> ImageResult<()> {
+    if input_bytes > RAW_MAX_INPUT_BYTES {
+        return Err(ImageError::Decode(format!(
+            "RAW image '{source_name}' is too large to decode safely: {input_bytes} bytes exceeds {RAW_MAX_INPUT_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_raw_dimensions(width: usize, height: usize, source_name: &str) -> ImageResult<()> {
+    if width == 0 || height == 0 {
+        return Err(ImageError::Decode(format!(
+            "RAW image '{source_name}' decoded to invalid dimensions {width}x{height}"
+        )));
+    }
+
+    let pixels = (width as u128) * (height as u128);
+    if pixels > RAW_MAX_PIXELS {
+        return Err(ImageError::Decode(format!(
+            "RAW image '{source_name}' is too large to decode safely: {width}x{height} exceeds {RAW_MAX_PIXELS} pixels"
+        )));
+    }
+
+    Ok(())
+}
+
+fn panic_payload_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 fn decode_with_tiff_crate(image_path: &str) -> ImageResult<DecodedDynamicImage> {
@@ -428,17 +557,27 @@ fn bytes_look_like_heif(image_bytes: &[u8]) -> bool {
     )
 }
 
+fn path_extension_is_raw(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            RAW_EXTENSIONS
+                .iter()
+                .any(|raw_extension| extension.eq_ignore_ascii_case(raw_extension))
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
+    use std::{ffi::OsStr, panic, path::Path};
 
     use image::hooks::decoding_hook_registered;
     use image::{ColorType, ImageEncoder, ImageFormat, codecs::png::PngEncoder};
     use moxcms::ColorProfile;
 
     use super::{
-        bytes_look_like_heif, decode_image_from_bytes, init_image_decoders,
-        should_attempt_tiff_fallback,
+        bytes_look_like_heif, catch_raw_decode_panic, decode_image_from_bytes, init_image_decoders,
+        path_extension_is_raw, should_attempt_tiff_fallback,
     };
 
     #[test]
@@ -464,6 +603,27 @@ mod tests {
     #[test]
     fn skips_non_heif_bytes() {
         assert!(!bytes_look_like_heif(b"not an image"));
+    }
+
+    #[test]
+    fn detects_raw_file_extensions_case_insensitively() {
+        assert!(path_extension_is_raw(Path::new("photo.CR3")));
+        assert!(path_extension_is_raw(Path::new("photo.dng")));
+        assert!(path_extension_is_raw(Path::new("photo.3FR")));
+        assert!(!path_extension_is_raw(Path::new("photo.jpg")));
+        assert!(!path_extension_is_raw(Path::new("photo")));
+    }
+
+    #[test]
+    fn raw_decode_panics_are_returned_as_decode_errors() {
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let result = catch_raw_decode_panic("panic.raw", || panic!("synthetic panic"));
+        panic::set_hook(previous_hook);
+
+        let error = result.expect_err("panic should be converted to an error");
+        assert!(error.to_string().contains("RAW decoder panicked"));
+        assert!(error.to_string().contains("synthetic panic"));
     }
 
     #[test]
