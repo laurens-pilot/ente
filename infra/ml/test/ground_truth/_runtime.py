@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -25,6 +26,11 @@ except Exception:
 
 
 DEFAULT_MODEL_BASE_URL: Final[str] = "https://models.ente.io/"
+# Shared asset lock file with pinned model SHA-256 values; also enforced by the
+# Rust harness (rust/crates/photos/tests/support/ml_indexing.rs).
+ASSET_LOCK_PATH: Final[Path] = (
+    Path(__file__).resolve().parent.parent / "ml_indexing" / "assets.json"
+)
 DEFAULT_PADDING_RGB: Final[tuple[int, int, int]] = (114, 114, 114)
 ALLOW_OPENCV_FALLBACK_ENV: Final[str] = "ML_PARITY_ALLOW_OPENCV_DECODE_FALLBACK"
 EXIF_ORIENTATION_TAG: Final[int] = 274
@@ -56,6 +62,23 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _pinned_model_sha256s() -> dict[str, str]:
+    """Model file name -> pinned SHA-256 (lowercase hex) from the asset lock file."""
+    try:
+        lock_data = json.loads(ASSET_LOCK_PATH.read_text(encoding="utf-8"))
+    except OSError:
+        print(
+            f"[ml_parity][WARNING] cannot read asset lock file '{ASSET_LOCK_PATH}'; "
+            "model downloads will NOT be hash-verified",
+            file=sys.stderr,
+        )
+        return {}
+    return {
+        model["file_name"]: model["sha256"].strip().lower()
+        for model in lock_data.get("models", {}).values()
+    }
+
+
 def ensure_model(
     *,
     file_name: str,
@@ -65,13 +88,29 @@ def ensure_model(
     cache_dir.mkdir(parents=True, exist_ok=True)
     model_path = cache_dir / file_name
 
-    if model_path.exists() and model_path.stat().st_size > 0:
-        return ModelArtifact(
-            file_name=file_name,
-            path=model_path,
-            sha256=_sha256_file(model_path),
-            etag=None,
+    expected_sha256 = _pinned_model_sha256s().get(file_name)
+    if expected_sha256 is None:
+        print(
+            f"[ml_parity][WARNING] no pinned SHA-256 for model '{file_name}' in "
+            f"'{ASSET_LOCK_PATH}'; skipping hash verification",
+            file=sys.stderr,
         )
+
+    if model_path.exists() and model_path.stat().st_size > 0:
+        cached_sha256 = _sha256_file(model_path)
+        if expected_sha256 is None or cached_sha256 == expected_sha256:
+            return ModelArtifact(
+                file_name=file_name,
+                path=model_path,
+                sha256=cached_sha256,
+                etag=None,
+            )
+        print(
+            f"[ml_parity][WARNING] cached model '{model_path}' SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {cached_sha256}; re-downloading",
+            file=sys.stderr,
+        )
+        model_path.unlink()
 
     model_url = f"{base_url.rstrip('/')}/{file_name}"
     with requests.get(model_url, stream=True, timeout=(10, 300)) as response:
@@ -89,11 +128,21 @@ def ensure_model(
                 if chunk:
                     tmp_file.write(chunk)
 
+    downloaded_sha256 = _sha256_file(tmp_path)
+    if expected_sha256 is not None and downloaded_sha256 != expected_sha256:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"SHA-256 mismatch for model '{file_name}' downloaded from {model_url}: "
+            f"expected {expected_sha256}, got {downloaded_sha256}. Refusing to load "
+            f"an unverified model; update the pin in '{ASSET_LOCK_PATH}' if the "
+            "model was intentionally changed."
+        )
+
     tmp_path.replace(model_path)
     return ModelArtifact(
         file_name=file_name,
         path=model_path,
-        sha256=_sha256_file(model_path),
+        sha256=downloaded_sha256,
         etag=etag,
     )
 
