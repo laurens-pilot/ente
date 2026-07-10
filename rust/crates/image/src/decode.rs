@@ -2,7 +2,7 @@ use std::{
     any::Any,
     ffi::OsStr,
     fs::File,
-    io::{BufRead, BufReader, Cursor, Read, Seek},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
     panic::{self, AssertUnwindSafe},
     path::Path,
     sync::Once,
@@ -55,16 +55,18 @@ const RAW_EXTENSIONS: &[&str] = &[
     "rwl", "srw", "x3f",
 ];
 /// Magic-byte prefixes of RAW containers that must be routed to the RAW
-/// pipeline first. TIFF magic is included because most RAW formats
+/// pipeline first. The list need not be exhaustive: formats missed here are
+/// still caught by the RAW extension routing or by the RAW fallback after an
+/// image crate failure.
+///
+/// TIFF magic is deliberately absent even though most RAW formats
 /// (NEF/ARW/CR2/DNG/PEF/SRW/...) are TIFF containers whose first IFD is often
-/// a decodable thumbnail, so the image crate would "succeed" and silently
-/// return that thumbnail. The rawler probe rejects plain TIFF files quickly,
-/// letting those fall through to the image crate. The list need not be
-/// exhaustive: formats missed here are still caught by the RAW extension
-/// routing or by the RAW fallback after an image crate failure.
+/// a decodable thumbnail the image crate would "successfully" decode. TIFF
+/// containers are instead pre-screened with [`tiff_looks_like_camera_raw`]:
+/// only TIFFs carrying the camera markers rawler dispatches on stay RAW
+/// candidates, and plain TIFFs skip the RAW pipeline (and the full-input
+/// reads and copies a failed rawler probe would cost) entirely.
 const RAW_MAGIC_PREFIXES: &[&[u8]] = &[
-    b"II*\0",    // TIFF little-endian (NEF/ARW/CR2/DNG/PEF/SRW/3FR/IIQ/...)
-    b"MM\0*",    // TIFF big-endian
     b"II\x1a\0", // Canon CRW
     b"IIU\0",    // Panasonic RW2/RWL
     b"IIRO",     // Olympus ORF
@@ -74,6 +76,27 @@ const RAW_MAGIC_PREFIXES: &[&[u8]] = &[
     b"FOVb",     // Sigma X3F
     b"\0MRM",    // Minolta MRW
 ];
+const TIFF_MAGIC_LITTLE_ENDIAN: &[u8] = b"II*\0";
+const TIFF_MAGIC_BIG_ENDIAN: &[u8] = b"MM\0*";
+
+/// IFD tags rawler's TIFF probe dispatches on, mirrored by
+/// [`tiff_looks_like_camera_raw`] (see rawler 0.7.2 `get_decoder`): `Make`
+/// drives the main dispatch table, `Model` catches the Kodak DCS560C special
+/// case, `DNGVersion` selects the DNG decoder, and `Software == "Camera
+/// Library"` identifies Leaf MOS backs that carry neither Make nor Model.
+const TIFF_TAG_MAKE: u16 = 0x010F;
+const TIFF_TAG_MODEL: u16 = 0x0110;
+const TIFF_TAG_SOFTWARE: u16 = 0x0131;
+const TIFF_TAG_DNG_VERSION: u16 = 0xC612;
+const TIFF_ASCII_TYPE: u16 = 2;
+const LEAF_MOS_SOFTWARE: &str = "Camera Library";
+/// Walk limits for the TIFF pre-screen. Real files stay far below both;
+/// exceeding them aborts the walk conservatively (treat as RAW candidate).
+const TIFF_PRESCREEN_MAX_IFDS: usize = 32;
+const TIFF_PRESCREEN_MAX_ENTRIES_PER_IFD: u16 = 4096;
+/// "Camera Library" is 14 bytes plus a NUL terminator; a longer `Software`
+/// value cannot equal it under rawler's exact comparison.
+const TIFF_PRESCREEN_MAX_SOFTWARE_BYTES: u32 = 64;
 
 struct DecodedDynamicImage {
     image: DynamicImage,
@@ -113,19 +136,23 @@ pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> 
 /// Decode an image from a path and apply EXIF orientation.
 ///
 /// RAW candidates go to the RAW pipeline first (see [`RAW_MAGIC_PREFIXES`] for
-/// why the image crate must not see them first). How RAW failures are handled
-/// depends on the strength of the RAW signal:
+/// why the image crate must not see them first). For TIFF containers, "magic
+/// says RAW" additionally requires camera markers in the IFD chain (see
+/// [`tiff_looks_like_camera_raw`]); marker-less TIFFs go straight to the
+/// image crate. How RAW failures are handled depends on the strength of the
+/// RAW signal:
 ///
 /// - Extension and magic both say RAW: the file is committed to the RAW
 ///   pipeline and every failure — oversized input, unmatched camera model,
 ///   decode/develop error — is a hard error. Falling back would let the image
 ///   crate decode the embedded preview of a TIFF-based RAW and silently
 ///   return a thumbnail-sized image.
-/// - Only one signal says RAW (a `.tif` export carrying TIFF magic, or a
-///   misnamed file whose magic disagrees): the RAW attempt is opportunistic
-///   and any RAW failure falls back to the image crate. This matters because
-///   rawler's probe dispatches TIFF containers on the EXIF `Make` tag alone,
-///   so a plain TIFF exported from a camera photo can pass the probe and only
+/// - Only one signal says RAW (a camera-marker TIFF without a RAW extension —
+///   typically a `.tif` export that kept its camera EXIF — or a misnamed file
+///   whose magic disagrees): the RAW attempt is opportunistic and any RAW
+///   failure falls back to the image crate. This matters because rawler's
+///   probe dispatches TIFF containers on the EXIF `Make` tag alone, so a
+///   plain TIFF exported from a camera photo can pass the probe and only
 ///   fail later in `raw_image()` — such files must keep decoding as TIFFs.
 ///
 /// The size guardrail runs before the RAW source is constructed because
@@ -146,6 +173,13 @@ fn decode_dynamic_from_path(image_path: &str) -> ImageResult<DynamicImage> {
 
     if extension_is_raw && magic_is_raw {
         validate_raw_input_size(input_bytes, image_path)?;
+        // Hard-error domain: RAWs from camera models newer than the pinned
+        // rawler's model database land on the ProbeRejected arm by design —
+        // better no result than a silently indexed thumbnail. If that proves
+        // too strict, a follow-up could serve the embedded JPEG preview
+        // (rawler's `Decoder::full_image`) when `raw_image` fails for a
+        // matched model; probe rejections carry no decoder and would need a
+        // generic preview extraction instead.
         return match decode_raw_from_path(image_path)? {
             RawDecodeOutcome::Decoded(decoded) => Ok(decoded),
             RawDecodeOutcome::ProbeRejected(probe_error) => Err(ImageError::Decode(format!(
@@ -179,11 +213,13 @@ fn decode_dynamic_from_path(image_path: &str) -> ImageResult<DynamicImage> {
 /// Mirrors [`decode_dynamic_from_path`], but bytes carry no file name, so
 /// there is never a second RAW signal to corroborate the magic bytes: the RAW
 /// attempt is always opportunistic and any RAW failure falls back to the
-/// image crate (this branch carries every plain TIFF decoded from bytes).
-/// Bytes that don't look like RAW still get a RAW fallback after an image
-/// crate failure, to catch RAW containers whose magic is not in
-/// [`RAW_MAGIC_PREFIXES`]. Oversized input skips the RAW attempt entirely so
-/// that `RawSource::new_from_slice` never copies more than
+/// image crate. TIFF-magic bytes reach the RAW branch only when the
+/// pre-screen finds camera markers (see [`tiff_looks_like_camera_raw`]);
+/// marker-less TIFFs decode via the image crate directly. Bytes that don't
+/// look like RAW still get a RAW fallback after an image crate failure, to
+/// catch RAW containers whose magic is not in [`RAW_MAGIC_PREFIXES`].
+/// Oversized input skips the RAW attempt entirely so that
+/// `RawSource::new_from_slice` never copies more than
 /// [`RAW_MAX_INPUT_BYTES`].
 fn decode_dynamic_from_bytes(image_bytes: &[u8]) -> ImageResult<DynamicImage> {
     let within_raw_size_limit = image_bytes.len() as u64 <= RAW_MAX_INPUT_BYTES;
@@ -368,6 +404,11 @@ fn decode_raw_source_to_dynamic_image(
         .raw_image(source, &decode_params, false)
         .map_err(|e| ImageError::Decode(format!("failed to decode RAW image: {e}")))?;
     validate_raw_dimensions(raw_image.width, raw_image.height, source_name)?;
+    // `RawImage::orientation` is only populated by rawler 0.7.2's DNG and QTK
+    // decoders; every other decoder leaves it hardcoded to `Normal` (upstream
+    // rawimage.rs "TODO fixme"). It is therefore only usable as a fallback —
+    // the `raw_metadata` pass below is the authoritative orientation source
+    // and must not be "simplified" away in favor of this field.
     let raw_image_orientation = raw_orientation_to_exif(raw_image.orientation);
 
     let developed = RawDevelop::default()
@@ -411,11 +452,10 @@ fn validate_raw_dimensions_before_decode(
     if let Some(raw_ifd) = decoder
         .ifd(WellKnownIFD::Raw)
         .map_err(|e| ImageError::Decode(format!("failed to inspect RAW dimensions: {e}")))?
+        && let Some((width, height)) = raw_dimensions_from_ifd(&raw_ifd)
     {
-        if let Some((width, height)) = raw_dimensions_from_ifd(&raw_ifd) {
-            validate_raw_dimensions(width, height, source_name)?;
-            return Ok(());
-        }
+        validate_raw_dimensions(width, height, source_name)?;
+        return Ok(());
     }
 
     validate_tiff_raw_candidate_dimensions(source, source_name)
@@ -811,22 +851,152 @@ fn bytes_look_like_raw(image_bytes: &[u8]) -> bool {
         return &image_bytes[8..12] == b"crx ";
     }
 
+    if bytes_have_tiff_magic(image_bytes) {
+        return tiff_looks_like_camera_raw(&mut Cursor::new(image_bytes));
+    }
+
     RAW_MAGIC_PREFIXES
         .iter()
         .any(|prefix| image_bytes.starts_with(prefix))
+}
+
+fn bytes_have_tiff_magic(image_bytes: &[u8]) -> bool {
+    image_bytes.starts_with(TIFF_MAGIC_LITTLE_ENDIAN)
+        || image_bytes.starts_with(TIFF_MAGIC_BIG_ENDIAN)
 }
 
 fn file_magic_looks_like_raw(image_path: &str) -> bool {
     let Ok(file) = File::open(image_path) else {
         return false;
     };
+    let mut reader = BufReader::new(file);
 
     let mut magic = Vec::with_capacity(16);
-    if file.take(16).read_to_end(&mut magic).is_err() {
+    if reader.by_ref().take(16).read_to_end(&mut magic).is_err() {
         return false;
     }
 
+    if bytes_have_tiff_magic(&magic) {
+        // The pre-screen seeks back to the start of the file itself.
+        return tiff_looks_like_camera_raw(&mut reader);
+    }
+
     bytes_look_like_raw(&magic)
+}
+
+/// Pre-screen for TIFF-magic inputs: reports whether the TIFF carries any of
+/// the camera markers rawler's probe dispatches on ([`TIFF_TAG_MAKE`] and
+/// friends), scanning exactly the scope rawler 0.7.2 consults — the direct
+/// entries of each IFD in the root chain, no sub-IFDs. A TIFF without any
+/// marker cannot match rawler's TIFF dispatch, so it is treated as a plain
+/// TIFF and skips the RAW pipeline entirely. This matters because a failed
+/// rawler probe is expensive: constructing the `RawSource` materializes the
+/// whole input, and the probe's final naked-RAW lookup copies it a second
+/// time.
+///
+/// Marker checks are presence-based — strictly more conservative than
+/// rawler's value dispatch — except `Software`, where plain editor-written
+/// TIFFs are so common that only the Leaf [`LEAF_MOS_SOFTWARE`] value counts.
+/// Any parse trouble routes to the RAW pipeline (`true`): the pre-screen can
+/// only skip work, never change an outcome rawler would have produced.
+fn tiff_looks_like_camera_raw<R: Read + Seek>(reader: &mut R) -> bool {
+    tiff_contains_camera_raw_markers(reader).unwrap_or(true)
+}
+
+fn tiff_contains_camera_raw_markers<R: Read + Seek>(reader: &mut R) -> std::io::Result<bool> {
+    let invalid =
+        |message: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string());
+
+    let mut header = [0u8; 8];
+    reader.seek(SeekFrom::Start(0))?;
+    reader.read_exact(&mut header)?;
+    let little_endian = if header.starts_with(TIFF_MAGIC_LITTLE_ENDIAN) {
+        true
+    } else if header.starts_with(TIFF_MAGIC_BIG_ENDIAN) {
+        false
+    } else {
+        return Err(invalid("not a TIFF header"));
+    };
+    let read_u16 = |bytes: &[u8]| {
+        let bytes: [u8; 2] = bytes.try_into().expect("exactly 2 bytes");
+        if little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+    let read_u32 = |bytes: &[u8]| {
+        let bytes: [u8; 4] = bytes.try_into().expect("exactly 4 bytes");
+        if little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+
+    let mut ifd_offset = read_u32(&header[4..8]);
+    let mut visited_ifds = 0usize;
+
+    while ifd_offset != 0 {
+        visited_ifds += 1;
+        if visited_ifds > TIFF_PRESCREEN_MAX_IFDS {
+            return Err(invalid("IFD chain too long"));
+        }
+
+        reader.seek(SeekFrom::Start(ifd_offset.into()))?;
+        let mut entry_count_bytes = [0u8; 2];
+        reader.read_exact(&mut entry_count_bytes)?;
+        let entry_count = read_u16(&entry_count_bytes);
+        if entry_count == 0 || entry_count > TIFF_PRESCREEN_MAX_ENTRIES_PER_IFD {
+            return Err(invalid("implausible IFD entry count"));
+        }
+
+        let mut entries = vec![0u8; usize::from(entry_count) * 12];
+        reader.read_exact(&mut entries)?;
+        let mut next_offset_bytes = [0u8; 4];
+        reader.read_exact(&mut next_offset_bytes)?;
+        ifd_offset = read_u32(&next_offset_bytes);
+
+        let mut software_entry: Option<[u8; 12]> = None;
+        for entry in entries.chunks_exact(12) {
+            match read_u16(&entry[0..2]) {
+                TIFF_TAG_MAKE | TIFF_TAG_MODEL | TIFF_TAG_DNG_VERSION => return Ok(true),
+                TIFF_TAG_SOFTWARE => {
+                    software_entry = Some(entry.try_into().expect("exactly 12 bytes"));
+                }
+                _ => {}
+            }
+        }
+
+        // Resolved after the IFD is fully read because the value may live
+        // anywhere in the file and reading it moves the cursor.
+        let Some(entry) = software_entry else {
+            continue;
+        };
+        let value_count = read_u32(&entry[4..8]);
+        if read_u16(&entry[2..4]) != TIFF_ASCII_TYPE
+            || value_count == 0
+            || value_count > TIFF_PRESCREEN_MAX_SOFTWARE_BYTES
+        {
+            continue;
+        }
+        let mut value = vec![0u8; value_count as usize];
+        if value_count <= 4 {
+            value.copy_from_slice(&entry[8..8 + value_count as usize]);
+        } else {
+            reader.seek(SeekFrom::Start(read_u32(&entry[8..12]).into()))?;
+            reader.read_exact(&mut value)?;
+        }
+        let text = &value[..value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len())];
+        if std::str::from_utf8(text).is_ok_and(|text| text.trim() == LEAF_MOS_SOFTWARE) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -884,8 +1054,6 @@ mod tests {
 
     #[test]
     fn detects_raw_magic_bytes() {
-        assert!(bytes_look_like_raw(b"II*\0rest")); // TIFF LE (NEF/ARW/CR2/DNG)
-        assert!(bytes_look_like_raw(b"MM\0*rest")); // TIFF BE
         assert!(bytes_look_like_raw(b"IIU\0rest")); // Panasonic RW2
         assert!(bytes_look_like_raw(b"IIRO rest")); // Olympus ORF
         assert!(bytes_look_like_raw(b"FUJIFILMCCD-RAW")); // Fujifilm RAF
@@ -895,6 +1063,60 @@ mod tests {
         assert!(!bytes_look_like_raw(b"\x89PNG\r\n\x1a\n"));
         assert!(!bytes_look_like_raw(b"\xff\xd8\xff\xe0")); // JPEG
         assert!(!bytes_look_like_raw(b""));
+    }
+
+    #[test]
+    fn tiff_magic_is_raw_candidate_only_with_camera_markers() {
+        // Marker-less TIFFs are pre-screened out of the RAW pipeline; any of
+        // the markers rawler's probe dispatches on keeps a TIFF a candidate.
+        let mut plain = Vec::new();
+        TiffEncoder::new(Cursor::new(&mut plain))
+            .write_image(&[1u8, 2, 3], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        assert!(!bytes_look_like_raw(&plain));
+
+        let with_make = encode_rgb8_tiff_with_camera_exif(&[1, 2, 3], "SONY", "ILCE-7M3");
+        assert!(bytes_look_like_raw(&with_make));
+
+        let model_only = encode_rgb8_tiff_with_string_tag(tiff::tags::Tag::Model, "DCS560C");
+        assert!(bytes_look_like_raw(&model_only));
+
+        let leaf = encode_rgb8_tiff_with_string_tag(tiff::tags::Tag::Software, "Camera Library");
+        assert!(bytes_look_like_raw(&leaf));
+        let edited =
+            encode_rgb8_tiff_with_string_tag(tiff::tags::Tag::Software, "Adobe Photoshop 27.1");
+        assert!(!bytes_look_like_raw(&edited));
+
+        // DNGVersion alone marks a DNG even without Make (hand-rolled: one
+        // IFD whose only entry is DNGVersion).
+        let mut dng = Vec::new();
+        dng.extend_from_slice(b"II*\0");
+        dng.extend_from_slice(&8u32.to_le_bytes());
+        dng.extend_from_slice(&1u16.to_le_bytes());
+        append_tiff_long(&mut dng, 0xC612, 0x0104);
+        dng.extend_from_slice(&0u32.to_le_bytes());
+        assert!(bytes_look_like_raw(&dng));
+
+        // Big-endian TIFF whose single IFD entry is Make ("SONY\0" at 26).
+        let big_endian_make =
+            b"MM\0*\x00\x00\x00\x08\x00\x01\x01\x0F\x00\x02\x00\x00\x00\x05\x00\x00\x00\x1A\x00\x00\x00\x00SONY\0";
+        assert!(bytes_look_like_raw(big_endian_make));
+
+        // Parse trouble stays conservative: truncated TIFFs remain RAW
+        // candidates and keep the pre-pre-screen routing.
+        assert!(bytes_look_like_raw(b"II*\0rest"));
+        assert!(bytes_look_like_raw(b"MM\0*rest"));
+    }
+
+    fn encode_rgb8_tiff_with_string_tag(tag: tiff::tags::Tag, value: &str) -> Vec<u8> {
+        use tiff::encoder::{TiffEncoder as TiffCrateEncoder, colortype::RGB8};
+
+        let mut encoded = Cursor::new(Vec::new());
+        let mut tiff_encoder = TiffCrateEncoder::new(&mut encoded).unwrap();
+        let mut image = tiff_encoder.new_image::<RGB8>(1, 1).unwrap();
+        image.encoder().write_tag(tag, value).unwrap();
+        image.write_data(&[1u8, 2, 3]).unwrap();
+        encoded.into_inner()
     }
 
     #[test]
@@ -948,20 +1170,44 @@ mod tests {
     }
 
     #[test]
-    fn plain_tiff_bytes_fall_through_to_image_crate() {
-        // TIFF magic routes to the RAW pipeline first; a plain TIFF must be
-        // rejected by the rawler probe and still decode via the image crate.
+    fn plain_tiff_bytes_decode_via_image_crate() {
+        // A marker-less TIFF is pre-screened out of the RAW pipeline (no
+        // rawler probe, no full-input copies) and decodes via the image crate.
         let mut encoded = Vec::new();
         TiffEncoder::new(Cursor::new(&mut encoded))
             .write_image(&[10u8, 20, 30], 1, 1, ColorType::Rgb8.into())
             .unwrap();
-        assert!(bytes_look_like_raw(&encoded));
+        assert!(!bytes_look_like_raw(&encoded));
 
         let decoded = decode_image_from_bytes(&encoded).unwrap();
 
         assert_eq!(decoded.dimensions.width, 1);
         assert_eq!(decoded.dimensions.height, 1);
         assert_eq!(decoded.rgb, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn plain_tiff_file_decodes_via_image_crate() {
+        // Exercises the path-based pre-screen: TIFF magic without camera
+        // markers or a RAW extension must not route into the RAW pipeline.
+        let mut tiff = Vec::new();
+        TiffEncoder::new(Cursor::new(&mut tiff))
+            .write_image(&[11u8, 22, 33], 1, 1, ColorType::Rgb8.into())
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ente_image_plain_{}_{:?}.tif",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &tiff).unwrap();
+
+        let decoded = decode_image_from_path(path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+
+        let decoded = decoded.expect("plain TIFF should decode via image crate");
+        assert_eq!(decoded.dimensions.width, 1);
+        assert_eq!(decoded.dimensions.height, 1);
+        assert_eq!(decoded.rgb, vec![11, 22, 33]);
     }
 
     #[test]
@@ -989,10 +1235,11 @@ mod tests {
     #[test]
     fn camera_exif_tiff_bytes_still_decode_as_tiff() {
         // A plain TIFF exported from a camera photo keeps the camera's EXIF
-        // Make/Model tags. rawler's probe dispatches TIFF containers on the
-        // Make tag alone, so it may accept this file as a Sony ARW and only
-        // fail once actual RAW data is requested. The RAW attempt from bytes
-        // is opportunistic, so the file must still decode via the image crate.
+        // Make/Model tags, so the pre-screen keeps it a RAW candidate.
+        // rawler's probe dispatches TIFF containers on the Make tag alone, so
+        // it may accept this file as a Sony ARW and only fail once actual RAW
+        // data is requested. The RAW attempt from bytes is opportunistic, so
+        // the file must still decode via the image crate.
         let tiff_bytes = encode_rgb8_tiff_with_camera_exif(&[40, 50, 60], "SONY", "ILCE-7M3");
         assert!(bytes_look_like_raw(&tiff_bytes));
 
@@ -1020,14 +1267,12 @@ mod tests {
 
     #[test]
     fn unrecognized_raw_with_raw_extension_and_magic_errors_instead_of_thumbnail() {
-        // A plain TIFF named .nef stands in for a RAW from a camera model
-        // missing in rawler's database: extension and magic both say RAW, the
-        // probe rejects it. This must be a hard error, not an image crate
+        // A TIFF with an unknown camera Make named .nef models a RAW from a
+        // camera model missing in rawler's database: the extension and the
+        // camera-marker magic both say RAW, but the probe finds no decoder
+        // for the make. This must be a hard error, not an image crate
         // fallback that could decode an embedded preview.
-        let mut tiff = Vec::new();
-        TiffEncoder::new(Cursor::new(&mut tiff))
-            .write_image(&[10u8, 20, 30], 1, 1, ColorType::Rgb8.into())
-            .unwrap();
+        let tiff = encode_rgb8_tiff_with_camera_exif(&[10, 20, 30], "ENTE TESTCAM", "MODEL-1");
         let path = std::env::temp_dir().join(format!(
             "ente_image_unknown_camera_{}_{:?}.nef",
             std::process::id(),
