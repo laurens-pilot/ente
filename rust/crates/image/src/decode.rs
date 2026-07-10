@@ -22,7 +22,8 @@ use image::{
 use jxl_oxide::integration::register_image_decoding_hook as register_jxl_decoding_hook;
 use rawler::{
     decoders::{
-        Decoder as RawDecoder, Orientation as RawOrientation, RawDecodeParams, WellKnownIFD,
+        Decoder as RawDecoder, FormatHint as RawFormatHint, Orientation as RawOrientation,
+        RawDecodeParams, WellKnownIFD,
     },
     formats::{
         bmff::Bmff,
@@ -472,11 +473,18 @@ fn validate_raw_dimensions_before_decode(
         return Ok(());
     }
 
-    if source_looks_like_bmff(source) {
-        return validate_cr3_raw_candidate_dimensions(source, source_name);
-    }
+    validate_raw_candidate_dimensions_for_format(decoder.format_hint(), source, source_name)
+}
 
-    validate_tiff_raw_candidate_dimensions(source, source_name)
+fn validate_raw_candidate_dimensions_for_format(
+    format_hint: RawFormatHint,
+    source: &RawSource,
+    source_name: &str,
+) -> ImageResult<()> {
+    match format_hint {
+        RawFormatHint::CR3 => validate_cr3_raw_candidate_dimensions(source, source_name),
+        _ => validate_tiff_raw_candidate_dimensions(source, source_name),
+    }
 }
 
 /// Validate the allocation dimensions used by rawler 0.7.2's
@@ -590,12 +598,15 @@ fn validate_raw_sample_allocation(
 /// paths), so a crafted CMP1 can request an arbitrarily large allocation —
 /// and an allocation failure aborts the process, which `catch_unwind`
 /// cannot intercept. Parse the same box tree rawler's Cr3Decoder navigates
-/// and validate every CMP1 before any pixel decode. Parse failures defer to
-/// rawler's own error reporting.
+/// and validate every CMP1 before any pixel decode. The decoder format is
+/// already known by the time this runs, so a second parse failure is treated
+/// as a validation failure rather than allowing the decode to proceed.
 fn validate_cr3_raw_candidate_dimensions(source: &RawSource, source_name: &str) -> ImageResult<()> {
-    let Ok(bmff) = Bmff::new(&mut source.reader()) else {
-        return Ok(());
-    };
+    let bmff = Bmff::new(&mut source.reader()).map_err(|e| {
+        ImageError::Decode(format!(
+            "failed to inspect CR3 dimensions for '{source_name}': {e}"
+        ))
+    })?;
 
     for trak in &bmff.filebox.moov.traks {
         if let Some(craw) = &trak.mdia.minf.stbl.stsd.craw
@@ -606,15 +617,6 @@ fn validate_cr3_raw_candidate_dimensions(source: &RawSource, source_name: &str) 
     }
 
     Ok(())
-}
-
-fn source_looks_like_bmff(source: &RawSource) -> bool {
-    let mut magic = [0u8; 8];
-    if source.reader().read_exact(&mut magic).is_err() {
-        return false;
-    }
-
-    &magic[4..8] == b"ftyp"
 }
 
 fn validate_tiff_raw_candidate_dimensions(
@@ -1166,7 +1168,7 @@ mod tests {
     };
     use moxcms::ColorProfile;
     use rawler::{
-        decoders::Orientation as RawOrientation,
+        decoders::{FormatHint as RawFormatHint, Orientation as RawOrientation},
         formats::tiff::{GenericTiffReader, reader::TiffReader},
         rawsource::RawSource,
     };
@@ -1176,7 +1178,7 @@ mod tests {
         decode_image_from_bytes, decode_image_from_path, init_image_decoders,
         path_extension_is_raw, raw_orientation_to_exif, should_attempt_tiff_fallback,
         validate_cr3_raw_candidate_dimensions, validate_dng_raw_ifd_allocation,
-        validate_tiff_raw_candidate_dimensions,
+        validate_raw_candidate_dimensions_for_format, validate_tiff_raw_candidate_dimensions,
     };
 
     #[test]
@@ -1378,11 +1380,35 @@ mod tests {
     }
 
     #[test]
-    fn cr3_dimension_guard_defers_unparseable_bmff_to_rawler() {
+    fn cr3_dimension_guard_rejects_unparseable_bmff() {
         let source = RawSource::new_from_slice(b"\0\0\0\x18ftypcrx garbage");
 
-        validate_cr3_raw_candidate_dimensions(&source, "junk.cr3")
-            .expect("BMFF parse failures should defer to rawler's own error");
+        let error = validate_cr3_raw_candidate_dimensions(&source, "junk.cr3")
+            .expect_err("recognized CR3 inputs should fail closed when reparsing fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to inspect CR3 dimensions")
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_cr3_with_box_before_ftyp() {
+        let mut encoded = bmff_box(b"free", &[]);
+        encoded.extend_from_slice(&synthetic_cr3_with_cmp1_dimensions(100_000, 100_000));
+        assert_eq!(&encoded[4..8], b"free");
+        let source = RawSource::new_from_slice(&encoded);
+
+        let error = validate_raw_candidate_dimensions_for_format(
+            RawFormatHint::CR3,
+            &source,
+            "leading-box.cr3",
+        )
+        .expect_err("CR3 preflight should not require ftyp to be the first box");
+
+        assert!(error.to_string().contains("100000x100000"));
+        assert!(error.to_string().contains("exceeds 200000000 pixels"));
     }
 
     /// Minimal BMFF tree that rawler's parser accepts: every box rawler
