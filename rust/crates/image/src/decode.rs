@@ -21,7 +21,9 @@ use image::{
 };
 use jxl_oxide::integration::register_image_decoding_hook as register_jxl_decoding_hook;
 use rawler::{
-    decoders::{Decoder as RawDecoder, RawDecodeParams, WellKnownIFD},
+    decoders::{
+        Decoder as RawDecoder, Orientation as RawOrientation, RawDecodeParams, WellKnownIFD,
+    },
     formats::tiff::{GenericTiffReader, IFD, reader::TiffReader},
     imgop::develop::RawDevelop,
     rawsource::RawSource,
@@ -366,6 +368,7 @@ fn decode_raw_source_to_dynamic_image(
         .raw_image(source, &decode_params, false)
         .map_err(|e| ImageError::Decode(format!("failed to decode RAW image: {e}")))?;
     validate_raw_dimensions(raw_image.width, raw_image.height, source_name)?;
+    let raw_image_orientation = raw_orientation_to_exif(raw_image.orientation);
 
     let developed = RawDevelop::default()
         .develop_intermediate(&raw_image)
@@ -379,7 +382,7 @@ fn decode_raw_source_to_dynamic_image(
 
     // Orientation is best effort: a metadata read failure should not discard
     // an otherwise successfully developed image.
-    let orientation = match decoder.raw_metadata(source, &decode_params) {
+    let metadata_orientation = match decoder.raw_metadata(source, &decode_params) {
         Ok(metadata) => metadata
             .exif
             .orientation
@@ -387,11 +390,12 @@ fn decode_raw_source_to_dynamic_image(
             .filter(|value| (1..=8).contains(value)),
         Err(err) => {
             eprintln!(
-                "[ml][decode] failed to read RAW metadata for '{source_name}': {err}; skipping orientation"
+                "[ml][decode] failed to read RAW metadata for '{source_name}': {err}; falling back to decoded RAW orientation"
             );
             None
         }
     };
+    let orientation = metadata_orientation.or(raw_image_orientation);
 
     Ok(RawDecodeOutcome::Decoded(match orientation {
         Some(orientation) => apply_exif_orientation_dynamic(image, orientation),
@@ -448,6 +452,20 @@ fn raw_dimensions_from_ifd(ifd: &IFD) -> Option<(usize, usize)> {
         .get_entry(RawTiffCommonTag::ImageLength)
         .map(|entry| entry.force_usize(0))?;
     Some((width, height))
+}
+
+fn raw_orientation_to_exif(orientation: RawOrientation) -> Option<u8> {
+    match orientation {
+        RawOrientation::Normal => Some(1),
+        RawOrientation::HorizontalFlip => Some(2),
+        RawOrientation::Rotate180 => Some(3),
+        RawOrientation::VerticalFlip => Some(4),
+        RawOrientation::Transpose => Some(5),
+        RawOrientation::Rotate90 => Some(6),
+        RawOrientation::Transverse => Some(7),
+        RawOrientation::Rotate270 => Some(8),
+        RawOrientation::Unknown => None,
+    }
 }
 
 fn catch_raw_decode_panic<T, F>(source_name: &str, decode: F) -> ImageResult<T>
@@ -821,12 +839,12 @@ mod tests {
         codecs::{png::PngEncoder, tiff::TiffEncoder},
     };
     use moxcms::ColorProfile;
-    use rawler::rawsource::RawSource;
+    use rawler::{decoders::Orientation as RawOrientation, rawsource::RawSource};
 
     use super::{
         ImageResult, bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic,
         decode_image_from_bytes, decode_image_from_path, init_image_decoders,
-        path_extension_is_raw, should_attempt_tiff_fallback,
+        path_extension_is_raw, raw_orientation_to_exif, should_attempt_tiff_fallback,
         validate_tiff_raw_candidate_dimensions,
     };
 
@@ -908,6 +926,25 @@ mod tests {
         encoded.extend_from_slice(&4u16.to_le_bytes());
         encoded.extend_from_slice(&1u32.to_le_bytes());
         encoded.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn maps_raw_orientation_to_exif_orientation() {
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Normal), Some(1));
+        assert_eq!(
+            raw_orientation_to_exif(RawOrientation::HorizontalFlip),
+            Some(2)
+        );
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Rotate180), Some(3));
+        assert_eq!(
+            raw_orientation_to_exif(RawOrientation::VerticalFlip),
+            Some(4)
+        );
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Transpose), Some(5));
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Rotate90), Some(6));
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Transverse), Some(7));
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Rotate270), Some(8));
+        assert_eq!(raw_orientation_to_exif(RawOrientation::Unknown), None);
     }
 
     #[test]
