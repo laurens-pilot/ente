@@ -20,7 +20,13 @@ use image::{
     DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, hooks::decoding_hook_registered,
 };
 use jxl_oxide::integration::register_image_decoding_hook as register_jxl_decoding_hook;
-use rawler::{decoders::RawDecodeParams, imgop::develop::RawDevelop, rawsource::RawSource};
+use rawler::{
+    decoders::{Decoder as RawDecoder, RawDecodeParams, WellKnownIFD},
+    formats::tiff::{GenericTiffReader, IFD, reader::TiffReader},
+    imgop::develop::RawDevelop,
+    rawsource::RawSource,
+    tags::TiffCommonTag as RawTiffCommonTag,
+};
 use tiff::{
     ColorType as TiffColorType,
     decoder::{Decoder as TiffDecoder, DecodingResult as TiffDecodingResult},
@@ -354,6 +360,8 @@ fn decode_raw_source_to_dynamic_image(
         }
     };
 
+    validate_raw_dimensions_before_decode(decoder.as_ref(), source, source_name)?;
+
     let raw_image = decoder
         .raw_image(source, &decode_params, false)
         .map_err(|e| ImageError::Decode(format!("failed to decode RAW image: {e}")))?;
@@ -389,6 +397,57 @@ fn decode_raw_source_to_dynamic_image(
         Some(orientation) => apply_exif_orientation_dynamic(image, orientation),
         None => image,
     }))
+}
+
+fn validate_raw_dimensions_before_decode(
+    decoder: &dyn RawDecoder,
+    source: &RawSource,
+    source_name: &str,
+) -> ImageResult<()> {
+    if let Some(raw_ifd) = decoder
+        .ifd(WellKnownIFD::Raw)
+        .map_err(|e| ImageError::Decode(format!("failed to inspect RAW dimensions: {e}")))?
+    {
+        if let Some((width, height)) = raw_dimensions_from_ifd(&raw_ifd) {
+            validate_raw_dimensions(width, height, source_name)?;
+            return Ok(());
+        }
+    }
+
+    validate_tiff_raw_candidate_dimensions(source, source_name)
+}
+
+fn validate_tiff_raw_candidate_dimensions(
+    source: &RawSource,
+    source_name: &str,
+) -> ImageResult<()> {
+    let mut reader = source.reader();
+    let tiff = match GenericTiffReader::new(&mut reader, 0, 0, None, &[]) {
+        Ok(tiff) => tiff,
+        Err(_) => return Ok(()),
+    };
+
+    for ifd in tiff.find_ifds_with_filter(|ifd| {
+        raw_dimensions_from_ifd(ifd).is_some()
+            && (ifd.has_entry(RawTiffCommonTag::StripOffsets)
+                || ifd.has_entry(RawTiffCommonTag::TileOffsets))
+    }) {
+        if let Some((width, height)) = raw_dimensions_from_ifd(ifd) {
+            validate_raw_dimensions(width, height, source_name)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn raw_dimensions_from_ifd(ifd: &IFD) -> Option<(usize, usize)> {
+    let width = ifd
+        .get_entry(RawTiffCommonTag::ImageWidth)
+        .map(|entry| entry.force_usize(0))?;
+    let height = ifd
+        .get_entry(RawTiffCommonTag::ImageLength)
+        .map(|entry| entry.force_usize(0))?;
+    Some((width, height))
 }
 
 fn catch_raw_decode_panic<T, F>(source_name: &str, decode: F) -> ImageResult<T>
@@ -762,11 +821,13 @@ mod tests {
         codecs::{png::PngEncoder, tiff::TiffEncoder},
     };
     use moxcms::ColorProfile;
+    use rawler::rawsource::RawSource;
 
     use super::{
         ImageResult, bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic,
         decode_image_from_bytes, decode_image_from_path, init_image_decoders,
         path_extension_is_raw, should_attempt_tiff_fallback,
+        validate_tiff_raw_candidate_dimensions,
     };
 
     #[test]
@@ -816,6 +877,37 @@ mod tests {
         assert!(!bytes_look_like_raw(b"\x89PNG\r\n\x1a\n"));
         assert!(!bytes_look_like_raw(b"\xff\xd8\xff\xe0")); // JPEG
         assert!(!bytes_look_like_raw(b""));
+    }
+
+    #[test]
+    fn rejects_oversized_tiff_raw_candidate_from_header_dimensions() {
+        let encoded = minimal_tiff_with_raw_candidate_dimensions(200_000_001, 1);
+        let source = RawSource::new_from_slice(&encoded);
+
+        let error = validate_tiff_raw_candidate_dimensions(&source, "huge.dng")
+            .expect_err("oversized TIFF RAW candidate should fail before decode");
+
+        assert!(error.to_string().contains("200000001x1"));
+        assert!(error.to_string().contains("exceeds 200000000 pixels"));
+    }
+
+    fn minimal_tiff_with_raw_candidate_dimensions(width: u32, height: u32) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"II*\0");
+        encoded.extend_from_slice(&8u32.to_le_bytes());
+        encoded.extend_from_slice(&3u16.to_le_bytes());
+        append_tiff_long(&mut encoded, 0x0100, width);
+        append_tiff_long(&mut encoded, 0x0101, height);
+        append_tiff_long(&mut encoded, 0x0111, 0);
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        encoded
+    }
+
+    fn append_tiff_long(encoded: &mut Vec<u8>, tag: u16, value: u32) {
+        encoded.extend_from_slice(&tag.to_le_bytes());
+        encoded.extend_from_slice(&4u16.to_le_bytes());
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.extend_from_slice(&value.to_le_bytes());
     }
 
     #[test]
