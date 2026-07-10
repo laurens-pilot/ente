@@ -24,7 +24,10 @@ use rawler::{
     decoders::{
         Decoder as RawDecoder, Orientation as RawOrientation, RawDecodeParams, WellKnownIFD,
     },
-    formats::tiff::{GenericTiffReader, IFD, reader::TiffReader},
+    formats::{
+        bmff::Bmff,
+        tiff::{GenericTiffReader, IFD, reader::TiffReader},
+    },
     imgop::develop::RawDevelop,
     rawsource::RawSource,
     tags::TiffCommonTag as RawTiffCommonTag,
@@ -444,6 +447,16 @@ fn decode_raw_source_to_dynamic_image(
     }))
 }
 
+/// Best-effort dimension preflight before any pixel decode allocates.
+/// Coverage: DNG exposes its raw IFD via `Decoder::ifd` (the only rawler
+/// 0.7.2 decoder that implements it), CR3/CRM dimensions come from the CMP1
+/// box, and other TIFF-based RAWs (NEF/ARW/CR2/PEF/SRW/...) are covered by
+/// the TIFF IFD walk. Formats not covered here (RW2/RAF/CRW/MRW/..., and
+/// buffers sized from embedded codec headers rather than container tags)
+/// are bounded by rawler's internal `alloc_image!` caps (500MP, 50k px per
+/// side), whose panics [`catch_raw_decode_panic`] converts to errors. Known
+/// residual gap: IIQ's proprietary block parser allocates from an
+/// unvalidated entry count upstream.
 fn validate_raw_dimensions_before_decode(
     decoder: &dyn RawDecoder,
     source: &RawSource,
@@ -458,7 +471,44 @@ fn validate_raw_dimensions_before_decode(
         return Ok(());
     }
 
+    if source_looks_like_bmff(source) {
+        return validate_cr3_raw_candidate_dimensions(source, source_name);
+    }
+
     validate_tiff_raw_candidate_dimensions(source, source_name)
+}
+
+/// CR3/CRM preflight. rawler's crx decompressor sizes its output and line
+/// buffers straight from the CMP1 box's `f_width`/`f_height` with no
+/// internal cap (unlike the `alloc_image!` guards in most other decode
+/// paths), so a crafted CMP1 can request an arbitrarily large allocation —
+/// and an allocation failure aborts the process, which `catch_unwind`
+/// cannot intercept. Parse the same box tree rawler's Cr3Decoder navigates
+/// and validate every CMP1 before any pixel decode. Parse failures defer to
+/// rawler's own error reporting.
+fn validate_cr3_raw_candidate_dimensions(source: &RawSource, source_name: &str) -> ImageResult<()> {
+    let Ok(bmff) = Bmff::new(&mut source.reader()) else {
+        return Ok(());
+    };
+
+    for trak in &bmff.filebox.moov.traks {
+        if let Some(craw) = &trak.mdia.minf.stbl.stsd.craw
+            && let Some(cmp1) = &craw.cmp1
+        {
+            validate_raw_dimensions(cmp1.f_width as usize, cmp1.f_height as usize, source_name)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn source_looks_like_bmff(source: &RawSource) -> bool {
+    let mut magic = [0u8; 8];
+    if source.reader().read_exact(&mut magic).is_err() {
+        return false;
+    }
+
+    &magic[4..8] == b"ftyp"
 }
 
 fn validate_tiff_raw_candidate_dimensions(
@@ -1015,7 +1065,7 @@ mod tests {
         ImageResult, bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic,
         decode_image_from_bytes, decode_image_from_path, init_image_decoders,
         path_extension_is_raw, raw_orientation_to_exif, should_attempt_tiff_fallback,
-        validate_tiff_raw_candidate_dimensions,
+        validate_cr3_raw_candidate_dimensions, validate_tiff_raw_candidate_dimensions,
     };
 
     #[test]
@@ -1148,6 +1198,108 @@ mod tests {
         encoded.extend_from_slice(&4u16.to_le_bytes());
         encoded.extend_from_slice(&1u32.to_le_bytes());
         encoded.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[test]
+    fn rejects_oversized_cr3_candidate_from_cmp1_dimensions() {
+        let encoded = synthetic_cr3_with_cmp1_dimensions(100_000, 100_000);
+        let source = RawSource::new_from_slice(&encoded);
+
+        let error = validate_cr3_raw_candidate_dimensions(&source, "huge.cr3")
+            .expect_err("oversized CR3 CMP1 dimensions should fail before decode");
+
+        assert!(error.to_string().contains("100000x100000"));
+        assert!(error.to_string().contains("exceeds 200000000 pixels"));
+    }
+
+    #[test]
+    fn accepts_cr3_candidate_with_sane_cmp1_dimensions() {
+        let encoded = synthetic_cr3_with_cmp1_dimensions(6000, 4000);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_cr3_raw_candidate_dimensions(&source, "ok.cr3")
+            .expect("sane CMP1 dimensions should pass the preflight");
+    }
+
+    #[test]
+    fn cr3_dimension_guard_defers_unparseable_bmff_to_rawler() {
+        let source = RawSource::new_from_slice(b"\0\0\0\x18ftypcrx garbage");
+
+        validate_cr3_raw_candidate_dimensions(&source, "junk.cr3")
+            .expect("BMFF parse failures should defer to rawler's own error");
+    }
+
+    /// Minimal BMFF tree that rawler's parser accepts: every box rawler
+    /// requires along the path to the CMP1 box, with zeroed filler for the
+    /// fields the parsers read but this test doesn't care about.
+    fn synthetic_cr3_with_cmp1_dimensions(width: u32, height: u32) -> Vec<u8> {
+        // CMP1 payload (36 bytes); ext_header stays 0 so the CRM movie
+        // branch in rawler's parser is skipped.
+        let mut cmp1 = Vec::new();
+        cmp1.extend_from_slice(&0i16.to_be_bytes()); // unknown1
+        cmp1.extend_from_slice(&0u16.to_be_bytes()); // header_size
+        cmp1.extend_from_slice(&0u16.to_be_bytes()); // version
+        cmp1.extend_from_slice(&0u16.to_be_bytes()); // version_sub
+        cmp1.extend_from_slice(&width.to_be_bytes()); // f_width
+        cmp1.extend_from_slice(&height.to_be_bytes()); // f_height
+        cmp1.extend_from_slice(&width.to_be_bytes()); // tile_width
+        cmp1.extend_from_slice(&height.to_be_bytes()); // tile_height
+        cmp1.push(14); // n_bits
+        cmp1.push(0x40); // n_planes = 4, cfa_layout = 0
+        cmp1.push(0x03); // enc_type = 0, image_levels = 3
+        cmp1.push(0); // tile flags
+        cmp1.extend_from_slice(&0u32.to_be_bytes()); // mdat_hdr_size
+        cmp1.extend_from_slice(&0u32.to_be_bytes()); // ext_header
+
+        // CRAW sample entry: 82 bytes of fixed fields, then child boxes.
+        let mut craw = vec![0u8; 82];
+        craw.extend_from_slice(&bmff_box(b"CMP1", &cmp1));
+
+        let mut stsd = Vec::new();
+        stsd.extend_from_slice(&0u32.to_be_bytes()); // version + flags
+        stsd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
+        stsd.extend_from_slice(&bmff_box(b"CRAW", &craw));
+
+        let mut stbl = Vec::new();
+        stbl.extend_from_slice(&bmff_box(b"stsd", &stsd));
+        stbl.extend_from_slice(&bmff_box(b"stts", &[0u8; 8]));
+        stbl.extend_from_slice(&bmff_box(b"stsc", &[0u8; 8]));
+        stbl.extend_from_slice(&bmff_box(b"stsz", &[0u8; 12]));
+
+        let mut minf = Vec::new();
+        minf.extend_from_slice(&bmff_box(b"dinf", &[]));
+        minf.extend_from_slice(&bmff_box(b"stbl", &stbl));
+
+        let mut mdia = Vec::new();
+        mdia.extend_from_slice(&bmff_box(b"mdhd", &[0u8; 24]));
+        mdia.extend_from_slice(&bmff_box(b"hdlr", &[0u8; 4]));
+        mdia.extend_from_slice(&bmff_box(b"minf", &minf));
+
+        let mut trak = Vec::new();
+        trak.extend_from_slice(&bmff_box(b"tkhd", &[0u8; 4]));
+        trak.extend_from_slice(&bmff_box(b"mdia", &mdia));
+
+        let mut moov = Vec::new();
+        moov.extend_from_slice(&bmff_box(b"mvhd", &[0u8; 20]));
+        moov.extend_from_slice(&bmff_box(b"trak", &trak));
+
+        let mut ftyp = Vec::new();
+        ftyp.extend_from_slice(b"crx "); // major brand
+        ftyp.extend_from_slice(&0u32.to_be_bytes()); // minor version
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&bmff_box(b"ftyp", &ftyp));
+        file.extend_from_slice(&bmff_box(b"moov", &moov));
+        file.extend_from_slice(&bmff_box(b"mdat", &[]));
+        file
+    }
+
+    fn bmff_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(8 + payload.len());
+        encoded.extend_from_slice(&(8 + payload.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(fourcc);
+        encoded.extend_from_slice(payload);
+        encoded
     }
 
     #[test]
