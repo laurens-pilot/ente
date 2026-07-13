@@ -60,7 +60,7 @@ const RAW_MAX_DIMENSION: usize = 50_000;
 const RAW_EXTENSIONS: &[&str] = &[
     "3fr", "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "fff", "iiq",
     "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "qtk", "raf", "raw", "rw2",
-    "rwl", "srw", "x3f",
+    "rwl", "sr2", "srf", "srw", "x3f",
 ];
 /// Magic-byte prefixes of RAW containers that must be routed to the RAW
 /// pipeline first. The list need not be exhaustive: formats missed here are
