@@ -63,7 +63,7 @@ fn apply_profile_to_image(
 }
 
 fn transform_buffer<P>(
-    buffer: ImageBuffer<P, Vec<P::Subpixel>>,
+    mut buffer: ImageBuffer<P, Vec<P::Subpixel>>,
     source_profile: &ColorProfile,
     layout: Layout,
     into_dynamic: fn(ImageBuffer<P, Vec<P::Subpixel>>) -> DynamicImage,
@@ -72,76 +72,64 @@ where
     P: Pixel,
     P::Subpixel: TransformSubpixel,
 {
-    let (width, height) = buffer.dimensions();
-    match P::Subpixel::transform_to_srgb(buffer.as_raw(), source_profile, layout) {
-        Ok(data) => Ok(into_dynamic(
-            ImageBuffer::from_raw(width, height, data)
-                .expect("transformed buffer length should match source dimensions"),
-        )),
+    match P::Subpixel::transform_to_srgb_in_place(
+        buffer.as_flat_samples_mut().samples,
+        source_profile,
+        layout,
+    ) {
+        Ok(()) => Ok(into_dynamic(buffer)),
         Err(err) => Err((into_dynamic(buffer), err)),
     }
 }
 
 /// Subpixel types for which moxcms can transform pixel buffers to sRGB.
 trait TransformSubpixel: Copy {
-    fn transform_to_srgb(
-        pixels: &[Self],
+    fn transform_to_srgb_in_place(
+        pixels: &mut [Self],
         source_profile: &ColorProfile,
         layout: Layout,
-    ) -> Result<Vec<Self>, String>;
+    ) -> Result<(), String>;
 }
 
 impl TransformSubpixel for u8 {
-    fn transform_to_srgb(
-        pixels: &[Self],
+    fn transform_to_srgb_in_place(
+        pixels: &mut [Self],
         source_profile: &ColorProfile,
         layout: Layout,
-    ) -> Result<Vec<Self>, String> {
+    ) -> Result<(), String> {
         let target_profile = target_profile_for_layout(layout);
         let transform = source_profile
-            .create_transform_8bit(layout, &target_profile, layout, transform_options())
+            .create_in_place_transform_8bit(layout, &target_profile, transform_options())
             .map_err(|err| err.to_string())?;
-        let mut transformed = vec![0; pixels.len()];
-        transform
-            .transform(pixels, &mut transformed)
-            .map_err(|err| err.to_string())?;
-        Ok(transformed)
+        transform.transform(pixels).map_err(|err| err.to_string())
     }
 }
 
 impl TransformSubpixel for u16 {
-    fn transform_to_srgb(
-        pixels: &[Self],
+    fn transform_to_srgb_in_place(
+        pixels: &mut [Self],
         source_profile: &ColorProfile,
         layout: Layout,
-    ) -> Result<Vec<Self>, String> {
+    ) -> Result<(), String> {
         let target_profile = target_profile_for_layout(layout);
         let transform = source_profile
-            .create_transform_16bit(layout, &target_profile, layout, transform_options())
+            .create_in_place_transform_16bit(layout, &target_profile, transform_options())
             .map_err(|err| err.to_string())?;
-        let mut transformed = vec![0; pixels.len()];
-        transform
-            .transform(pixels, &mut transformed)
-            .map_err(|err| err.to_string())?;
-        Ok(transformed)
+        transform.transform(pixels).map_err(|err| err.to_string())
     }
 }
 
 impl TransformSubpixel for f32 {
-    fn transform_to_srgb(
-        pixels: &[Self],
+    fn transform_to_srgb_in_place(
+        pixels: &mut [Self],
         source_profile: &ColorProfile,
         layout: Layout,
-    ) -> Result<Vec<Self>, String> {
+    ) -> Result<(), String> {
         let target_profile = target_profile_for_layout(layout);
         let transform = source_profile
-            .create_transform_f32(layout, &target_profile, layout, transform_options())
+            .create_in_place_transform_f32(layout, &target_profile, transform_options())
             .map_err(|err| err.to_string())?;
-        let mut transformed = vec![0.0; pixels.len()];
-        transform
-            .transform(pixels, &mut transformed)
-            .map_err(|err| err.to_string())?;
-        Ok(transformed)
+        transform.transform(pixels).map_err(|err| err.to_string())
     }
 }
 

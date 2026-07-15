@@ -19,16 +19,17 @@ use exif::{In, Reader as ExifReader, Tag as ExifTag};
 use image::{
     DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, hooks::decoding_hook_registered,
 };
-use jxl_oxide::integration::register_image_decoding_hook as register_jxl_decoding_hook;
+use jxl_bitstream::{BitstreamKind, ContainerParser, ParseEvent};
+use jxl_oxide::{
+    AllocTracker, InitializeResult, JxlImage, JxlThreadPool, UninitializedJxlImage,
+    integration::register_image_decoding_hook as register_jxl_decoding_hook,
+};
 use rawler::{
     decoders::{
-        Decoder as RawDecoder, FormatHint as RawFormatHint, Orientation as RawOrientation,
-        RawDecodeParams, WellKnownIFD,
+        Decoder as RawDecoder, Orientation as RawOrientation, RawDecodeParams, WellKnownIFD,
     },
-    formats::{
-        bmff::Bmff,
-        tiff::{GenericTiffReader, IFD, ifd::DataMode, reader::TiffReader},
-    },
+    decompressors::ljpeg::LjpegDecompressor,
+    formats::tiff::{GenericTiffReader, IFD, ifd::DataMode, reader::TiffReader},
     imgop::develop::RawDevelop,
     rawsource::RawSource,
     tags::TiffCommonTag as RawTiffCommonTag,
@@ -48,14 +49,17 @@ use crate::{
 static IMAGE_DECODER_HOOKS_INIT: Once = Once::new();
 
 const RAW_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-/// RAW development goes through a planar f32 intermediate (~12 bytes per pixel)
-/// on top of the u16 mosaic and Rgb16 output, so peak memory is roughly 18
-/// bytes per pixel. 200M pixels keeps headroom above the largest current
-/// sensors (Phase One IQ4 at ~151MP) while bounding worst-case allocations.
-const RAW_MAX_PIXELS: u128 = 200_000_000;
-/// Matches rawler 0.7.2's `alloc_image!` guard. The CRX decoder bypasses that
-/// macro but allocates multiple line and wavelet buffers proportional to one
-/// side, so total pixels alone is not a sufficient allocation bound.
+/// rawler's whole-frame development pipeline peaks around 32 bytes per Bayer
+/// source pixel and can be higher for multi-channel Linear DNGs. Keep local
+/// RAW development to a universal 36MP; larger RAWs may use an embedded JPEG.
+const RAW_MAX_DEVELOPMENT_PIXELS: u128 = 36_000_000;
+/// Separate sample-allocation ceiling for compressed/tiled DNG preflight.
+/// Multi-channel RAWs contain more than one sample per image pixel.
+const RAW_MAX_DECODED_SAMPLES: u128 = 200_000_000;
+const RAW_PREVIEW_MIN_SHORT_EDGE: u32 = 1080;
+const RAW_PREVIEW_MAX_PIXELS: u64 = 200_000_000;
+/// A separate side limit bounds decoder line and wavelet buffers for extreme
+/// aspect ratios; total pixels alone is not a sufficient allocation bound.
 const RAW_MAX_DIMENSION: usize = 50_000;
 const RAW_EXTENSIONS: &[&str] = &[
     "3fr", "ari", "arw", "cr2", "cr3", "crm", "crw", "dcr", "dcs", "dng", "erf", "fff", "iiq",
@@ -105,6 +109,22 @@ const TIFF_PRESCREEN_MAX_ENTRIES_PER_IFD: u16 = 4096;
 /// "Camera Library" is 14 bytes plus a NUL terminator; a longer `Software`
 /// value cannot equal it under rawler's exact comparison.
 const TIFF_PRESCREEN_MAX_SOFTWARE_BYTES: u32 = 64;
+const DNG_COMPRESSION_MODERN_JPEG: u16 = 7;
+const DNG_COMPRESSION_JPEG_XL: u16 = 52_546;
+/// Bound the codestream data inspected while locating the first displayed
+/// keyframe. Progressive-DC streams can place complete LF dependency frames
+/// before that header, so this is deliberately larger than an ordinary image
+/// header. Container metadata does not count toward this budget.
+const JPEG_XL_PREFLIGHT_MAX_CODESTREAM_BYTES: usize = 16 * 1024 * 1024;
+const JPEG_XL_PREFLIGHT_CHUNK_BYTES: usize = 64 * 1024;
+/// jxl-oxide tracks header and compressed frame-data allocations, but not the
+/// rendered framebuffers. Those are bounded separately from frame dimensions
+/// before rawler calls `render_frame`.
+const JPEG_XL_PREFLIGHT_MAX_TRACKED_ALLOC_BYTES: usize = 32 * 1024 * 1024;
+/// Allow the two full-canvas LF frames emitted by libjxl's most progressive DC
+/// mode, plus one further canvas worth of referenced data. This bounds hidden
+/// render allocations without excluding ordinary progressive still images.
+const JPEG_XL_PREFLIGHT_MAX_DEPENDENCY_SAMPLE_MULTIPLIER: u128 = 3;
 
 struct DecodedDynamicImage {
     image: DynamicImage,
@@ -151,10 +171,11 @@ pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> 
 /// RAW signal:
 ///
 /// - Extension and magic both say RAW: the file is committed to the RAW
-///   pipeline and every failure — oversized input, unmatched camera model,
-///   decode/develop error — is a hard error. Falling back would let the image
-///   crate decode the embedded preview of a TIFF-based RAW and silently
-///   return a thumbnail-sized image.
+///   pipeline. RAWs at or below 36MP are developed; larger RAWs may return the
+///   largest eligible embedded JPEG preview. Other failures — oversized
+///   input, unmatched camera model, decode/develop error, or no sufficiently
+///   large preview — are hard errors. There is no generic image-crate
+///   fallback that could silently return a thumbnail-sized image.
 /// - Only one signal says RAW (a camera-marker TIFF without a RAW extension —
 ///   typically a `.tif` export that kept its camera EXIF — or a misnamed file
 ///   whose magic disagrees): the RAW attempt is opportunistic and any RAW
@@ -181,13 +202,11 @@ fn decode_dynamic_from_path(image_path: &str) -> ImageResult<DynamicImage> {
 
     if extension_is_raw && magic_is_raw {
         validate_raw_input_size(input_bytes, image_path)?;
-        // Hard-error domain: RAWs from camera models newer than the pinned
-        // rawler's model database land on the ProbeRejected arm by design —
-        // better no result than a silently indexed thumbnail. If that proves
-        // too strict, a follow-up could serve the embedded JPEG preview
-        // (rawler's `Decoder::full_image`) when `raw_image` fails for a
-        // matched model; probe rejections carry no decoder and would need a
-        // generic preview extraction instead.
+        // Hard-error domain: RAWs from camera models newer than rawler's model
+        // database land on the ProbeRejected arm by design. The controlled
+        // embedded-preview fallback requires a matched decoder; probe
+        // rejections carry no decoder and must not fall through to the image
+        // crate's potentially thumbnail-sized TIFF decode.
         return match decode_raw_from_path(image_path)? {
             RawDecodeOutcome::Decoded(decoded) => Ok(decoded),
             RawDecodeOutcome::ProbeRejected(probe_error) => Err(ImageError::Decode(format!(
@@ -333,6 +352,16 @@ fn decode_reader_with_image_crate<R>(
 where
     R: BufRead + Seek,
 {
+    decode_reader_with_image_crate_and_limits(reader, Limits::default())
+}
+
+fn decode_reader_with_image_crate_and_limits<R>(
+    reader: ImageReader<R>,
+    mut limits: Limits,
+) -> image::ImageResult<DecodedDynamicImage>
+where
+    R: BufRead + Seek,
+{
     let mut decoder = reader.into_decoder()?;
     let icc_profile = match decoder.icc_profile() {
         Ok(icc_profile) => icc_profile,
@@ -342,7 +371,6 @@ where
         }
     };
 
-    let mut limits = Limits::default();
     limits.reserve(decoder.total_bytes())?;
     decoder.set_limits(limits)?;
 
@@ -370,6 +398,12 @@ enum RawDecodeOutcome {
     Decoded(DynamicImage),
     /// rawler does not recognize the input as a supported camera RAW.
     ProbeRejected(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RawDecodePlan {
+    Develop,
+    UseEmbeddedPreview,
 }
 
 fn decode_raw_from_path(image_path: &str) -> ImageResult<RawDecodeOutcome> {
@@ -406,7 +440,13 @@ fn decode_raw_source_to_dynamic_image(
         }
     };
 
-    validate_raw_dimensions_before_decode(decoder.as_ref(), source, source_name)?;
+    if validate_raw_dimensions_before_decode(decoder.as_ref(), source, &decode_params, source_name)?
+        == RawDecodePlan::UseEmbeddedPreview
+    {
+        let preview =
+            decode_best_raw_preview(decoder.as_ref(), source, &decode_params, source_name)?;
+        return Ok(RawDecodeOutcome::Decoded(preview));
+    }
 
     let raw_image = decoder
         .raw_image(source, &decode_params, false)
@@ -431,19 +471,8 @@ fn decode_raw_source_to_dynamic_image(
 
     // Orientation is best effort: a metadata read failure should not discard
     // an otherwise successfully developed image.
-    let metadata_orientation = match decoder.raw_metadata(source, &decode_params) {
-        Ok(metadata) => metadata
-            .exif
-            .orientation
-            .and_then(|value| u8::try_from(value).ok())
-            .filter(|value| (1..=8).contains(value)),
-        Err(err) => {
-            eprintln!(
-                "[ml][decode] failed to read RAW metadata for '{source_name}': {err}; falling back to decoded RAW orientation"
-            );
-            None
-        }
-    };
+    let metadata_orientation =
+        raw_metadata_orientation(decoder.as_ref(), source, &decode_params, source_name);
     let orientation = metadata_orientation.or(raw_image_orientation);
 
     Ok(RawDecodeOutcome::Decoded(match orientation {
@@ -452,42 +481,171 @@ fn decode_raw_source_to_dynamic_image(
     }))
 }
 
+fn raw_metadata_orientation(
+    decoder: &dyn RawDecoder,
+    source: &RawSource,
+    decode_params: &RawDecodeParams,
+    source_name: &str,
+) -> Option<u8> {
+    match decoder.raw_metadata(source, decode_params) {
+        Ok(metadata) => metadata
+            .exif
+            .orientation
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| (1..=8).contains(value)),
+        Err(err) => {
+            eprintln!(
+                "[ml][decode] failed to read RAW metadata for '{source_name}': {err}; leaving the decoded image's orientation unchanged when no pixel orientation is available"
+            );
+            None
+        }
+    }
+}
+
+fn decode_best_raw_preview(
+    decoder: &dyn RawDecoder,
+    source: &RawSource,
+    decode_params: &RawDecodeParams,
+    source_name: &str,
+) -> ImageResult<DynamicImage> {
+    let previews = decoder
+        .embedded_previews(source, decode_params)
+        .map_err(|e| {
+            ImageError::Decode(format!(
+                "failed to inspect embedded RAW previews for '{source_name}': {e}"
+            ))
+        })?;
+    let preview = previews
+        .iter()
+        .filter(|preview| {
+            preview.format == ImageFormat::Jpeg
+                && raw_preview_dimensions_are_eligible(preview.width, preview.height)
+        })
+        .max_by_key(|preview| preview.pixel_count());
+    let Some(preview) = preview else {
+        let available = if previews.is_empty() {
+            "none".to_string()
+        } else {
+            previews
+                .iter()
+                .map(|preview| format!("{}x{}", preview.width, preview.height))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        return Err(ImageError::Decode(format!(
+            "RAW image '{source_name}' exceeds {RAW_MAX_DEVELOPMENT_PIXELS} pixels and has no usable embedded JPEG preview (requires short edge >= {RAW_PREVIEW_MIN_SHORT_EDGE}px and <= {RAW_PREVIEW_MAX_PIXELS} pixels; found: {available})"
+        )));
+    };
+
+    let encoded_preview = preview.encoded_data(source).map_err(|e| {
+        ImageError::Decode(format!(
+            "failed to read embedded RAW preview {}x{} for '{source_name}': {e}",
+            preview.width, preview.height
+        ))
+    })?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(preview.width);
+    limits.max_image_height = Some(preview.height);
+    // Match rawler's preview decode budget. The decoded RGB8 buffer uses
+    // three bytes per pixel; one further byte per pixel plus 16 MiB gives the
+    // JPEG decoder bounded working space without reinstating the default
+    // 512 MiB ceiling for eligible large previews.
+    limits.max_alloc = Some(
+        preview
+            .pixel_count()
+            .saturating_mul(4)
+            .saturating_add(16 * 1024 * 1024),
+    );
+    let reader = ImageReader::with_format(Cursor::new(encoded_preview), preview.format);
+    let image = decode_reader_with_image_crate_and_limits(reader, limits)
+        .map(DecodedDynamicImage::into_srgb)
+        .map_err(|e| {
+            ImageError::Decode(format!(
+                "failed to decode embedded RAW preview {}x{} for '{source_name}': {e}",
+                preview.width, preview.height
+            ))
+        })?;
+    if !raw_preview_dimensions_are_eligible(image.width(), image.height()) {
+        return Err(ImageError::Decode(format!(
+            "embedded RAW preview for '{source_name}' decoded to ineligible dimensions {}x{}",
+            image.width(),
+            image.height()
+        )));
+    }
+
+    let orientation = raw_metadata_orientation(decoder, source, decode_params, source_name);
+
+    Ok(match orientation {
+        Some(orientation) => apply_exif_orientation_dynamic(image, orientation),
+        None => image,
+    })
+}
+
+fn raw_preview_dimensions_are_eligible(width: u32, height: u32) -> bool {
+    width.min(height) >= RAW_PREVIEW_MIN_SHORT_EDGE
+        && u64::from(width) * u64::from(height) <= RAW_PREVIEW_MAX_PIXELS
+}
+
 /// Best-effort dimension preflight before any pixel decode allocates.
-/// Coverage: DNG exposes its raw IFD via `Decoder::ifd` (the only rawler
-/// 0.7.2 decoder that implements it), CR3/CRM dimensions come from the CMP1
-/// box, and other TIFF-based RAWs (NEF/ARW/CR2/PEF/SRW/...) are covered by
-/// the TIFF IFD walk. Formats not covered here (RW2/RAF/CRW/MRW/..., and
-/// buffers sized from embedded codec headers rather than container tags)
-/// are bounded by rawler's internal `alloc_image!` caps (500MP, 50k px per
-/// side), whose panics [`catch_raw_decode_panic`] converts to errors. Known
-/// residual gap: IIQ's proprietary block parser allocates from an
-/// unvalidated entry count upstream.
+/// The fork's `Decoder::raw_dimensions` hook covers formats whose sensor
+/// dimensions do not live in ordinary TIFF image tags. DNG exposes its raw
+/// IFD via `Decoder::ifd`, allowing checks for tile padding and dimensions
+/// hidden in lossless-JPEG/JPEG-XL payloads. Remaining TIFF-based RAWs are
+/// covered by the TIFF IFD walk.
 fn validate_raw_dimensions_before_decode(
     decoder: &dyn RawDecoder,
     source: &RawSource,
+    decode_params: &RawDecodeParams,
     source_name: &str,
-) -> ImageResult<()> {
+) -> ImageResult<RawDecodePlan> {
+    let dimension_plan = decoder
+        .raw_dimensions(source, decode_params)
+        .map_err(|e| ImageError::Decode(format!("failed to inspect RAW dimensions: {e}")))?
+        .map(|(width, height)| raw_decode_plan_for_dimensions(width, height, source_name))
+        .transpose()?;
+    if dimension_plan == Some(RawDecodePlan::UseEmbeddedPreview) {
+        return Ok(RawDecodePlan::UseEmbeddedPreview);
+    }
+
+    // The dimension hook bounds the final image, not necessarily temporary
+    // codec allocations. Keep the DNG-specific payload checks when an IFD is
+    // available, even if a decoder also reports authoritative dimensions.
     if let Some(raw_ifd) = decoder
         .ifd(WellKnownIFD::Raw)
         .map_err(|e| ImageError::Decode(format!("failed to inspect RAW dimensions: {e}")))?
         && let Some((width, height)) = raw_dimensions_from_ifd(&raw_ifd)
     {
-        validate_raw_dimensions(width, height, source_name)?;
-        validate_dng_raw_ifd_allocation(&raw_ifd, source_name)?;
-        return Ok(());
+        let plan = raw_decode_plan_for_dimensions(width, height, source_name)?;
+        if plan == RawDecodePlan::Develop {
+            validate_dng_raw_ifd_allocation(&raw_ifd, source_name)?;
+            validate_dng_embedded_codec_dimensions(&raw_ifd, source, source_name)?;
+        }
+        return Ok(plan);
     }
 
-    validate_raw_candidate_dimensions_for_format(decoder.format_hint(), source, source_name)
+    if let Some(plan) = dimension_plan {
+        return Ok(plan);
+    }
+
+    for (width, height) in tiff_raw_candidate_dimensions(source) {
+        if raw_decode_plan_for_dimensions(width, height, source_name)?
+            == RawDecodePlan::UseEmbeddedPreview
+        {
+            return Ok(RawDecodePlan::UseEmbeddedPreview);
+        }
+    }
+    Ok(RawDecodePlan::Develop)
 }
 
-fn validate_raw_candidate_dimensions_for_format(
-    format_hint: RawFormatHint,
-    source: &RawSource,
+fn raw_decode_plan_for_dimensions(
+    width: usize,
+    height: usize,
     source_name: &str,
-) -> ImageResult<()> {
-    match format_hint {
-        RawFormatHint::CR3 => validate_cr3_raw_candidate_dimensions(source, source_name),
-        _ => validate_tiff_raw_candidate_dimensions(source, source_name),
+) -> ImageResult<RawDecodePlan> {
+    if raw_dimensions_require_preview(width, height, source_name)? {
+        Ok(RawDecodePlan::UseEmbeddedPreview)
+    } else {
+        Ok(RawDecodePlan::Develop)
     }
 }
 
@@ -553,6 +711,606 @@ fn validate_dng_raw_ifd_allocation(raw_ifd: &IFD, source_name: &str) -> ImageRes
     validate_raw_sample_allocation(sample_width, decode_height, source_name)
 }
 
+/// Validate dimensions declared inside compressed DNG strip/tile payloads.
+///
+/// rawler 0.7.2 validates and allocates the IFD-sized destination first, but
+/// its lossless-JPEG wrapper then creates a second `PixU16` from the JPEG SOF
+/// dimensions. JPEG-XL similarly renders the codestream dimensions before it
+/// copies into the destination. A small IFD can therefore hide an arbitrarily
+/// larger codec allocation. Inspect every payload before `raw_image` and
+/// require its allocation to be compatible with the storage block it will
+/// populate.
+fn validate_dng_embedded_codec_dimensions(
+    raw_ifd: &IFD,
+    source: &RawSource,
+    source_name: &str,
+) -> ImageResult<()> {
+    let compression = raw_ifd
+        .get_entry(RawTiffCommonTag::Compression)
+        .map(|entry| entry.force_u16(0))
+        .unwrap_or(1);
+    if !matches!(
+        compression,
+        DNG_COMPRESSION_MODERN_JPEG | DNG_COMPRESSION_JPEG_XL
+    ) {
+        return Ok(());
+    }
+
+    let width = dng_required_usize_tag(raw_ifd, RawTiffCommonTag::ImageWidth, source_name)?;
+    let height = dng_required_usize_tag(raw_ifd, RawTiffCommonTag::ImageLength, source_name)?;
+    let samples_per_pixel =
+        dng_required_usize_tag(raw_ifd, RawTiffCommonTag::SamplesPerPixel, source_name)?;
+    if samples_per_pixel == 0 {
+        return Err(ImageError::Decode(format!(
+            "DNG image '{source_name}' has invalid SamplesPerPixel value 0"
+        )));
+    }
+
+    let mut total_codec_samples = 0u128;
+    match raw_ifd.data_mode().map_err(|e| {
+        ImageError::Decode(format!(
+            "failed to inspect compressed DNG storage for '{source_name}': {e}"
+        ))
+    })? {
+        DataMode::Strips => {
+            let rows_per_strip = raw_ifd
+                .get_entry(RawTiffCommonTag::RowsPerStrip)
+                .map(|entry| entry.force_usize(0))
+                .unwrap_or(height);
+            if rows_per_strip == 0 {
+                return Err(ImageError::Decode(format!(
+                    "compressed DNG image '{source_name}' has invalid RowsPerStrip value 0"
+                )));
+            }
+
+            let expected_strip_count = height.div_ceil(rows_per_strip);
+            let (strips, _) = raw_ifd.strip_data(source).map_err(|e| {
+                ImageError::Decode(format!(
+                    "failed to inspect compressed DNG strips for '{source_name}': {e}"
+                ))
+            })?;
+            if strips.len() != expected_strip_count {
+                return Err(ImageError::Decode(format!(
+                    "compressed DNG image '{source_name}' declares {} strips but dimensions require {expected_strip_count}",
+                    strips.len()
+                )));
+            }
+
+            let expected_sample_width = width.checked_mul(samples_per_pixel).ok_or_else(|| {
+                ImageError::Decode(format!(
+                    "compressed DNG image '{source_name}' sample width overflows"
+                ))
+            })?;
+            for (index, payload) in strips.into_iter().enumerate() {
+                let first_row = index.checked_mul(rows_per_strip).ok_or_else(|| {
+                    ImageError::Decode(format!(
+                        "compressed DNG image '{source_name}' strip row offset overflows"
+                    ))
+                })?;
+                let required_rows = height.saturating_sub(first_row).min(rows_per_strip);
+                // A final strip may be encoded to the full RowsPerStrip size.
+                // Do not grant that padding to a single strip whose declared
+                // RowsPerStrip is itself larger than the image.
+                let maximum_rows = if expected_strip_count > 1 {
+                    rows_per_strip
+                } else {
+                    required_rows
+                };
+                total_codec_samples = total_codec_samples
+                    .checked_add(validate_dng_codec_payload_dimensions(
+                        payload,
+                        compression,
+                        width,
+                        expected_sample_width,
+                        required_rows,
+                        maximum_rows,
+                        samples_per_pixel,
+                        DngBlockContext::new("strip", index, source_name),
+                    )?)
+                    .ok_or_else(|| {
+                        ImageError::Decode(format!(
+                            "compressed DNG image '{source_name}' payload sample count overflows"
+                        ))
+                    })?;
+            }
+        }
+        DataMode::Tiles => {
+            let tile_width =
+                dng_required_usize_tag(raw_ifd, RawTiffCommonTag::TileWidth, source_name)?;
+            let tile_height =
+                dng_required_usize_tag(raw_ifd, RawTiffCommonTag::TileLength, source_name)?;
+            if tile_width == 0 || tile_height == 0 {
+                return Err(ImageError::Decode(format!(
+                    "compressed DNG image '{source_name}' has invalid tile dimensions {tile_width}x{tile_height}"
+                )));
+            }
+
+            let expected_tile_count = width
+                .div_ceil(tile_width)
+                .checked_mul(height.div_ceil(tile_height))
+                .ok_or_else(|| {
+                    ImageError::Decode(format!(
+                        "compressed DNG image '{source_name}' tile count overflows"
+                    ))
+                })?;
+            let tiles = raw_ifd.tile_data(source).map_err(|e| {
+                ImageError::Decode(format!(
+                    "failed to inspect compressed DNG tiles for '{source_name}': {e}"
+                ))
+            })?;
+            if tiles.len() != expected_tile_count {
+                return Err(ImageError::Decode(format!(
+                    "compressed DNG image '{source_name}' declares {} tiles but dimensions require {expected_tile_count}",
+                    tiles.len()
+                )));
+            }
+
+            let expected_sample_width =
+                tile_width.checked_mul(samples_per_pixel).ok_or_else(|| {
+                    ImageError::Decode(format!(
+                        "compressed DNG image '{source_name}' tile sample width overflows"
+                    ))
+                })?;
+            for (index, payload) in tiles.into_iter().enumerate() {
+                total_codec_samples = total_codec_samples
+                    .checked_add(validate_dng_codec_payload_dimensions(
+                        payload,
+                        compression,
+                        tile_width,
+                        expected_sample_width,
+                        tile_height,
+                        tile_height,
+                        samples_per_pixel,
+                        DngBlockContext::new("tile", index, source_name),
+                    )?)
+                    .ok_or_else(|| {
+                        ImageError::Decode(format!(
+                            "compressed DNG image '{source_name}' payload sample count overflows"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    if total_codec_samples > RAW_MAX_DECODED_SAMPLES {
+        return Err(ImageError::Decode(format!(
+            "compressed DNG image '{source_name}' is too large to decode safely: embedded codec payloads declare {total_codec_samples} samples, exceeding {RAW_MAX_DECODED_SAMPLES}"
+        )));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct DngBlockContext<'a> {
+    kind: &'static str,
+    index: usize,
+    source_name: &'a str,
+}
+
+impl<'a> DngBlockContext<'a> {
+    fn new(kind: &'static str, index: usize, source_name: &'a str) -> Self {
+        Self {
+            kind,
+            index,
+            source_name,
+        }
+    }
+}
+
+impl std::fmt::Display for DngBlockContext<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "DNG {} {} for '{}'",
+            self.kind, self.index, self.source_name
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_dng_codec_payload_dimensions(
+    payload: &[u8],
+    compression: u16,
+    expected_pixel_width: usize,
+    expected_sample_width: usize,
+    minimum_height: usize,
+    maximum_height: usize,
+    samples_per_pixel: usize,
+    context: DngBlockContext<'_>,
+) -> ImageResult<u128> {
+    match compression {
+        DNG_COMPRESSION_MODERN_JPEG => {
+            let decoder = LjpegDecompressor::new(payload).map_err(|e| {
+                ImageError::Decode(format!("failed to inspect lossless-JPEG {context}: {e}"))
+            })?;
+            validate_dng_lossless_jpeg_sample_count(
+                decoder.width(),
+                decoder.height(),
+                expected_sample_width,
+                minimum_height,
+                maximum_height,
+                context,
+            )
+        }
+        DNG_COMPRESSION_JPEG_XL => {
+            let header = inspect_jpeg_xl_header(payload, context)?;
+            if header.width != expected_pixel_width
+                || !(minimum_height..=maximum_height).contains(&header.height)
+            {
+                return Err(ImageError::Decode(format!(
+                    "compressed {context} has incompatible JPEG-XL pixel dimensions {}x{}; expected width {expected_pixel_width} and height {minimum_height}..={maximum_height}",
+                    header.width, header.height
+                )));
+            }
+            if header.output_channels != samples_per_pixel {
+                return Err(ImageError::Decode(format!(
+                    "JPEG-XL {context} declares {} output channels, expected {samples_per_pixel}",
+                    header.output_channels
+                )));
+            }
+            validate_raw_side_limit(
+                header
+                    .width
+                    .checked_mul(header.output_channels)
+                    .ok_or_else(|| {
+                        ImageError::Decode(format!("JPEG-XL {context} sample width overflows"))
+                    })?,
+                header.height,
+                context.source_name,
+                "embedded JPEG-XL sample dimensions",
+            )?;
+
+            let expected_block_samples = (expected_sample_width as u128)
+                .checked_mul(maximum_height as u128)
+                .ok_or_else(|| {
+                    ImageError::Decode(format!("compressed {context} sample count overflows"))
+                })?;
+            if header.rendered_samples > expected_block_samples {
+                return Err(ImageError::Decode(format!(
+                    "JPEG-XL {context} declares {} rendered samples, exceeding the expected block allocation {expected_block_samples}",
+                    header.rendered_samples
+                )));
+            }
+            Ok(header.rendered_samples)
+        }
+        _ => Ok(0),
+    }
+}
+
+fn validate_dng_lossless_jpeg_sample_count(
+    jpeg_sample_width: usize,
+    jpeg_height: usize,
+    expected_sample_width: usize,
+    minimum_height: usize,
+    maximum_height: usize,
+    context: DngBlockContext<'_>,
+) -> ImageResult<u128> {
+    let declared_samples = (jpeg_sample_width as u128)
+        .checked_mul(jpeg_height as u128)
+        .ok_or_else(|| {
+            ImageError::Decode(format!("lossless-JPEG {context} sample count overflows"))
+        })?;
+    let expected_sample_width = expected_sample_width as u128;
+    let minimum_samples = expected_sample_width
+        .checked_mul(minimum_height as u128)
+        .ok_or_else(|| {
+            ImageError::Decode(format!(
+                "compressed {context} minimum sample count overflows"
+            ))
+        })?;
+    let maximum_samples = expected_sample_width
+        .checked_mul(maximum_height as u128)
+        .ok_or_else(|| {
+            ImageError::Decode(format!(
+                "compressed {context} maximum sample count overflows"
+            ))
+        })?;
+    let contains_complete_destination_rows =
+        expected_sample_width != 0 && declared_samples.is_multiple_of(expected_sample_width);
+
+    if !(minimum_samples..=maximum_samples).contains(&declared_samples)
+        || !contains_complete_destination_rows
+    {
+        return Err(ImageError::Decode(format!(
+            "lossless-JPEG {context} declares {declared_samples} samples ({jpeg_sample_width}x{jpeg_height}); expected {minimum_samples}..={maximum_samples} samples in complete destination rows of {expected_sample_width}"
+        )));
+    }
+
+    Ok(declared_samples)
+}
+
+struct JpegXlHeaderDimensions {
+    width: usize,
+    height: usize,
+    output_channels: usize,
+    rendered_samples: u128,
+}
+
+#[derive(Clone, Copy)]
+struct JpegXlFrameLayout {
+    is_reference_only: bool,
+    x0: i32,
+    y0: i32,
+    width: u32,
+    height: u32,
+}
+
+struct JpegXlPreflightDecoder {
+    uninitialized: Option<UninitializedJxlImage>,
+    image: Option<JxlImage>,
+}
+
+impl JpegXlPreflightDecoder {
+    fn new() -> Self {
+        let uninitialized = JxlImage::builder()
+            .pool(JxlThreadPool::none())
+            .alloc_tracker(AllocTracker::with_limit(
+                JPEG_XL_PREFLIGHT_MAX_TRACKED_ALLOC_BYTES,
+            ))
+            .build_uninit();
+        Self {
+            uninitialized: Some(uninitialized),
+            image: None,
+        }
+    }
+
+    fn feed_codestream(&mut self, bytes: &[u8]) -> jxl_oxide::Result<()> {
+        if let Some(image) = self.image.as_mut() {
+            image.feed_bytes(bytes)?;
+            return Ok(());
+        }
+
+        let mut uninitialized = self
+            .uninitialized
+            .take()
+            .expect("JPEG-XL preflight decoder must have one active state");
+        uninitialized.feed_bytes(bytes)?;
+        match uninitialized.try_init()? {
+            InitializeResult::Initialized(image) => self.image = Some(image),
+            InitializeResult::NeedMoreData(uninitialized) => {
+                self.uninitialized = Some(uninitialized)
+            }
+        }
+        Ok(())
+    }
+
+    fn has_first_keyframe_header(&self) -> bool {
+        self.image
+            .as_ref()
+            .is_some_and(|image| image.frame_header(0).is_some())
+    }
+
+    fn into_image(self) -> Option<JxlImage> {
+        self.image.filter(|image| image.frame_header(0).is_some())
+    }
+}
+
+fn inspect_jpeg_xl_header(
+    payload: &[u8],
+    context: DngBlockContext<'_>,
+) -> ImageResult<JpegXlHeaderDimensions> {
+    let mut container = ContainerParser::new();
+    let mut decoder = JpegXlPreflightDecoder::new();
+    let mut inspected_codestream_bytes = 0usize;
+
+    'container_events: for event in container.feed_bytes(payload) {
+        let event = event
+            .map_err(|e| ImageError::Decode(format!("failed to inspect JPEG-XL {context}: {e}")))?;
+        match event {
+            ParseEvent::BitstreamKind(BitstreamKind::Invalid) => {
+                return Err(ImageError::Decode(format!(
+                    "failed to inspect JPEG-XL {context}: invalid JPEG-XL signature"
+                )));
+            }
+            ParseEvent::Codestream(mut codestream) => {
+                while !codestream.is_empty() {
+                    if inspected_codestream_bytes == JPEG_XL_PREFLIGHT_MAX_CODESTREAM_BYTES {
+                        break 'container_events;
+                    }
+                    let remaining_budget =
+                        JPEG_XL_PREFLIGHT_MAX_CODESTREAM_BYTES - inspected_codestream_bytes;
+                    let chunk_len = codestream
+                        .len()
+                        .min(JPEG_XL_PREFLIGHT_CHUNK_BYTES)
+                        .min(remaining_budget);
+                    let (chunk, remaining) = codestream.split_at(chunk_len);
+                    decoder.feed_codestream(chunk).map_err(|e| {
+                        ImageError::Decode(format!("failed to inspect JPEG-XL {context}: {e}"))
+                    })?;
+                    inspected_codestream_bytes += chunk_len;
+                    codestream = remaining;
+
+                    if decoder.has_first_keyframe_header() {
+                        break 'container_events;
+                    }
+                }
+            }
+            ParseEvent::BitstreamKind(_)
+            | ParseEvent::NoMoreAuxBox
+            | ParseEvent::AuxBoxStart { .. }
+            | ParseEvent::AuxBoxData(..)
+            | ParseEvent::AuxBoxEnd(..) => {}
+        }
+    }
+
+    let image = decoder.into_image().ok_or_else(|| {
+        ImageError::Decode(format!(
+            "failed to inspect JPEG-XL {context}: first keyframe header exceeds the {JPEG_XL_PREFLIGHT_MAX_CODESTREAM_BYTES}-byte codestream inspection budget or is truncated"
+        ))
+    })?;
+
+    let image_header = image.image_header();
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let color_channels = if image_header.metadata.grayscale() {
+        1usize
+    } else {
+        3usize
+    };
+    // `stream_no_alpha`, which rawler uses, emits the base color channels and
+    // one black channel for CMYK, but omits alpha and other auxiliary data.
+    let output_channels = color_channels
+        + usize::from(
+            image_header
+                .metadata
+                .ec_info
+                .iter()
+                .any(|channel| channel.is_black()),
+        );
+
+    let raw_width = image_header.size.width as u128;
+    let raw_height = image_header.size.height as u128;
+    let mut rendered_samples = raw_width
+        .checked_mul(raw_height)
+        .and_then(|pixels| pixels.checked_mul(color_channels as u128))
+        .ok_or_else(|| ImageError::Decode(format!("JPEG-XL {context} sample count overflows")))?;
+    for channel in &image_header.metadata.ec_info {
+        let divisor = 1u128.checked_shl(channel.dim_shift).ok_or_else(|| {
+            ImageError::Decode(format!(
+                "JPEG-XL {context} has invalid extra-channel dimension shift {}",
+                channel.dim_shift
+            ))
+        })?;
+        let channel_width = raw_width.div_ceil(divisor);
+        let channel_height = raw_height.div_ceil(divisor);
+        rendered_samples = rendered_samples
+            .checked_add(channel_width.checked_mul(channel_height).ok_or_else(|| {
+                ImageError::Decode(format!(
+                    "JPEG-XL {context} extra-channel sample count overflows"
+                ))
+            })?)
+            .ok_or_else(|| {
+                ImageError::Decode(format!("JPEG-XL {context} total sample count overflows"))
+            })?;
+    }
+
+    let first_keyframe_index = image
+        .frame_by_keyframe(0)
+        .expect("first keyframe header was checked above")
+        .index();
+    let dependency_frames = (0..first_keyframe_index)
+        .map(|frame_index| {
+            let header = image
+                .frame(frame_index)
+                .expect("frames preceding the first keyframe must be loaded")
+                .header();
+            JpegXlFrameLayout {
+                is_reference_only: !header.frame_type.is_normal_frame()
+                    && !header.frame_type.is_progressive_frame(),
+                x0: header.x0,
+                y0: header.y0,
+                width: header.width,
+                height: header.height,
+            }
+        })
+        .collect::<Vec<_>>();
+    validate_jpeg_xl_dependency_frame_layouts(
+        &dependency_frames,
+        image_header.size.width,
+        image_header.size.height,
+        color_channels + image_header.metadata.ec_info.len(),
+        rendered_samples,
+        context,
+    )?;
+
+    Ok(JpegXlHeaderDimensions {
+        width,
+        height,
+        output_channels,
+        rendered_samples,
+    })
+}
+
+fn validate_jpeg_xl_dependency_frame_layouts(
+    frames: &[JpegXlFrameLayout],
+    canvas_width: u32,
+    canvas_height: u32,
+    allocation_channels: usize,
+    rendered_samples: u128,
+    context: DngBlockContext<'_>,
+) -> ImageResult<()> {
+    let maximum_dependency_samples = rendered_samples
+        .checked_mul(JPEG_XL_PREFLIGHT_MAX_DEPENDENCY_SAMPLE_MULTIPLIER)
+        .ok_or_else(|| {
+            ImageError::Decode(format!(
+                "JPEG-XL {context} dependency sample budget overflows"
+            ))
+        })?;
+    let mut dependency_samples = 0u128;
+
+    for (frame_index, frame) in frames.iter().enumerate() {
+        let (allocation_width, allocation_height) = if frame.is_reference_only {
+            (u128::from(frame.width), u128::from(frame.height))
+        } else {
+            (
+                jpeg_xl_canvas_intersection(frame.x0, frame.width, canvas_width),
+                jpeg_xl_canvas_intersection(frame.y0, frame.height, canvas_height),
+            )
+        };
+        validate_raw_side_limit(
+            allocation_width as usize,
+            allocation_height as usize,
+            context.source_name,
+            "embedded JPEG-XL dependency frame dimensions",
+        )?;
+        let frame_samples = allocation_width
+            .checked_mul(allocation_height)
+            .and_then(|pixels| pixels.checked_mul(allocation_channels as u128))
+            .ok_or_else(|| {
+                ImageError::Decode(format!(
+                    "JPEG-XL {context} dependency frame {frame_index} sample count overflows"
+                ))
+            })?;
+        dependency_samples = dependency_samples
+            .checked_add(frame_samples)
+            .ok_or_else(|| {
+                ImageError::Decode(format!(
+                    "JPEG-XL {context} total dependency sample count overflows"
+                ))
+            })?;
+
+        if dependency_samples > maximum_dependency_samples {
+            return Err(ImageError::Decode(format!(
+                "JPEG-XL {context} dependency frames require {dependency_samples} samples by frame {frame_index}, exceeding the bounded dependency allocation {maximum_dependency_samples}; frame {frame_index} reference-only={}, origin=({}, {}), dimensions={}x{} on a {}x{} canvas",
+                frame.is_reference_only,
+                frame.x0,
+                frame.y0,
+                frame.width,
+                frame.height,
+                canvas_width,
+                canvas_height,
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn jpeg_xl_canvas_intersection(origin: i32, length: u32, canvas_length: u32) -> u128 {
+    let start = i64::from(origin).max(0).min(i64::from(canvas_length));
+    let end = i64::from(origin)
+        .saturating_add(i64::from(length))
+        .max(0)
+        .min(i64::from(canvas_length));
+    end.saturating_sub(start) as u128
+}
+
+fn dng_required_usize_tag<T: rawler::tags::TiffTag>(
+    raw_ifd: &IFD,
+    tag: T,
+    source_name: &str,
+) -> ImageResult<usize> {
+    raw_ifd
+        .get_entry(tag)
+        .map(|entry| entry.force_usize(0))
+        .ok_or_else(|| {
+            ImageError::Decode(format!(
+                "compressed DNG image '{source_name}' is missing a required TIFF tag"
+            ))
+        })
+}
+
 fn padded_dng_dimension(
     dimension: usize,
     tile_dimension: usize,
@@ -593,63 +1351,41 @@ fn validate_raw_sample_allocation(
     )?;
 
     let samples = (sample_width as u128) * (sample_height as u128);
-    if samples > RAW_MAX_PIXELS {
+    if samples > RAW_MAX_DECODED_SAMPLES {
         return Err(ImageError::Decode(format!(
-            "RAW image '{source_name}' is too large to decode safely: decoded sample allocation {sample_width}x{sample_height} exceeds {RAW_MAX_PIXELS} samples"
+            "RAW image '{source_name}' is too large to decode safely: decoded sample allocation {sample_width}x{sample_height} exceeds {RAW_MAX_DECODED_SAMPLES} samples"
         )));
     }
 
     Ok(())
 }
 
-/// CR3/CRM preflight. rawler's crx decompressor sizes its output and line
-/// buffers straight from the CMP1 box's `f_width`/`f_height` with no
-/// internal cap (unlike the `alloc_image!` guards in most other decode
-/// paths), so a crafted CMP1 can request an arbitrarily large allocation —
-/// and an allocation failure aborts the process, which `catch_unwind`
-/// cannot intercept. Parse the same box tree rawler's Cr3Decoder navigates
-/// and validate every CMP1 before any pixel decode. The decoder format is
-/// already known by the time this runs, so a second parse failure is treated
-/// as a validation failure rather than allowing the decode to proceed.
-fn validate_cr3_raw_candidate_dimensions(source: &RawSource, source_name: &str) -> ImageResult<()> {
-    let bmff = Bmff::new(&mut source.reader()).map_err(|e| {
-        ImageError::Decode(format!(
-            "failed to inspect CR3 dimensions for '{source_name}': {e}"
-        ))
-    })?;
-
-    for trak in &bmff.filebox.moov.traks {
-        if let Some(craw) = &trak.mdia.minf.stbl.stsd.craw
-            && let Some(cmp1) = &craw.cmp1
-        {
-            validate_raw_dimensions(cmp1.f_width as usize, cmp1.f_height as usize, source_name)?;
-        }
-    }
-
-    Ok(())
-}
-
+#[cfg(test)]
 fn validate_tiff_raw_candidate_dimensions(
     source: &RawSource,
     source_name: &str,
 ) -> ImageResult<()> {
+    for (width, height) in tiff_raw_candidate_dimensions(source) {
+        validate_raw_dimensions(width, height, source_name)?;
+    }
+    Ok(())
+}
+
+fn tiff_raw_candidate_dimensions(source: &RawSource) -> Vec<(usize, usize)> {
     let mut reader = source.reader();
     let tiff = match GenericTiffReader::new(&mut reader, 0, 0, None, &[]) {
         Ok(tiff) => tiff,
-        Err(_) => return Ok(()),
+        Err(_) => return Vec::new(),
     };
 
-    for ifd in tiff.find_ifds_with_filter(|ifd| {
+    tiff.find_ifds_with_filter(|ifd| {
         raw_dimensions_from_ifd(ifd).is_some()
             && (ifd.has_entry(RawTiffCommonTag::StripOffsets)
                 || ifd.has_entry(RawTiffCommonTag::TileOffsets))
-    }) {
-        if let Some((width, height)) = raw_dimensions_from_ifd(ifd) {
-            validate_raw_dimensions(width, height, source_name)?;
-        }
-    }
-
-    Ok(())
+    })
+    .into_iter()
+    .filter_map(raw_dimensions_from_ifd)
+    .collect()
 }
 
 fn raw_dimensions_from_ifd(ifd: &IFD) -> Option<(usize, usize)> {
@@ -699,6 +1435,19 @@ fn validate_raw_input_size(input_bytes: u64, source_name: &str) -> ImageResult<(
 }
 
 fn validate_raw_dimensions(width: usize, height: usize, source_name: &str) -> ImageResult<()> {
+    if raw_dimensions_require_preview(width, height, source_name)? {
+        return Err(ImageError::Decode(format!(
+            "RAW image '{source_name}' is too large to develop safely: {width}x{height} exceeds {RAW_MAX_DEVELOPMENT_PIXELS} pixels"
+        )));
+    }
+    Ok(())
+}
+
+fn raw_dimensions_require_preview(
+    width: usize,
+    height: usize,
+    source_name: &str,
+) -> ImageResult<bool> {
     if width == 0 || height == 0 {
         return Err(ImageError::Decode(format!(
             "RAW image '{source_name}' decoded to invalid dimensions {width}x{height}"
@@ -707,13 +1456,7 @@ fn validate_raw_dimensions(width: usize, height: usize, source_name: &str) -> Im
     validate_raw_side_limit(width, height, source_name, "dimensions")?;
 
     let pixels = (width as u128) * (height as u128);
-    if pixels > RAW_MAX_PIXELS {
-        return Err(ImageError::Decode(format!(
-            "RAW image '{source_name}' is too large to decode safely: {width}x{height} exceeds {RAW_MAX_PIXELS} pixels"
-        )));
-    }
-
-    Ok(())
+    Ok(pixels > RAW_MAX_DEVELOPMENT_PIXELS)
 }
 
 fn validate_raw_side_limit(
@@ -1190,22 +1933,23 @@ mod tests {
     use image::hooks::decoding_hook_registered;
     use image::{
         ColorType, ImageEncoder, ImageFormat,
-        codecs::{png::PngEncoder, tiff::TiffEncoder},
+        codecs::{jpeg::JpegEncoder, png::PngEncoder, tiff::TiffEncoder},
     };
     use moxcms::ColorProfile;
     use rawler::{
-        decoders::{FormatHint as RawFormatHint, Orientation as RawOrientation},
+        decoders::Orientation as RawOrientation,
         formats::tiff::{GenericTiffReader, reader::TiffReader},
         rawsource::RawSource,
     };
 
     use super::{
-        ImageResult, bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic,
-        decode_image_from_bytes, decode_image_from_path, init_image_decoders,
-        path_extension_is_raw, raw_orientation_to_exif, should_attempt_tiff_fallback,
-        validate_cr3_raw_candidate_dimensions, validate_dng_raw_ifd_allocation,
-        validate_raw_candidate_dimensions_for_format, validate_raw_dimensions,
-        validate_tiff_raw_candidate_dimensions,
+        DngBlockContext, ImageResult, JpegXlFrameLayout, bytes_look_like_heif, bytes_look_like_raw,
+        catch_raw_decode_panic, decode_image_from_bytes, decode_image_from_path,
+        init_image_decoders, path_extension_is_raw, raw_dimensions_require_preview,
+        raw_orientation_to_exif, raw_preview_dimensions_are_eligible, should_attempt_tiff_fallback,
+        validate_dng_embedded_codec_dimensions, validate_dng_lossless_jpeg_sample_count,
+        validate_dng_raw_ifd_allocation, validate_jpeg_xl_dependency_frame_layouts,
+        validate_raw_dimensions, validate_tiff_raw_candidate_dimensions,
     };
 
     #[test]
@@ -1318,7 +2062,7 @@ mod tests {
             .expect_err("oversized TIFF RAW candidate should fail before decode");
 
         assert!(error.to_string().contains("50000x4001"));
-        assert!(error.to_string().contains("exceeds 200000000 pixels"));
+        assert!(error.to_string().contains("exceeds 36000000 pixels"));
     }
 
     #[test]
@@ -1357,6 +2101,176 @@ mod tests {
         assert!(error.to_string().contains("exceeds 200000000 samples"));
     }
 
+    #[test]
+    fn accepts_matching_lossless_jpeg_dng_strip_dimensions() {
+        let jpeg = synthetic_lossless_jpeg_header(8, 4);
+        let encoded = minimal_dng_with_single_strip_payload(8, 4, 4, 1, 7, &jpeg);
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "matching.dng")
+            .expect("matching embedded lossless-JPEG dimensions should pass preflight");
+    }
+
+    #[test]
+    fn accepts_reshaped_lossless_jpeg_dng_tile_samples() {
+        // DNG permits the JPEG axes to differ from the tile axes when their
+        // total sample counts match. rawler flattens this 4x8 JPEG buffer and
+        // rechunks its 32 samples into four destination rows of eight.
+        let jpeg = synthetic_lossless_jpeg_header(4, 8);
+        let encoded = minimal_dng_with_single_tile_payload(8, 4, 8, 4, 1, 7, &jpeg);
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "reshaped.dng")
+            .expect("reshaped lossless-JPEG samples should pass preflight");
+    }
+
+    #[test]
+    fn rejects_lossless_jpeg_samples_not_aligned_to_destination_rows() {
+        let context = DngBlockContext::new("strip", 1, "partial-row.dng");
+        let error = validate_dng_lossless_jpeg_sample_count(5, 4, 8, 2, 4, context)
+            .expect_err("partial destination rows should fail preflight");
+
+        assert!(error.to_string().contains("declares 20 samples (5x4)"));
+        assert!(error.to_string().contains("complete destination rows of 8"));
+    }
+
+    #[test]
+    fn rejects_oversized_lossless_jpeg_dng_tile_dimensions_before_decode() {
+        // The TIFF allocation is only 1x1, while the embedded SOF advertises
+        // a multi-gigabyte 50,000x50,000 u16 image. Header inspection must
+        // reject it without constructing rawler's payload-sized PixU16.
+        let jpeg = synthetic_lossless_jpeg_header(50_000, 50_000);
+        let encoded = minimal_dng_with_single_tile_payload(1, 1, 1, 1, 1, 7, &jpeg);
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        let error =
+            validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "embedded-huge.dng")
+                .expect_err("embedded lossless-JPEG dimensions should be checked before decode");
+
+        assert!(
+            error
+                .to_string()
+                .contains("declares 2500000000 samples (50000x50000)")
+        );
+        assert!(error.to_string().contains("expected 1..=1 samples"));
+    }
+
+    #[test]
+    fn rejects_unparseable_jpeg_xl_dng_payload_before_decode() {
+        let encoded = minimal_dng_with_single_tile_payload(
+            1,
+            1,
+            1,
+            1,
+            1,
+            52_546,
+            b"not a JPEG-XL codestream",
+        );
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        let error =
+            validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "invalid-jxl.dng")
+                .expect_err("invalid JPEG-XL headers should fail closed before decode");
+
+        assert!(error.to_string().contains("failed to inspect JPEG-XL"));
+    }
+
+    #[test]
+    fn accepts_matching_jpeg_xl_dng_tile_dimensions() {
+        let encoded =
+            minimal_dng_with_single_tile_payload(2, 2, 2, 2, 3, 52_546, tiny_rgb_jpeg_xl());
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "matching-jxl.dng")
+            .expect("matching embedded JPEG-XL dimensions should pass preflight");
+    }
+
+    #[test]
+    fn accepts_jpeg_xl_container_with_large_leading_metadata() {
+        let payload =
+            jpeg_xl_container_with_leading_metadata(tiny_rgb_jpeg_xl(), 1024 * 1024 + 4096);
+        jxl_oxide::JxlImage::builder()
+            .read(Cursor::new(&payload))
+            .expect("the underlying decoder should accept the metadata-bearing container");
+        let encoded = minimal_dng_with_single_tile_payload(2, 2, 2, 2, 3, 52_546, &payload);
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "container-metadata.dng")
+            .expect("container metadata should not consume the codestream inspection budget");
+    }
+
+    #[test]
+    fn accepts_progressive_dc_jpeg_xl_dependencies() {
+        let payload = progressive_dc_jpeg_xl();
+        let image = jxl_oxide::JxlImage::builder()
+            .read(Cursor::new(&payload))
+            .expect("progressive fixture should decode");
+        assert!(
+            !image
+                .frame(0)
+                .unwrap()
+                .header()
+                .frame_type
+                .is_normal_frame()
+        );
+        assert_eq!(image.frame_by_keyframe(0).unwrap().index(), 2);
+
+        let encoded = minimal_dng_with_single_tile_payload(32, 32, 32, 32, 3, 52_546, &payload);
+        let tiff = parse_tiff(&encoded);
+        let source = RawSource::new_from_slice(&encoded);
+
+        validate_dng_embedded_codec_dimensions(tiff.root_ifd(), &source, "progressive-dc.dng")
+            .expect("bounded LF dependency frames should pass JPEG-XL preflight");
+    }
+
+    #[test]
+    fn rejects_oversized_reference_only_jpeg_xl_dependency_before_decode() {
+        let error = validate_jpeg_xl_dependency_frame_layouts(
+            &[JpegXlFrameLayout {
+                is_reference_only: true,
+                x0: 0,
+                y0: 0,
+                width: 50_000,
+                height: 50_000,
+            }],
+            2,
+            2,
+            3,
+            12,
+            DngBlockContext::new("tile", 0, "referenced-frame.dng"),
+        )
+        .expect_err("a leading reference-only frame should fail preflight");
+
+        assert!(error.to_string().contains("dependency frames require"));
+        assert!(error.to_string().contains("reference-only=true"));
+        assert!(error.to_string().contains("dimensions=50000x50000"));
+    }
+
+    #[test]
+    fn bounds_cropped_jpeg_xl_dependencies_by_the_rendered_canvas_intersection() {
+        validate_jpeg_xl_dependency_frame_layouts(
+            &[JpegXlFrameLayout {
+                is_reference_only: false,
+                x0: -50_000,
+                y0: 0,
+                width: 50_002,
+                height: 2,
+            }],
+            2,
+            2,
+            3,
+            12,
+            DngBlockContext::new("tile", 0, "cropped.dng"),
+        )
+        .expect("non-reference frames render only their intersection with the canvas");
+    }
+
     fn minimal_tiff_with_raw_candidate_dimensions(width: u32, height: u32) -> Vec<u8> {
         minimal_tiff_with_long_entries(&[(0x0100, width), (0x0101, height), (0x0111, 0)])
     }
@@ -1373,6 +2287,163 @@ mod tests {
         encoded
     }
 
+    fn minimal_dng_with_single_strip_payload(
+        width: u32,
+        height: u32,
+        rows_per_strip: u32,
+        samples_per_pixel: u16,
+        compression: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 7;
+        let payload_offset = 8 + 2 + usize::from(ENTRY_COUNT) * 12 + 4;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"II*\0");
+        encoded.extend_from_slice(&8u32.to_le_bytes());
+        encoded.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+        append_tiff_long(&mut encoded, 0x0100, width); // ImageWidth
+        append_tiff_long(&mut encoded, 0x0101, height); // ImageLength
+        append_tiff_short(&mut encoded, 0x0103, compression); // Compression
+        append_tiff_long(&mut encoded, 0x0111, payload_offset as u32); // StripOffsets
+        append_tiff_short(&mut encoded, 0x0115, samples_per_pixel); // SamplesPerPixel
+        append_tiff_long(&mut encoded, 0x0116, rows_per_strip); // RowsPerStrip
+        append_tiff_long(&mut encoded, 0x0117, payload.len() as u32); // StripByteCounts
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(encoded.len(), payload_offset);
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn minimal_dng_with_single_tile_payload(
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        samples_per_pixel: u16,
+        compression: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 8;
+        let payload_offset = 8 + 2 + usize::from(ENTRY_COUNT) * 12 + 4;
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(b"II*\0");
+        encoded.extend_from_slice(&8u32.to_le_bytes());
+        encoded.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+        append_tiff_long(&mut encoded, 0x0100, width); // ImageWidth
+        append_tiff_long(&mut encoded, 0x0101, height); // ImageLength
+        append_tiff_short(&mut encoded, 0x0103, compression); // Compression
+        append_tiff_short(&mut encoded, 0x0115, samples_per_pixel); // SamplesPerPixel
+        append_tiff_long(&mut encoded, 0x0142, tile_width); // TileWidth
+        append_tiff_long(&mut encoded, 0x0143, tile_height); // TileLength
+        append_tiff_long(&mut encoded, 0x0144, payload_offset as u32); // TileOffsets
+        append_tiff_long(&mut encoded, 0x0145, payload.len() as u32); // TileByteCounts
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(encoded.len(), payload_offset);
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    fn synthetic_lossless_jpeg_header(width: u16, height: u16) -> Vec<u8> {
+        let mut jpeg = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xC3]); // SOF3
+        jpeg.extend_from_slice(&11u16.to_be_bytes());
+        jpeg.push(12); // precision
+        jpeg.extend_from_slice(&height.to_be_bytes());
+        jpeg.extend_from_slice(&width.to_be_bytes());
+        jpeg.push(1); // component count
+        jpeg.extend_from_slice(&[1, 0x11, 0]); // id, sampling, quantization table
+
+        jpeg.extend_from_slice(&[0xFF, 0xC4]); // DHT
+        jpeg.extend_from_slice(&20u16.to_be_bytes());
+        jpeg.push(0); // DC table 0
+        jpeg.push(1); // one one-bit code
+        jpeg.extend_from_slice(&[0; 15]);
+        jpeg.push(0); // Huffman value
+
+        jpeg.extend_from_slice(&[0xFF, 0xDA]); // SOS
+        jpeg.extend_from_slice(&8u16.to_be_bytes());
+        jpeg.extend_from_slice(&[1, 1, 0]); // component count, id, table
+        jpeg.extend_from_slice(&[1, 0, 0]); // predictor, Se/Ah, point transform
+        jpeg
+    }
+
+    fn tiny_rgb_jpeg_xl() -> &'static [u8] {
+        // A lossless 2x2 black RGB codestream generated by cjxl 0.11.1.
+        &[
+            0xff, 0x0a, 0x08, 0x10, 0x10, 0x09, 0x08, 0x02, 0x01, 0x00, 0x8c, 0x02, 0x4b, 0x18,
+            0x9b, 0x9c, 0x71, 0x84, 0x03, 0x38, 0x80, 0x03, 0x38, 0x20, 0x4a, 0xc0, 0x39, 0x05,
+            0x01, 0x00, 0x20, 0x44, 0x80, 0x08, 0x10, 0x01, 0x22, 0x40, 0x84, 0xff, 0xf7, 0xef,
+            0xf9, 0xef, 0xa1, 0x31, 0xe7, 0x9c, 0x6b, 0xed, 0x73, 0x6f, 0x92, 0x24, 0x09, 0x01,
+            0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0xff, 0xff, 0xff, 0x73, 0xef, 0xeb, 0xee, 0xee,
+            0xee, 0x86, 0xff, 0xf7, 0xef, 0xf9, 0xef, 0xa1, 0x31, 0xe7, 0x9c, 0x6b, 0xed, 0x73,
+            0x6f, 0x92, 0x24, 0x09, 0x01, 0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0xff, 0xff, 0xff,
+            0x73, 0xef, 0xeb, 0xee, 0xee, 0xee, 0x86, 0xff, 0xf7, 0xef, 0xf9, 0xef, 0xa1, 0x31,
+            0xe7, 0x9c, 0x6b, 0xed, 0x73, 0x6f, 0x92, 0x24, 0x09, 0x01, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0xd5, 0xff, 0xff, 0xff, 0x73, 0xef, 0xeb, 0xee, 0xee, 0xee, 0x86, 0xff, 0xf7,
+            0xef, 0xf9, 0xef, 0xa1, 0x31, 0xe7, 0x9c, 0x6b, 0xed, 0x73, 0x6f, 0x92, 0x24, 0x09,
+            0x01, 0x55, 0x55, 0x55, 0x55, 0x55, 0xd5, 0xff, 0xff, 0xff, 0x73, 0xef, 0xeb, 0xee,
+            0xee, 0xee, 0x3e, 0x00, 0x00, 0x00, 0x00,
+        ]
+    }
+
+    fn progressive_dc_jpeg_xl() -> Vec<u8> {
+        // A 32x32 RGB gradient encoded by cjxl 0.11.1 with
+        // --progressive_dc=2 --progressive_ac --container=0. It contains two
+        // LF dependency frames before the first displayed keyframe.
+        decode_hex(concat!(
+            "ff0a47060a2a1805005c00000000000000000030005000504a2834226e3a",
+            "0040249ca6619fac3b193de2c3a460040000acc000504204704032104c10",
+            "64106cfeffea030050a132cab8c1cbb99e2f3f74584cdbb8ced056db1696",
+            "24422924b146030834024333280c4d554d494d4586a6aaa6a4a622435355",
+            "53525391a1a9aa29a9a9c8d054d594d4546468aa6a4a6a2a323455352535",
+            "15199aaa9a929a8a0c4d554d494d4586a6aaa6a4a62243535553525391a1",
+            "a9aa29a9a9c8d054d594d4546468aa6a4a6a2a32345535253515199aaa9a",
+            "929a8a0c4d554d494d454a120b83736c604a46cb5f3c5c4962558276def2",
+            "cb46197c921fa428a4701bfac66c6e98553a643430e44931d9449804c18d",
+            "d68f926a7462b19f82bbb0e7929cac33e626a883d263685da269d7720600",
+            "3e60a7016a00089bdeb5033f3914b5a8790ae23bd8dede0e286ad7cafe1c",
+            "ef4d7ddb2fa32dc77eb66399c58870d74f9dadf439f0df04d8f8dc59c175",
+            "e1927752c5be808c0ff2afe2b1abef0329000c94a1f2d83d0397049a8911",
+            "ec22e87e91e8f38f52df1edf9c74939ce48ac705e3d2e9e2660e3f1afb56",
+            "ac1218807c3452b61e936bfa0586e97723d04ac4b64aa88beb74f0e4d9be",
+            "e72ad03ff3070ce79b47c4472e9f7605db9062cf534060ccdfa7025e7140",
+            "4981ab54782e97312d06eab15681943200e0c3a460842800904001640006",
+            "2c0002b59f200000152aa38c1bbc9cebf9f24387c5b48deb0c6db56d6149",
+            "22944212891a10450330fe050000952492d0f327bbf7d7a8084d49e200f1",
+            "363f45210566ab1809879fe369cf77aff67e9f2ab345d57399a91106e892",
+            "b100400f00000bd8036800a4000ca250ea5bdb238062",
+        ))
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert!(hex.len().is_multiple_of(2));
+        (0..hex.len())
+            .step_by(2)
+            .map(|offset| u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn jpeg_xl_container_with_leading_metadata(
+        codestream: &[u8],
+        metadata_bytes: usize,
+    ) -> Vec<u8> {
+        let mut container = Vec::new();
+        container.extend_from_slice(b"\0\0\0\x0cJXL \r\n\x87\n");
+        append_jpeg_xl_box(&mut container, b"ftyp", b"jxl \0\0\0\0jxl ");
+        append_jpeg_xl_box(&mut container, b"Exif", &vec![0; metadata_bytes]);
+        append_jpeg_xl_box(&mut container, b"jxlc", codestream);
+        container
+    }
+
+    fn append_jpeg_xl_box(container: &mut Vec<u8>, box_type: &[u8; 4], payload: &[u8]) {
+        let box_size = u32::try_from(8 + payload.len()).expect("test box must fit in u32");
+        container.extend_from_slice(&box_size.to_be_bytes());
+        container.extend_from_slice(box_type);
+        container.extend_from_slice(payload);
+    }
+
     fn parse_tiff(encoded: &[u8]) -> GenericTiffReader {
         GenericTiffReader::new(&mut Cursor::new(encoded), 0, 0, None, &[])
             .expect("synthetic TIFF should parse")
@@ -1385,152 +2456,105 @@ mod tests {
         encoded.extend_from_slice(&value.to_le_bytes());
     }
 
-    #[test]
-    fn rejects_oversized_cr3_candidate_from_cmp1_dimensions() {
-        let encoded = synthetic_cr3_with_cmp1_dimensions(50_000, 5_000);
-        let source = RawSource::new_from_slice(&encoded);
-
-        let error = validate_cr3_raw_candidate_dimensions(&source, "huge.cr3")
-            .expect_err("oversized CR3 CMP1 dimensions should fail before decode");
-
-        assert!(error.to_string().contains("50000x5000"));
-        assert!(error.to_string().contains("exceeds 200000000 pixels"));
-    }
-
-    #[test]
-    fn rejects_cr3_extreme_aspect_ratio_before_line_buffer_allocation() {
-        let encoded = synthetic_cr3_with_cmp1_dimensions(100_000_000, 2);
-        let source = RawSource::new_from_slice(&encoded);
-
-        let error = validate_cr3_raw_candidate_dimensions(&source, "extreme-width.cr3")
-            .expect_err("extreme CR3 sides should fail before line-buffer allocation");
-
-        assert!(error.to_string().contains("100000000x2"));
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds maximum side length 50000")
-        );
+    fn append_tiff_short(encoded: &mut Vec<u8>, tag: u16, value: u16) {
+        encoded.extend_from_slice(&tag.to_le_bytes());
+        encoded.extend_from_slice(&3u16.to_le_bytes());
+        encoded.extend_from_slice(&1u32.to_le_bytes());
+        encoded.extend_from_slice(&value.to_le_bytes());
+        encoded.extend_from_slice(&0u16.to_le_bytes());
     }
 
     #[test]
     fn accepts_raw_dimensions_at_maximum_side_length() {
-        validate_raw_dimensions(50_000, 4_000, "boundary.raw")
-            .expect("the rawler-compatible side limit should be inclusive");
+        validate_raw_dimensions(50_000, 720, "boundary.raw")
+            .expect("the side and 36MP limits should both be inclusive");
     }
 
     #[test]
-    fn accepts_cr3_candidate_with_sane_cmp1_dimensions() {
-        let encoded = synthetic_cr3_with_cmp1_dimensions(6000, 4000);
-        let source = RawSource::new_from_slice(&encoded);
-
-        validate_cr3_raw_candidate_dimensions(&source, "ok.cr3")
-            .expect("sane CMP1 dimensions should pass the preflight");
+    fn raw_development_limit_is_exactly_36_megapixels() {
+        assert!(!raw_dimensions_require_preview(6000, 6000, "boundary.raw").unwrap());
+        assert!(raw_dimensions_require_preview(6001, 6000, "oversized.raw").unwrap());
     }
 
     #[test]
-    fn cr3_dimension_guard_rejects_unparseable_bmff() {
-        let source = RawSource::new_from_slice(b"\0\0\0\x18ftypcrx garbage");
+    fn raw_preview_requires_full_hd_short_edge() {
+        assert!(raw_preview_dimensions_are_eligible(1920, 1080));
+        assert!(raw_preview_dimensions_are_eligible(1080, 1920));
+        assert!(!raw_preview_dimensions_are_eligible(1920, 1079));
+    }
 
-        let error = validate_cr3_raw_candidate_dimensions(&source, "junk.cr3")
-            .expect_err("recognized CR3 inputs should fail closed when reparsing fails");
+    #[test]
+    fn raw_preview_limit_is_exactly_200_megapixels() {
+        assert!(raw_preview_dimensions_are_eligible(20_000, 10_000));
+        assert!(!raw_preview_dimensions_are_eligible(20_001, 10_000));
+    }
 
+    #[test]
+    fn oversized_dng_applies_embedded_preview_icc_profile_without_raw_decode() {
+        let preview_width = 1920;
+        let preview_height = 1080;
+        let display_p3_icc = ColorProfile::new_display_p3().encode().unwrap();
+        let preview_pixel = [128, 0, 0];
+        let preview_pixels = preview_pixel
+            .into_iter()
+            .cycle()
+            .take((preview_width * preview_height * 3) as usize)
+            .collect::<Vec<_>>();
+        let mut jpeg = Vec::new();
+        let mut jpeg_encoder = JpegEncoder::new_with_quality(&mut jpeg, 100);
+        jpeg_encoder.set_icc_profile(display_p3_icc).unwrap();
+        jpeg_encoder
+            .write_image(
+                &preview_pixels,
+                preview_width,
+                preview_height,
+                ColorType::Rgb8.into(),
+            )
+            .unwrap();
+        let expected_preview = decode_image_from_bytes(&jpeg).unwrap();
         assert!(
-            error
-                .to_string()
-                .contains("failed to inspect CR3 dimensions")
+            expected_preview.rgb[0] > preview_pixel[0],
+            "test profile should visibly move the red channel into sRGB"
         );
-    }
 
-    #[test]
-    fn rejects_oversized_cr3_with_box_before_ftyp() {
-        let mut encoded = bmff_box(b"free", &[]);
-        encoded.extend_from_slice(&synthetic_cr3_with_cmp1_dimensions(50_000, 5_000));
-        assert_eq!(&encoded[4..8], b"free");
-        let source = RawSource::new_from_slice(&encoded);
+        let root_entry_count = 7_u16;
+        let preview_entry_count = 6_u16;
+        let preview_ifd_offset = 8 + 2 + u32::from(root_entry_count) * 12 + 4;
+        let jpeg_offset = preview_ifd_offset + 2 + u32::from(preview_entry_count) * 12 + 4;
+        let mut dng = Vec::new();
+        dng.extend_from_slice(b"II*\0");
+        dng.extend_from_slice(&8_u32.to_le_bytes());
+        dng.extend_from_slice(&root_entry_count.to_le_bytes());
+        append_tiff_long(&mut dng, 0x0100, 6001); // ImageWidth
+        append_tiff_long(&mut dng, 0x0101, 6000); // ImageLength: 36,006,000 px
+        append_tiff_short(&mut dng, 0x0102, 16); // BitsPerSample
+        append_tiff_short(&mut dng, 0x0103, 1); // Compression
+        append_tiff_short(&mut dng, 0x0106, 32_803); // CFA photometric
+        append_tiff_long(&mut dng, 0x014a, preview_ifd_offset); // SubIFDs
+        dng.extend_from_slice(&0xc612_u16.to_le_bytes()); // DNGVersion
+        dng.extend_from_slice(&1_u16.to_le_bytes()); // BYTE
+        dng.extend_from_slice(&4_u32.to_le_bytes());
+        dng.extend_from_slice(&[1, 4, 0, 0]);
+        dng.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(dng.len(), preview_ifd_offset as usize);
 
-        let error = validate_raw_candidate_dimensions_for_format(
-            RawFormatHint::CR3,
-            &source,
-            "leading-box.cr3",
-        )
-        .expect_err("CR3 preflight should not require ftyp to be the first box");
+        dng.extend_from_slice(&preview_entry_count.to_le_bytes());
+        append_tiff_long(&mut dng, 0x00fe, 1); // reduced-resolution image
+        append_tiff_long(&mut dng, 0x0100, preview_width);
+        append_tiff_long(&mut dng, 0x0101, preview_height);
+        append_tiff_short(&mut dng, 0x0103, 7); // JPEG compression
+        append_tiff_long(&mut dng, 0x0201, jpeg_offset);
+        append_tiff_long(&mut dng, 0x0202, jpeg.len() as u32);
+        dng.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(dng.len(), jpeg_offset as usize);
+        dng.extend_from_slice(&jpeg);
 
-        assert!(error.to_string().contains("50000x5000"));
-        assert!(error.to_string().contains("exceeds 200000000 pixels"));
-    }
-
-    /// Minimal BMFF tree that rawler's parser accepts: every box rawler
-    /// requires along the path to the CMP1 box, with zeroed filler for the
-    /// fields the parsers read but this test doesn't care about.
-    fn synthetic_cr3_with_cmp1_dimensions(width: u32, height: u32) -> Vec<u8> {
-        // CMP1 payload (36 bytes); ext_header stays 0 so the CRM movie
-        // branch in rawler's parser is skipped.
-        let mut cmp1 = Vec::new();
-        cmp1.extend_from_slice(&0i16.to_be_bytes()); // unknown1
-        cmp1.extend_from_slice(&0u16.to_be_bytes()); // header_size
-        cmp1.extend_from_slice(&0u16.to_be_bytes()); // version
-        cmp1.extend_from_slice(&0u16.to_be_bytes()); // version_sub
-        cmp1.extend_from_slice(&width.to_be_bytes()); // f_width
-        cmp1.extend_from_slice(&height.to_be_bytes()); // f_height
-        cmp1.extend_from_slice(&width.to_be_bytes()); // tile_width
-        cmp1.extend_from_slice(&height.to_be_bytes()); // tile_height
-        cmp1.push(14); // n_bits
-        cmp1.push(0x40); // n_planes = 4, cfa_layout = 0
-        cmp1.push(0x03); // enc_type = 0, image_levels = 3
-        cmp1.push(0); // tile flags
-        cmp1.extend_from_slice(&0u32.to_be_bytes()); // mdat_hdr_size
-        cmp1.extend_from_slice(&0u32.to_be_bytes()); // ext_header
-
-        // CRAW sample entry: 82 bytes of fixed fields, then child boxes.
-        let mut craw = vec![0u8; 82];
-        craw.extend_from_slice(&bmff_box(b"CMP1", &cmp1));
-
-        let mut stsd = Vec::new();
-        stsd.extend_from_slice(&0u32.to_be_bytes()); // version + flags
-        stsd.extend_from_slice(&1u32.to_be_bytes()); // entry_count
-        stsd.extend_from_slice(&bmff_box(b"CRAW", &craw));
-
-        let mut stbl = Vec::new();
-        stbl.extend_from_slice(&bmff_box(b"stsd", &stsd));
-        stbl.extend_from_slice(&bmff_box(b"stts", &[0u8; 8]));
-        stbl.extend_from_slice(&bmff_box(b"stsc", &[0u8; 8]));
-        stbl.extend_from_slice(&bmff_box(b"stsz", &[0u8; 12]));
-
-        let mut minf = Vec::new();
-        minf.extend_from_slice(&bmff_box(b"dinf", &[]));
-        minf.extend_from_slice(&bmff_box(b"stbl", &stbl));
-
-        let mut mdia = Vec::new();
-        mdia.extend_from_slice(&bmff_box(b"mdhd", &[0u8; 24]));
-        mdia.extend_from_slice(&bmff_box(b"hdlr", &[0u8; 4]));
-        mdia.extend_from_slice(&bmff_box(b"minf", &minf));
-
-        let mut trak = Vec::new();
-        trak.extend_from_slice(&bmff_box(b"tkhd", &[0u8; 4]));
-        trak.extend_from_slice(&bmff_box(b"mdia", &mdia));
-
-        let mut moov = Vec::new();
-        moov.extend_from_slice(&bmff_box(b"mvhd", &[0u8; 20]));
-        moov.extend_from_slice(&bmff_box(b"trak", &trak));
-
-        let mut ftyp = Vec::new();
-        ftyp.extend_from_slice(b"crx "); // major brand
-        ftyp.extend_from_slice(&0u32.to_be_bytes()); // minor version
-
-        let mut file = Vec::new();
-        file.extend_from_slice(&bmff_box(b"ftyp", &ftyp));
-        file.extend_from_slice(&bmff_box(b"moov", &moov));
-        file.extend_from_slice(&bmff_box(b"mdat", &[]));
-        file
-    }
-
-    fn bmff_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        let mut encoded = Vec::with_capacity(8 + payload.len());
-        encoded.extend_from_slice(&(8 + payload.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(fourcc);
-        encoded.extend_from_slice(payload);
-        encoded
+        let decoded = decode_image_from_bytes(&dng).expect("eligible preview should be returned");
+        assert_eq!(
+            (decoded.dimensions.width, decoded.dimensions.height),
+            (1920, 1080)
+        );
+        assert_eq!(&decoded.rgb[..3], &expected_preview.rgb[..3]);
     }
 
     #[test]

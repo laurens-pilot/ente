@@ -5,16 +5,15 @@ edition = "2024"
 [dependencies]
 fast_image_resize = { version = "5.5.0", features = ["image"] }
 image = { version = "0.25.10", default-features = true }
+jxl-bitstream = "=1.1.0"
 jxl-oxide = { version = "0.12.6", features = ["image"] }
 kamadak-exif = "0.6.1"
 ente_heic = { package = "heic_decoder", git = "https://github.com/ente/heic-decoder.git", rev = "3fd83f1c1f0c88b8c4b511355b4041c7bb2d393b", features = [
     "image-integration",
 ] }
-moxcms = "0.8.1"
-# Pinned exactly: decode.rs mirrors 0.7.2 internals — the TIFF camera-marker
-# pre-screen tracks get_decoder's dispatch tags, and orientation is read via
-# raw_metadata because RawImage::orientation is hardcoded upstream except for
-# DNG/QTK. Re-verify both (and the RAW routing tests) when bumping.
-rawler = "=0.7.2"
+moxcms = { version = "0.8.1", features = ["in_place"] }
+# Temporary local fork: adds allocation-free embedded JPEG discovery and RAW
+# dimension inspection needed by the 36MP development/preview fallback policy.
+rawler = { path = "/Users/laurens/dev/other_ente/dnglab/rawler" }
 thiserror.workspace = true
 tiff = "0.10.3"
