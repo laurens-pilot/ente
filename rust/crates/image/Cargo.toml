@@ -12,8 +12,8 @@ ente_heic = { package = "heic_decoder", git = "https://github.com/ente/heic-deco
     "image-integration",
 ] }
 moxcms = { version = "0.8.1", features = ["in_place"] }
-# Temporary local fork: adds allocation-free embedded JPEG discovery and RAW
-# dimension inspection needed by the 36MP development/preview fallback policy.
-rawler = { path = "/Users/laurens/dev/other_ente/dnglab/rawler" }
+# Fork `main`: adds embedded JPEG/dimension inspection and the owned RGB8 path
+# needed by the 54MP development/preview fallback policy.
+rawler = { git = "https://github.com/laurens-pilot/dnglab.git", rev = "49cc3f608254057282e1416b12cc8cf9cef51faa" }
 thiserror.workspace = true
 tiff = "0.10.3"

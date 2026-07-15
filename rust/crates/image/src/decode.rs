@@ -17,7 +17,8 @@ use ente_heic::{
 };
 use exif::{In, Reader as ExifReader, Tag as ExifTag};
 use image::{
-    DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, hooks::decoding_hook_registered,
+    DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits, RgbImage,
+    hooks::decoding_hook_registered,
 };
 use jxl_bitstream::{BitstreamKind, ContainerParser, ParseEvent};
 use jxl_oxide::{
@@ -49,13 +50,16 @@ use crate::{
 static IMAGE_DECODER_HOOKS_INIT: Once = Once::new();
 
 const RAW_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
-/// rawler's whole-frame development pipeline peaks around 32 bytes per Bayer
-/// source pixel and can be higher for multi-channel Linear DNGs. Keep local
-/// RAW development to a universal 36MP; larger RAWs may use an embedded JPEG.
-const RAW_MAX_DEVELOPMENT_PIXELS: u128 = 36_000_000;
+/// The local rawler fork's owned RGB8 path tracks a 16 B/source-pixel peak for
+/// ordinary non-rotated Bayer and X-Trans, 18 B/px for integer Linear RGB,
+/// 20 B/px for a four-color CFA, and 24 B/px for integer four-channel Linear
+/// RAW. Legacy Fuji rotation can be higher but occurs on much smaller sensors.
+/// Keep a conservative universal 54MP ceiling until device RSS validation
+/// supports a higher limit; larger RAWs may use an embedded JPEG.
+const RAW_MAX_DEVELOPMENT_PIXELS: u128 = 54_000_000;
 /// Separate sample-allocation ceiling for compressed/tiled DNG preflight.
 /// Multi-channel RAWs contain more than one sample per image pixel.
-const RAW_MAX_DECODED_SAMPLES: u128 = 200_000_000;
+const RAW_MAX_DECODED_SAMPLES: u128 = RAW_MAX_DEVELOPMENT_PIXELS * 4;
 const RAW_PREVIEW_MIN_SHORT_EDGE: u32 = 1080;
 const RAW_PREVIEW_MAX_PIXELS: u64 = 200_000_000;
 /// A separate side limit bounds decoder line and wavelet buffers for extreme
@@ -171,7 +175,7 @@ pub fn decode_image_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedImage> 
 /// RAW signal:
 ///
 /// - Extension and magic both say RAW: the file is committed to the RAW
-///   pipeline. RAWs at or below 36MP are developed; larger RAWs may return the
+///   pipeline. RAWs at or below 54MP are developed; larger RAWs may return the
 ///   largest eligible embedded JPEG preview. Other failures — oversized
 ///   input, unmatched camera model, decode/develop error, or no sufficiently
 ///   large preview — are hard errors. There is no generic image-crate
@@ -459,15 +463,34 @@ fn decode_raw_source_to_dynamic_image(
     // and must not be "simplified" away in favor of this field.
     let raw_image_orientation = raw_orientation_to_exif(raw_image.orientation);
 
-    let developed = RawDevelop::default()
-        .develop_intermediate(&raw_image)
+    let (developed, memory_report) = RawDevelop::default()
+        .develop_rgb8_with_report(raw_image)
         .map_err(|e| ImageError::Decode(format!("failed to develop RAW image: {e}")))?;
-    let image = developed.to_dynamic_image().ok_or_else(|| {
+    validate_raw_dimensions(developed.width, developed.height, source_name)?;
+    eprintln!(
+        "[ml][decode] RAW development for '{source_name}' tracked a peak of {} bytes ({:.2} B/source-pixel) at {:?}; decoder and process memory are not included",
+        memory_report.peak_tracked_bytes,
+        memory_report.peak_bytes_per_source_pixel(),
+        memory_report.peak_stage,
+    );
+    let width = u32::try_from(developed.width).map_err(|_| {
         ImageError::Decode(format!(
-            "failed to materialize developed RAW image for '{source_name}'"
+            "developed RAW width {} does not fit in u32 for '{source_name}'",
+            developed.width
         ))
     })?;
-    validate_raw_dimensions(image.width() as usize, image.height() as usize, source_name)?;
+    let height = u32::try_from(developed.height).map_err(|_| {
+        ImageError::Decode(format!(
+            "developed RAW height {} does not fit in u32 for '{source_name}'",
+            developed.height
+        ))
+    })?;
+    let image = RgbImage::from_raw(width, height, developed.data).ok_or_else(|| {
+        ImageError::Decode(format!(
+            "failed to materialize developed RGB8 RAW image for '{source_name}'"
+        ))
+    })?;
+    let image = DynamicImage::ImageRgb8(image);
 
     // Orientation is best effort: a metadata read failure should not discard
     // an otherwise successfully developed image.
@@ -1943,10 +1966,11 @@ mod tests {
     };
 
     use super::{
-        DngBlockContext, ImageResult, JpegXlFrameLayout, bytes_look_like_heif, bytes_look_like_raw,
-        catch_raw_decode_panic, decode_image_from_bytes, decode_image_from_path,
-        init_image_decoders, path_extension_is_raw, raw_dimensions_require_preview,
-        raw_orientation_to_exif, raw_preview_dimensions_are_eligible, should_attempt_tiff_fallback,
+        DngBlockContext, ImageResult, JpegXlFrameLayout, RAW_MAX_DECODED_SAMPLES,
+        bytes_look_like_heif, bytes_look_like_raw, catch_raw_decode_panic, decode_image_from_bytes,
+        decode_image_from_path, init_image_decoders, path_extension_is_raw,
+        raw_dimensions_require_preview, raw_orientation_to_exif,
+        raw_preview_dimensions_are_eligible, should_attempt_tiff_fallback,
         validate_dng_embedded_codec_dimensions, validate_dng_lossless_jpeg_sample_count,
         validate_dng_raw_ifd_allocation, validate_jpeg_xl_dependency_frame_layouts,
         validate_raw_dimensions, validate_tiff_raw_candidate_dimensions,
@@ -2062,7 +2086,7 @@ mod tests {
             .expect_err("oversized TIFF RAW candidate should fail before decode");
 
         assert!(error.to_string().contains("50000x4001"));
-        assert!(error.to_string().contains("exceeds 36000000 pixels"));
+        assert!(error.to_string().contains("exceeds 54000000 pixels"));
     }
 
     #[test]
@@ -2079,7 +2103,11 @@ mod tests {
             .expect_err("decoded samples should be bounded before allocation");
 
         assert!(error.to_string().contains("40000x10000"));
-        assert!(error.to_string().contains("exceeds 200000000 samples"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {RAW_MAX_DECODED_SAMPLES} samples"))
+        );
     }
 
     #[test]
@@ -2098,7 +2126,11 @@ mod tests {
             .expect_err("padded decoded samples should be bounded before allocation");
 
         assert!(error.to_string().contains("50000x10000"));
-        assert!(error.to_string().contains("exceeds 200000000 samples"));
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("exceeds {RAW_MAX_DECODED_SAMPLES} samples"))
+        );
     }
 
     #[test]
@@ -2466,14 +2498,14 @@ mod tests {
 
     #[test]
     fn accepts_raw_dimensions_at_maximum_side_length() {
-        validate_raw_dimensions(50_000, 720, "boundary.raw")
-            .expect("the side and 36MP limits should both be inclusive");
+        validate_raw_dimensions(50_000, 1080, "boundary.raw")
+            .expect("the side and 54MP limits should both be inclusive");
     }
 
     #[test]
-    fn raw_development_limit_is_exactly_36_megapixels() {
-        assert!(!raw_dimensions_require_preview(6000, 6000, "boundary.raw").unwrap());
-        assert!(raw_dimensions_require_preview(6001, 6000, "oversized.raw").unwrap());
+    fn raw_development_limit_is_exactly_54_megapixels() {
+        assert!(!raw_dimensions_require_preview(6000, 9000, "boundary.raw").unwrap());
+        assert!(raw_dimensions_require_preview(6001, 9000, "oversized.raw").unwrap());
     }
 
     #[test]
@@ -2526,7 +2558,7 @@ mod tests {
         dng.extend_from_slice(&8_u32.to_le_bytes());
         dng.extend_from_slice(&root_entry_count.to_le_bytes());
         append_tiff_long(&mut dng, 0x0100, 6001); // ImageWidth
-        append_tiff_long(&mut dng, 0x0101, 6000); // ImageLength: 36,006,000 px
+        append_tiff_long(&mut dng, 0x0101, 9000); // ImageLength: 54,009,000 px
         append_tiff_short(&mut dng, 0x0102, 16); // BitsPerSample
         append_tiff_short(&mut dng, 0x0103, 1); // Compression
         append_tiff_short(&mut dng, 0x0106, 32_803); // CFA photometric
