@@ -26,6 +26,7 @@ use std::num::NonZeroUsize;
 use crate::ml::error::{MlError, MlResult};
 use crate::ml::events;
 use crate::ml::golden;
+use crate::ml::runtime::ModelSessionGuard;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 use crate::ml::runtime::rt_log;
 #[cfg(target_os = "android")]
@@ -969,7 +970,7 @@ fn build_session_with_providers(model_path: &str, attempt: ProviderAttempt) -> M
 
 /// Guard against execution providers that return NaN or infinity instead of
 /// failing. The error message matches `is_execution_provider_failure` so the
-/// runtime advances to the next execution provider fallback.
+/// run helpers advance to the next execution provider fallback.
 fn ensure_finite_f32(data: &[f32]) -> MlResult<()> {
     if data.iter().copied().all(f32::is_finite) {
         return Ok(());
@@ -1000,92 +1001,187 @@ fn session_expects_f16(session: &Session) -> bool {
         .unwrap_or(false)
 }
 
+/// Errors that indicate the active execution provider (rather than the input
+/// or the model itself) failed, including the non-finite output guard above.
+fn is_execution_provider_failure(error: &MlError) -> bool {
+    let MlError::Ort(message) = error else {
+        return false;
+    };
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("executionprovider")
+        || normalized.contains("unknown allocation device")
+        || normalized.contains("xnnpackexecutionprovider")
+        || normalized.contains("coremlexecutionprovider")
+        || normalized.contains("webgpu")
+        || normalized.contains("wgpu")
+        || normalized.contains("dawn")
+        || normalized.contains("vulkan")
+        || normalized.contains("vk_error")
+        || normalized.contains("non-finite")
+        || normalized.contains("ep error")
+}
+
+fn should_advance_provider_fallback(error: &MlError) -> bool {
+    cfg!(any(target_os = "ios", target_os = "android")) && is_execution_provider_failure(error)
+}
+
+/// Runs `attempt` against the guarded session. When the attempt (or a
+/// subsequent session rebuild) fails with an execution provider error, only
+/// this model is advanced to its next fallback execution mode and the
+/// inference is retried; other models keep their sessions. The successful
+/// attempt's provider is recorded for result attribution.
+fn run_with_provider_fallback<T>(
+    guard: &mut ModelSessionGuard<'_>,
+    mut attempt: impl FnMut(&mut Session) -> MlResult<T>,
+) -> MlResult<T> {
+    loop {
+        let mut error = match attempt(guard.session_mut()) {
+            Ok(value) => {
+                guard.record_used_provider();
+                return Ok(value);
+            }
+            Err(error) => error,
+        };
+
+        // Advance until a fallback session is ready for the next attempt.
+        // Rebuild errors are classified like inference errors, so a fallback
+        // provider whose session fails to build is itself skipped past.
+        loop {
+            if !should_advance_provider_fallback(&error) {
+                return Err(error);
+            }
+            match guard.advance_fallback_and_rebuild() {
+                Ok(false) => return Err(error),
+                Ok(true) => break,
+                Err(rebuild_error) => {
+                    events::record(
+                        events::Severity::Warning,
+                        format!(
+                            "execution provider failed for {} ({error}); fallback session \
+                             build also failed: {rebuild_error}",
+                            guard.model_name()
+                        ),
+                    );
+                    error = rebuild_error;
+                }
+            }
+        }
+        events::record(
+            events::Severity::Warning,
+            format!(
+                "execution provider failed for {}, retrying with the next provider fallback: \
+                 {error}",
+                guard.model_name()
+            ),
+        );
+    }
+}
+
 /// Run inference accepting f32 data and returning f32 results.
 /// Automatically converts inputs/outputs for FP16 models.
 pub(crate) fn run_f32<const N: usize>(
-    session: &mut Session,
+    guard: &mut ModelSessionGuard<'_>,
     input: Vec<f32>,
     input_shape: [i64; N],
 ) -> MlResult<(Vec<i64>, Vec<f32>)> {
-    let outputs = if session_expects_f16(session) {
-        let f16_input = Vec::<half::f16>::from_f32_slice(&input);
-        let input_tensor = Tensor::<half::f16>::from_array((input_shape, f16_input))?;
-        session.run(ort::inputs![input_tensor])?
-    } else {
-        let input_tensor = Tensor::<f32>::from_array((input_shape, input))?;
-        session.run(ort::inputs![input_tensor])?
-    };
+    run_with_provider_fallback(guard, |session| {
+        let outputs = if session_expects_f16(session) {
+            let f16_input = Vec::<half::f16>::from_f32_slice(&input);
+            let input_tensor = Tensor::<half::f16>::from_array((input_shape, f16_input))?;
+            session.run(ort::inputs![input_tensor])?
+        } else {
+            let input_tensor = TensorRef::<f32>::from_array_view((input_shape, input.as_slice()))?;
+            session.run(ort::inputs![input_tensor])?
+        };
 
-    if outputs.len() == 0 {
-        return Err(MlError::Ort("missing first output tensor".to_string()));
-    }
-    let output = &outputs[0];
+        if outputs.len() == 0 {
+            return Err(MlError::Ort("missing first output tensor".to_string()));
+        }
+        let output = &outputs[0];
 
-    // Extract output: try f32 first, fall back to f16 with conversion.
-    if let Ok((tensor_shape, tensor_data)) = output.try_extract_tensor::<f32>() {
-        let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
-        let data = tensor_data.to_vec();
-        ensure_finite_f32(&data)?;
-        Ok((shape, data))
-    } else {
-        let (tensor_shape, tensor_data) = output.try_extract_tensor::<half::f16>()?;
-        let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
-        let mut data = vec![0.0; tensor_data.len()];
-        tensor_data.convert_to_f32_slice(&mut data);
-        ensure_finite_f32(&data)?;
-        Ok((shape, data))
-    }
+        // Extract output: try f32 first, fall back to f16 with conversion.
+        if let Ok((tensor_shape, tensor_data)) = output.try_extract_tensor::<f32>() {
+            let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
+            let data = tensor_data.to_vec();
+            ensure_finite_f32(&data)?;
+            Ok((shape, data))
+        } else {
+            let (tensor_shape, tensor_data) = output.try_extract_tensor::<half::f16>()?;
+            let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
+            let mut data = vec![0.0; tensor_data.len()];
+            tensor_data.convert_to_f32_slice(&mut data);
+            ensure_finite_f32(&data)?;
+            Ok((shape, data))
+        }
+    })
 }
 
 /// Run inference using a reusable input and process the first output in place.
 /// Both f32 and f16 outputs remain borrowed from ONNX Runtime; consumers
 /// convert only the values they inspect.
 pub(crate) fn with_prepared_float_output<const N: usize, T>(
-    session: &mut Session,
+    guard: &mut ModelSessionGuard<'_>,
     input: &PreparedF32Input,
     input_shape: [i64; N],
     consume: impl FnOnce(&[i64], BorrowedFloatTensor<'_>) -> MlResult<T>,
 ) -> MlResult<T> {
-    let outputs = if session_expects_f16(session) {
-        let input_tensor =
-            TensorRef::<half::f16>::from_array_view((input_shape, input.f16_data()))?;
-        session.run(ort::inputs![input_tensor])?
-    } else {
-        let input_tensor =
-            TensorRef::<f32>::from_array_view((input_shape, input.f32_data.as_slice()))?;
-        session.run(ort::inputs![input_tensor])?
-    };
+    // The consumer runs only after an attempt has produced finite output, so
+    // failed attempts never reach it and it is invoked at most once.
+    let mut consume = Some(consume);
+    run_with_provider_fallback(guard, |session| {
+        let outputs = if session_expects_f16(session) {
+            let input_tensor =
+                TensorRef::<half::f16>::from_array_view((input_shape, input.f16_data()))?;
+            session.run(ort::inputs![input_tensor])?
+        } else {
+            let input_tensor =
+                TensorRef::<f32>::from_array_view((input_shape, input.f32_data.as_slice()))?;
+            session.run(ort::inputs![input_tensor])?
+        };
 
-    if outputs.len() == 0 {
-        return Err(MlError::Ort("missing first output tensor".to_string()));
-    }
-    let output = &outputs[0];
-    if let Ok((tensor_shape, tensor_data)) = output.try_extract_tensor::<f32>() {
-        ensure_finite_f32(tensor_data)?;
-        consume(tensor_shape, BorrowedFloatTensor::F32(tensor_data))
-    } else {
-        let (tensor_shape, tensor_data) = output.try_extract_tensor::<half::f16>()?;
-        ensure_finite_f16(tensor_data)?;
-        consume(tensor_shape, BorrowedFloatTensor::F16(tensor_data))
-    }
+        if outputs.len() == 0 {
+            return Err(MlError::Ort("missing first output tensor".to_string()));
+        }
+        let output = &outputs[0];
+        if let Ok((tensor_shape, tensor_data)) = output.try_extract_tensor::<f32>() {
+            ensure_finite_f32(tensor_data)?;
+            let Some(consume) = consume.take() else {
+                return Err(MlError::Runtime(
+                    "inference output consumer invoked more than once".to_string(),
+                ));
+            };
+            consume(tensor_shape, BorrowedFloatTensor::F32(tensor_data))
+        } else {
+            let (tensor_shape, tensor_data) = output.try_extract_tensor::<half::f16>()?;
+            ensure_finite_f16(tensor_data)?;
+            let Some(consume) = consume.take() else {
+                return Err(MlError::Runtime(
+                    "inference output consumer invoked more than once".to_string(),
+                ));
+            };
+            consume(tensor_shape, BorrowedFloatTensor::F16(tensor_data))
+        }
+    })
 }
 
 pub(crate) fn run_i32_f32<const N: usize>(
-    session: &mut Session,
+    guard: &mut ModelSessionGuard<'_>,
     input: &[i32],
     input_shape: [i64; N],
 ) -> MlResult<(Vec<i64>, Vec<f32>)> {
-    let input_tensor = TensorRef::<i32>::from_array_view((input_shape, input))?;
-    let outputs = session.run(ort::inputs![input_tensor])?;
-    if outputs.len() == 0 {
-        return Err(MlError::Ort("missing first output tensor".to_string()));
-    }
-    let output = &outputs[0];
-    let (tensor_shape, tensor_data) = output.try_extract_tensor::<f32>()?;
-    let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
-    let data = tensor_data.to_vec();
-    ensure_finite_f32(&data)?;
-    Ok((shape, data))
+    run_with_provider_fallback(guard, |session| {
+        let input_tensor = TensorRef::<i32>::from_array_view((input_shape, input))?;
+        let outputs = session.run(ort::inputs![input_tensor])?;
+        if outputs.len() == 0 {
+            return Err(MlError::Ort("missing first output tensor".to_string()));
+        }
+        let output = &outputs[0];
+        let (tensor_shape, tensor_data) = output.try_extract_tensor::<f32>()?;
+        let shape = tensor_shape.iter().copied().collect::<Vec<_>>();
+        let data = tensor_data.to_vec();
+        ensure_finite_f32(&data)?;
+        Ok((shape, data))
+    })
 }
 
 #[cfg(test)]

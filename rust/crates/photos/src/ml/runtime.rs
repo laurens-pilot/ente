@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    ops::{Deref, DerefMut},
     sync::{Mutex, MutexGuard},
 };
 
@@ -67,13 +66,15 @@ struct ModelSlot {
 }
 
 pub(crate) struct ModelSessionGuard<'a> {
+    slot: &'a ModelSlot,
     state: MutexGuard<'a, ModelSlotState>,
+    used_providers: &'a Cell<UsedProviders>,
 }
 
 /// Which accelerated execution providers were behind the sessions used through
-/// a [`MlRuntimeView`]. ORed over every session guard the view hands out, so a
-/// result produced through the view can be attributed to the providers that
-/// actually computed (any part of) it.
+/// a [`MlRuntimeView`]. ORed over every successful inference run against the
+/// view's session guards, so a result produced through the view can be
+/// attributed to the providers that actually computed (any part of) it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UsedProviders {
     pub(crate) coreml: bool,
@@ -94,26 +95,6 @@ pub(crate) struct MlRuntimeView<'a> {
     runtime: &'a MlRuntime,
     model_paths: &'a ModelPaths,
     used_providers: Cell<UsedProviders>,
-}
-
-impl Deref for ModelSessionGuard<'_> {
-    type Target = Session;
-
-    fn deref(&self) -> &Self::Target {
-        self.state
-            .session
-            .as_ref()
-            .expect("session must be loaded before creating ModelSessionGuard")
-    }
-}
-
-impl DerefMut for ModelSessionGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.state
-            .session
-            .as_mut()
-            .expect("session must be loaded before creating ModelSessionGuard")
-    }
 }
 
 impl ModelSlot {
@@ -170,29 +151,12 @@ impl ModelSlot {
         }
     }
 
-    fn advance_provider_fallback_if_configured(&self, path: &str) -> bool {
-        if path.trim().is_empty() {
-            return false;
-        }
-
-        let mut state = self.lock_state();
-        if state.path != path {
-            return false;
-        }
-        let current_mode = state
-            .fallback_execution_mode
-            .unwrap_or(self.default_execution_mode);
-        let Some(fallback_mode) = current_mode.fallback() else {
-            return false;
-        };
-
-        state.fallback_execution_mode = Some(fallback_mode);
-        state.execution_provider = None;
-        state.session = None;
-        true
-    }
-
-    fn session_guard_for(&self, path: &str, error_msg: &str) -> MlResult<ModelSessionGuard<'_>> {
+    fn session_guard_for<'a>(
+        &'a self,
+        path: &str,
+        error_msg: &str,
+        used_providers: &'a Cell<UsedProviders>,
+    ) -> MlResult<ModelSessionGuard<'a>> {
         if path.trim().is_empty() {
             return Err(MlError::InvalidRequest(error_msg.to_string()));
         }
@@ -200,7 +164,11 @@ impl ModelSlot {
         let mut state = self.lock_state();
         Self::set_config_locked(&mut state, path);
         self.ensure_loaded_locked(&mut state, error_msg)?;
-        Ok(ModelSessionGuard { state })
+        Ok(ModelSessionGuard {
+            slot: self,
+            state,
+            used_providers,
+        })
     }
 
     fn set_config_locked(state: &mut ModelSlotState, path: &str) {
@@ -259,6 +227,50 @@ impl ModelSessionGuard<'_> {
         self.state
             .execution_provider
             .expect("a loaded session must record its execution provider")
+    }
+
+    pub(crate) fn session_mut(&mut self) -> &mut Session {
+        self.state
+            .session
+            .as_mut()
+            .expect("session must be loaded while a ModelSessionGuard exists")
+    }
+
+    /// The file name of the guarded model, for diagnostics.
+    pub(crate) fn model_name(&self) -> &str {
+        self.state
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.state.path)
+    }
+
+    /// Records this session's execution provider as having contributed to a
+    /// result produced through the owning [`MlRuntimeView`].
+    pub(crate) fn record_used_provider(&self) {
+        let mut used = self.used_providers.get();
+        used.record(self.execution_provider());
+        self.used_providers.set(used);
+    }
+
+    /// Advances this model to its next fallback execution mode and rebuilds
+    /// the session in place. Returns `Ok(false)` when the fallback chain is
+    /// exhausted. On a rebuild error the advanced mode is kept and the slot is
+    /// left without a session, so a later acquisition retries the build.
+    pub(crate) fn advance_fallback_and_rebuild(&mut self) -> MlResult<bool> {
+        let current_mode = self.slot.effective_execution_mode(&self.state);
+        let Some(fallback_mode) = current_mode.fallback() else {
+            return Ok(false);
+        };
+
+        self.state.fallback_execution_mode = Some(fallback_mode);
+        self.state.execution_provider = None;
+        self.state.session = None;
+        self.slot.ensure_loaded_locked(
+            &mut self.state,
+            "model path cleared during execution provider fallback",
+        )?;
+        Ok(true)
     }
 }
 
@@ -359,41 +371,6 @@ impl MlRuntime {
         self.pet_body_embedding_cat.release_residency();
     }
 
-    fn advance_provider_fallbacks_for_requested_models(&self, model_paths: &ModelPaths) -> bool {
-        let mut advanced = false;
-        advanced |= self
-            .face_detection
-            .advance_provider_fallback_if_configured(&model_paths.face_detection);
-        advanced |= self
-            .face_embedding
-            .advance_provider_fallback_if_configured(&model_paths.face_embedding);
-        advanced |= self
-            .clip_image
-            .advance_provider_fallback_if_configured(&model_paths.clip_image);
-        advanced |= self
-            .clip_text
-            .advance_provider_fallback_if_configured(&model_paths.clip_text);
-        advanced |= self
-            .pet_face_detection
-            .advance_provider_fallback_if_configured(&model_paths.pet_face_detection);
-        advanced |= self
-            .pet_face_embedding_dog
-            .advance_provider_fallback_if_configured(&model_paths.pet_face_embedding_dog);
-        advanced |= self
-            .pet_face_embedding_cat
-            .advance_provider_fallback_if_configured(&model_paths.pet_face_embedding_cat);
-        advanced |= self
-            .pet_body_detection
-            .advance_provider_fallback_if_configured(&model_paths.pet_body_detection);
-        advanced |= self
-            .pet_body_embedding_dog
-            .advance_provider_fallback_if_configured(&model_paths.pet_body_embedding_dog);
-        advanced |= self
-            .pet_body_embedding_cat
-            .advance_provider_fallback_if_configured(&model_paths.pet_body_embedding_cat);
-        advanced
-    }
-
     fn view<'a>(&'a self, model_paths: &'a ModelPaths) -> MlRuntimeView<'a> {
         MlRuntimeView {
             runtime: self,
@@ -404,27 +381,19 @@ impl MlRuntime {
 }
 
 impl<'a> MlRuntimeView<'a> {
-    /// The accelerated providers behind every session used through this view
-    /// so far (since creation or the last [`Self::reset_used_providers`]).
+    /// The accelerated providers behind every successful inference run
+    /// through this view's session guards so far.
     pub(crate) fn used_providers(&self) -> UsedProviders {
         self.used_providers.get()
     }
 
-    fn reset_used_providers(&self) {
-        self.used_providers.set(UsedProviders::default());
-    }
-
-    fn tracked_session(
-        &self,
-        slot: &'a ModelSlot,
+    fn tracked_session<'v>(
+        &'v self,
+        slot: &'v ModelSlot,
         path: &str,
         error_msg: &str,
-    ) -> MlResult<ModelSessionGuard<'a>> {
-        let guard = slot.session_guard_for(path, error_msg)?;
-        let mut used = self.used_providers.get();
-        used.record(guard.execution_provider());
-        self.used_providers.set(used);
-        Ok(guard)
+    ) -> MlResult<ModelSessionGuard<'v>> {
+        slot.session_guard_for(path, error_msg, &self.used_providers)
     }
 
     pub(crate) fn face_detection_session(&self) -> MlResult<ModelSessionGuard<'_>> {
@@ -516,64 +485,19 @@ pub(crate) fn prepare_runtime(model_paths: &ModelPaths) {
     GLOBAL_RUNTIME.prepare_indexing_models(model_paths);
 }
 
+/// Runs `func` against the process-wide runtime. Execution provider failures
+/// are handled per inference inside the onnx run helpers (see
+/// `onnx::run_with_provider_fallback`), so `func` is invoked exactly once.
 pub(crate) fn with_runtime<F, R>(model_paths: &ModelPaths, func: F) -> MlResult<R>
 where
-    F: for<'a> Fn(&MlRuntimeView<'a>) -> MlResult<R>,
+    F: for<'a> FnOnce(&MlRuntimeView<'a>) -> MlResult<R>,
 {
     ensure_runtime(model_paths);
-
-    let runtime_view = GLOBAL_RUNTIME.view(model_paths);
-    let mut result = func(&runtime_view);
-    loop {
-        match result {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                if !should_retry_execution_provider_runtime(&error)
-                    || !GLOBAL_RUNTIME.advance_provider_fallbacks_for_requested_models(model_paths)
-                {
-                    return Err(error);
-                }
-
-                crate::ml::events::record(
-                    crate::ml::events::Severity::Warning,
-                    format!(
-                        "execution provider failed, retrying with the next provider fallback: \
-                         {error}"
-                    ),
-                );
-                // Drop provider attributions from the failed attempt; only the
-                // retry that produces the returned value should count.
-                runtime_view.reset_used_providers();
-                result = func(&runtime_view);
-            }
-        }
-    }
+    func(&GLOBAL_RUNTIME.view(model_paths))
 }
 
 pub(crate) fn release_runtime() {
     GLOBAL_RUNTIME.release_indexing_models();
-}
-
-fn should_retry_execution_provider_runtime(error: &MlError) -> bool {
-    cfg!(any(target_os = "ios", target_os = "android")) && is_execution_provider_failure(error)
-}
-
-fn is_execution_provider_failure(error: &MlError) -> bool {
-    let MlError::Ort(message) = error else {
-        return false;
-    };
-    let normalized = message.to_ascii_lowercase();
-    normalized.contains("executionprovider")
-        || normalized.contains("unknown allocation device")
-        || normalized.contains("xnnpackexecutionprovider")
-        || normalized.contains("coremlexecutionprovider")
-        || normalized.contains("webgpu")
-        || normalized.contains("wgpu")
-        || normalized.contains("dawn")
-        || normalized.contains("vulkan")
-        || normalized.contains("vk_error")
-        || normalized.contains("non-finite")
-        || normalized.contains("ep error")
 }
 
 #[cfg(test)]
