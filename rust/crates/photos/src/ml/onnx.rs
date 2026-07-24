@@ -136,6 +136,27 @@ impl ExecutionMode {
             Self::CpuOnly => None,
         }
     }
+
+    /// The mode to keep for the rest of the process when a session build at
+    /// this mode had to fall back internally and returned `provider`.
+    ///
+    /// Only the iOS CoreML → CPU build fallback is persisted: the CoreML
+    /// attempt is expensive (model compilation plus the golden self-test, and
+    /// a self-test failure also invalidates the compiled-model cache) and its
+    /// outcome is deterministic for a given model and OS, so re-attempting it
+    /// on every session rebuild wastes seconds per indexing batch. Android's
+    /// accelerated attempt is gated dynamically (the WebGPU opt-in flag plus
+    /// the durable crash canary), so its internal fallbacks stay transient.
+    pub(crate) fn build_fallback_demotion(self, provider: ExecutionProvider) -> Option<Self> {
+        if cfg!(target_os = "ios")
+            && self == Self::PlatformDefault
+            && provider == ExecutionProvider::Cpu
+        {
+            Some(Self::CpuOnly)
+        } else {
+            None
+        }
+    }
 }
 
 pub(crate) fn build_session(

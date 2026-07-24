@@ -8,7 +8,7 @@ use ort::session::Session;
 
 use crate::ml::{
     error::{MlError, MlResult},
-    onnx,
+    events, onnx,
 };
 
 /// Log to Android logcat or stderr.
@@ -52,7 +52,15 @@ pub struct ModelPaths {
 #[derive(Debug)]
 struct ModelSlotState {
     path: String,
+    /// Runtime execution provider fallback, advanced when an inference fails.
+    /// Transient: cleared when the slot's residency is released, so the next
+    /// indexing batch retries the accelerated provider.
     fallback_execution_mode: Option<onnx::ExecutionMode>,
+    /// Demotion recorded when a session build itself fell back (the iOS
+    /// CoreML attempt failed its build or golden self-test). Kept until the
+    /// model path changes or the process exits, so rebuilds don't re-pay the
+    /// doomed accelerated attempt every batch.
+    build_fallback_execution_mode: Option<onnx::ExecutionMode>,
     execution_provider: Option<onnx::ExecutionProvider>,
     pin_count: usize,
     session: Option<Session>,
@@ -108,6 +116,7 @@ impl ModelSlot {
             state: Mutex::new(ModelSlotState {
                 path: String::new(),
                 fallback_execution_mode: None,
+                build_fallback_execution_mode: None,
                 execution_provider: None,
                 pin_count: 0,
                 session: None,
@@ -177,10 +186,17 @@ impl ModelSlot {
         }
         state.path = path.to_string();
         state.fallback_execution_mode = None;
+        // The build demotion is specific to the previous model file; a new
+        // model deserves a fresh accelerated attempt.
+        state.build_fallback_execution_mode = None;
         state.execution_provider = None;
         state.session = None;
     }
 
+    /// Clears the state that should not outlive an indexing batch. The
+    /// build-time demotion is deliberately kept: rebuilding at the demoted
+    /// mode is what makes the failed accelerated attempt a once-per-process
+    /// cost instead of a once-per-batch cost.
     fn clear_transient_runtime_state_locked(state: &mut ModelSlotState) {
         state.fallback_execution_mode = None;
         state.execution_provider = None;
@@ -190,12 +206,14 @@ impl ModelSlot {
     fn reset_slot_locked(state: &mut ModelSlotState) {
         state.path.clear();
         state.pin_count = 0;
+        state.build_fallback_execution_mode = None;
         Self::clear_transient_runtime_state_locked(state);
     }
 
     fn effective_execution_mode(&self, state: &ModelSlotState) -> onnx::ExecutionMode {
         state
             .fallback_execution_mode
+            .or(state.build_fallback_execution_mode)
             .unwrap_or(self.default_execution_mode)
     }
 
@@ -216,6 +234,16 @@ impl ModelSlot {
         let (session, execution_provider) =
             onnx::build_session(&state.path, execution_mode, self.coreml_cache_namespace)?;
         rt_log(&format!("loaded {model_name} in {:?}", t.elapsed()));
+        if let Some(demoted_mode) = execution_mode.build_fallback_demotion(execution_provider) {
+            events::record(
+                events::Severity::Warning,
+                format!(
+                    "session build for {model_name} fell back to {execution_provider:?}; \
+                     keeping {demoted_mode:?} for the rest of this process"
+                ),
+            );
+            state.build_fallback_execution_mode = Some(demoted_mode);
+        }
         state.execution_provider = Some(execution_provider);
         state.session = Some(session);
         Ok(())
@@ -602,6 +630,7 @@ mod tests {
             state.path = "pet.onnx".to_string();
             state.pin_count = 1;
             state.fallback_execution_mode = Some(onnx::ExecutionMode::CpuOnly);
+            state.build_fallback_execution_mode = Some(onnx::ExecutionMode::CpuOnly);
         }
 
         slot.sync_indexing_residency("");
@@ -610,6 +639,7 @@ mod tests {
         assert!(state.path.is_empty());
         assert_eq!(state.pin_count, 0);
         assert_eq!(state.fallback_execution_mode, None);
+        assert_eq!(state.build_fallback_execution_mode, None);
         assert!(state.session.is_none());
     }
 
@@ -630,6 +660,80 @@ mod tests {
         assert_eq!(state.pin_count, 0);
         assert_eq!(state.fallback_execution_mode, None);
         assert!(state.session.is_none());
+    }
+
+    #[test]
+    fn build_fallback_demotion_survives_release_but_not_path_change() {
+        let slot = ModelSlot::new(onnx::ExecutionMode::PlatformDefault, "test-model");
+
+        {
+            let mut state = slot.lock_state();
+            state.path = "face.onnx".to_string();
+            state.pin_count = 1;
+            state.fallback_execution_mode = Some(onnx::ExecutionMode::CpuOnly);
+            state.build_fallback_execution_mode = Some(onnx::ExecutionMode::CpuOnly);
+        }
+
+        slot.release_residency();
+
+        {
+            let state = slot.lock_state();
+            assert_eq!(state.fallback_execution_mode, None);
+            assert_eq!(
+                state.build_fallback_execution_mode,
+                Some(onnx::ExecutionMode::CpuOnly)
+            );
+            assert_eq!(
+                slot.effective_execution_mode(&state),
+                onnx::ExecutionMode::CpuOnly
+            );
+        }
+
+        // Reconfiguring the same model keeps the demotion.
+        slot.configure_if_requested("face.onnx");
+        assert_eq!(
+            slot.lock_state().build_fallback_execution_mode,
+            Some(onnx::ExecutionMode::CpuOnly)
+        );
+
+        // A model update gets a fresh accelerated attempt.
+        slot.configure_if_requested("face_v2.onnx");
+        let state = slot.lock_state();
+        assert_eq!(state.build_fallback_execution_mode, None);
+        assert_eq!(
+            slot.effective_execution_mode(&state),
+            onnx::ExecutionMode::PlatformDefault
+        );
+    }
+
+    #[test]
+    fn build_fallback_demotion_matches_platform_policy() {
+        #[cfg(target_os = "ios")]
+        {
+            assert_eq!(
+                onnx::ExecutionMode::PlatformDefault
+                    .build_fallback_demotion(onnx::ExecutionProvider::Cpu),
+                Some(onnx::ExecutionMode::CpuOnly)
+            );
+            assert_eq!(
+                onnx::ExecutionMode::PlatformDefault
+                    .build_fallback_demotion(onnx::ExecutionProvider::CoreMl),
+                None
+            );
+            assert_eq!(
+                onnx::ExecutionMode::CpuOnly.build_fallback_demotion(onnx::ExecutionProvider::Cpu),
+                None
+            );
+        }
+        // Android's accelerated attempt is gated dynamically (WebGPU flag and
+        // crash canary), and desktop has no accelerated attempt, so internal
+        // build fallbacks are never persisted there.
+        #[cfg(not(target_os = "ios"))]
+        assert_eq!(
+            onnx::ExecutionMode::PlatformDefault
+                .build_fallback_demotion(onnx::ExecutionProvider::Cpu),
+            None
+        );
     }
 
     #[test]
