@@ -16,6 +16,7 @@ workspace:
   - apps/auth
   - apps/locker
   - apps/photos
+  - apps/photos/plugins/ente_background_manager
   - apps/photos/plugins/ente_cast
   - apps/photos/plugins/ente_crypto
   - apps/photos/plugins/ente_panorama_viewer

@@ -14,6 +14,7 @@ import "package:photos/ui/home/christmas/christmas_utils.dart";
 import "package:photos/ui/notification/toast.dart";
 import "package:photos/ui/notification/update/change_log_page.dart";
 import "package:photos/ui/settings/debug/social_debug_screen.dart";
+import "package:photos/utils/background_tasks.dart";
 
 class DebugSettingsPage extends StatefulWidget {
   const DebugSettingsPage({super.key});
@@ -68,6 +69,7 @@ class _DebugSettingsPageState extends State<DebugSettingsPage> {
                                 await localSettings.setInternalUserDisabled(
                                   newValue,
                                 );
+                                await BackgroundTasks.configure();
                                 if (!mounted) return;
                                 setState(() {});
                                 if (!context.mounted) return;

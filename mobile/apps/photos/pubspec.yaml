@@ -62,6 +62,8 @@ dependencies:
     path: plugins/ente_panorama_viewer
   ente_photos_frb:
     path: rust_builder
+  ente_background_manager:
+    path: plugins/ente_background_manager
   ente_photos_platform:
     path: plugins/ente_photos_platform
   ente_pure_utils:
