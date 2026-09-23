@@ -16,6 +16,7 @@ import "package:photos/services/collections_service.dart";
 import "package:photos/services/filter/db_filters.dart";
 import "package:photos/ui/actions/collection/collection_file_actions.dart";
 import "package:photos/ui/actions/collection/collection_sharing_actions.dart";
+import "package:photos/ui/common/device_asset_picker.dart";
 import "package:photos/ui/viewer/gallery/gallery.dart";
 import "package:photos/ui/viewer/gallery/state/boundary_reporter_mixin.dart";
 import "package:photos/ui/viewer/gallery/state/gallery_boundaries_provider.dart";
@@ -182,15 +183,10 @@ class AddPhotosPhotoWidget extends StatelessWidget {
     try {
       final assetPickerTextDelegate = await _getAssetPickerTextDelegate();
       if (!context.mounted) return;
-      final List<AssetEntity>? result = await AssetPicker.pickAssets(
+      final List<AssetEntity>? result = await pickDeviceAssets(
         context,
-        pickerConfig: AssetPickerConfig(
-          keepScrollOffset: true,
-          maxAssets: maxPickAssetLimit,
-          textDelegate: assetPickerTextDelegate,
-          gridCount: 6,
-          pageSize: 120,
-        ),
+        maxAssets: maxPickAssetLimit,
+        textDelegate: assetPickerTextDelegate,
       );
       if (result != null && result.isNotEmpty) {
         final ca = CollectionActions(CollectionsService.instance);
