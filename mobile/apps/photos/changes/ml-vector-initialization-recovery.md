@@ -1,1 +1,0 @@
-- Improved recovery when opening AI search and recognition indexes fails.
