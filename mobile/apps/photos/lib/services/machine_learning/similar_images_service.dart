@@ -154,8 +154,10 @@ class SimilarImagesService {
       }
 
       if (!needsFullRefresh) {
-        final Set<int> cacheGroupedFileIDs = await cachedData
-            .getGroupedFileIDs();
+        final cachedGroups = await cachedData.similarFilesList();
+        final cacheGroupedFileIDs = cachedGroups
+            .expand((group) => group.fileIds)
+            .toSet();
         final deletedFromGroups = cacheGroupedFileIDs.intersection(
           cachedFileIDs.difference(currentFileIDs),
         );
@@ -174,6 +176,22 @@ class SimilarImagesService {
               "Refreshing similar images cache because ${groupedFilesWithoutClipEmbeddings.length} of $totalInGroups grouped files no longer have CLIP embeddings",
             );
             needsFullRefresh = true;
+          }
+        }
+
+        if (!needsFullRefresh) {
+          for (final group in cachedGroups) {
+            Set<String>? personIDs;
+            for (final fileID in group.fileIds) {
+              if (!currentFileIDs.contains(fileID)) continue;
+              final currentPersonIDs = fileIDToPersonIDs[fileID] ?? <String>{};
+              personIDs ??= currentPersonIDs;
+              if (!setsAreEqual(personIDs, currentPersonIDs)) {
+                needsFullRefresh = true;
+                break;
+              }
+            }
+            if (needsFullRefresh) break;
           }
         }
       }
