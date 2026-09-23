@@ -105,8 +105,15 @@ class PetVectorDB {
   final Lock _writeLock = Lock();
 
   Future<VectorDb> get _vectorDB async {
-    _vectorDbFuture ??= _initVectorDB();
-    return _vectorDbFuture!;
+    final future = _vectorDbFuture ??= _writeLock.synchronized(_initVectorDB);
+    try {
+      return await future;
+    } catch (_) {
+      if (identical(_vectorDbFuture, future)) {
+        _vectorDbFuture = null;
+      }
+      rethrow;
+    }
   }
 
   Future<VectorDb> _initVectorDB() async {
@@ -119,7 +126,7 @@ class PetVectorDB {
     } catch (e, s) {
       _logger.severe("Could not open Pet VectorDB at $dbPath", e, s);
       _logger.severe("Deleting the index file and trying again");
-      await deleteIndexFile();
+      await _deleteIndexFile();
       try {
         vectorDB = VectorDb(filePath: dbPath, dimensions: _embeddingDimension);
       } catch (e, s) {
@@ -267,19 +274,23 @@ class PetVectorDB {
 
   Future<void> deleteIndexFile() async {
     await _writeLock.synchronized(() async {
-      try {
-        final documentsDirectory = await getApplicationDocumentsDirectory();
-        final String dbPath = join(documentsDirectory.path, _databaseName);
-        _logger.info("Delete pet index file: $dbPath");
-        final file = File(dbPath);
-        if (await file.exists()) {
-          await file.delete();
-        }
-        _vectorDbFuture = null;
-      } catch (e, s) {
-        _logger.severe("Error deleting pet index file", e, s);
-        rethrow;
-      }
+      _vectorDbFuture = null;
+      await _deleteIndexFile();
     });
+  }
+
+  Future<void> _deleteIndexFile() async {
+    try {
+      final documentsDirectory = await getApplicationDocumentsDirectory();
+      final String dbPath = join(documentsDirectory.path, _databaseName);
+      _logger.info("Delete pet index file: $dbPath");
+      final file = File(dbPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+    } catch (e, s) {
+      _logger.severe("Error deleting pet index file", e, s);
+      rethrow;
+    }
   }
 }

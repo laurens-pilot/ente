@@ -42,8 +42,15 @@ class ClusterCentroidVectorDB {
   final Lock _writeLock = Lock();
 
   Future<VectorDb> get _vectorDB async {
-    _vectorDbFuture ??= _initVectorDB();
-    return _vectorDbFuture!;
+    final future = _vectorDbFuture ??= _writeLock.synchronized(_initVectorDB);
+    try {
+      return await future;
+    } catch (_) {
+      if (identical(_vectorDbFuture, future)) {
+        _vectorDbFuture = null;
+      }
+      rethrow;
+    }
   }
 
   bool? _migrationDone;
@@ -70,7 +77,7 @@ class ClusterCentroidVectorDB {
         s,
       );
       _logger.severe("Deleting the index file and trying again");
-      await deleteIndexFile();
+      await _deleteIndexFile();
       try {
         vectorDB = VectorDb(filePath: dbPath, dimensions: _embeddingDimension);
       } catch (e, s) {
@@ -419,27 +426,31 @@ class ClusterCentroidVectorDB {
 
   Future<void> deleteIndexFile() async {
     await _writeLock.synchronized(() async {
-      try {
-        final documentsDirectory = await getApplicationDocumentsDirectory();
-        final String dbPath = join(documentsDirectory.path, _databaseName);
-        _logger.info("Delete cluster centroid index file: DB path $dbPath");
-        final file = File(dbPath);
-        if (await file.exists()) {
-          await file.delete();
-        }
-        _logger.info("Deleted cluster centroid index file on disk");
-        _vectorDbFuture = null;
-        _warmupFuture = null;
-        await invalidateMigrationState();
-      } catch (e, s) {
-        _logger.severe(
-          "Error deleting cluster centroid index file on disk",
-          e,
-          s,
-        );
-        rethrow;
-      }
+      _vectorDbFuture = null;
+      _warmupFuture = null;
+      await _deleteIndexFile();
     });
+  }
+
+  Future<void> _deleteIndexFile() async {
+    try {
+      final documentsDirectory = await getApplicationDocumentsDirectory();
+      final String dbPath = join(documentsDirectory.path, _databaseName);
+      _logger.info("Delete cluster centroid index file: DB path $dbPath");
+      final file = File(dbPath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+      _logger.info("Deleted cluster centroid index file on disk");
+      await invalidateMigrationState();
+    } catch (e, s) {
+      _logger.severe(
+        "Error deleting cluster centroid index file on disk",
+        e,
+        s,
+      );
+      rethrow;
+    }
   }
 }
 
