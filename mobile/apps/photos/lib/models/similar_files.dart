@@ -71,6 +71,7 @@ class SimilarFiles {
 class SimilarFilesCache {
   final List<String> similarFilesJsonStringList;
   final Set<int> allCheckedFileIDs;
+  final Map<int, Set<String>>? fileIDToPersonIDs;
   final double distanceThreshold;
   final bool exact;
 
@@ -84,6 +85,7 @@ class SimilarFilesCache {
     required this.distanceThreshold,
     required this.exact,
     required this.cachedTime,
+    this.fileIDToPersonIDs,
   });
 
   Future<List<SimilarFiles>> similarFilesList() async {
@@ -117,6 +119,11 @@ class SimilarFilesCache {
       distanceThreshold: (json['distanceThreshold'] as num).toDouble(),
       exact: json['exact'] as bool,
       cachedTime: json['cachedTime'] as int,
+      fileIDToPersonIDs: (json['fileIDToPersonIDs'] as Map<String, dynamic>?)
+          ?.map(
+            (fileID, personIDs) =>
+                MapEntry(int.parse(fileID), Set<String>.from(personIDs)),
+          ),
     );
   }
 
@@ -127,6 +134,9 @@ class SimilarFilesCache {
       'distanceThreshold': distanceThreshold,
       'exact': exact,
       'cachedTime': cachedTime,
+      'fileIDToPersonIDs': fileIDToPersonIDs?.map(
+        (fileID, personIDs) => MapEntry(fileID.toString(), personIDs.toList()),
+      ),
     };
   }
 

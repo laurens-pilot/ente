@@ -110,6 +110,7 @@ class SimilarImagesService {
       await _cacheSimilarFiles(
         result,
         fileIDs.toSet(),
+        fileIDToPersonIDs,
         distanceThreshold,
         exact,
         DateTime.now().millisecondsSinceEpoch,
@@ -154,6 +155,24 @@ class SimilarImagesService {
       }
 
       if (!needsFullRefresh) {
+        final cachedPersonIDs = cachedData.fileIDToPersonIDs;
+        if (cachedPersonIDs == null) {
+          needsFullRefresh = true;
+        } else {
+          for (final fileID in cachedFileIDs) {
+            if (!currentFileIDs.contains(fileID)) continue;
+            if (!setsAreEqual(
+              cachedPersonIDs[fileID] ?? <String>{},
+              fileIDToPersonIDs[fileID] ?? <String>{},
+            )) {
+              needsFullRefresh = true;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!needsFullRefresh) {
         final cachedGroups = await cachedData.similarFilesList();
         final cacheGroupedFileIDs = cachedGroups
             .expand((group) => group.fileIds)
@@ -178,22 +197,6 @@ class SimilarImagesService {
             needsFullRefresh = true;
           }
         }
-
-        if (!needsFullRefresh) {
-          for (final group in cachedGroups) {
-            Set<String>? personIDs;
-            for (final fileID in group.fileIds) {
-              if (!currentFileIDs.contains(fileID)) continue;
-              final currentPersonIDs = fileIDToPersonIDs[fileID] ?? <String>{};
-              personIDs ??= currentPersonIDs;
-              if (!setsAreEqual(personIDs, currentPersonIDs)) {
-                needsFullRefresh = true;
-                break;
-              }
-            }
-            if (needsFullRefresh) break;
-          }
-        }
       }
     }
 
@@ -208,6 +211,7 @@ class SimilarImagesService {
       await _cacheSimilarFiles(
         result,
         fileIDs.toSet(),
+        fileIDToPersonIDs,
         distanceThreshold,
         exact,
         DateTime.now().millisecondsSinceEpoch,
@@ -260,6 +264,7 @@ class SimilarImagesService {
         await _cacheSimilarFiles(
           existingGroups,
           currentFileIDsSet,
+          fileIDToPersonIDs,
           distanceThreshold,
           exact,
           cachedData.cachedTime,
@@ -366,6 +371,7 @@ class SimilarImagesService {
     await _cacheSimilarFiles(
       existingGroups,
       currentFileIDsSet,
+      fileIDToPersonIDs,
       distanceThreshold,
       exact,
       cachedData.cachedTime,
@@ -449,6 +455,7 @@ class SimilarImagesService {
   Future<void> _cacheSimilarFiles(
     List<SimilarFiles> similarGroups,
     Set<int> allCheckedFileIDs,
+    Map<int, Set<String>> fileIDToPersonIDs,
     double distanceThreshold,
     bool exact,
     int cachedTimeOfOriginalComputation,
@@ -460,6 +467,7 @@ class SimilarImagesService {
     final cacheObject = SimilarFilesCache(
       similarFilesJsonStringList: similarGroupsJsonStringList,
       allCheckedFileIDs: allCheckedFileIDs,
+      fileIDToPersonIDs: fileIDToPersonIDs,
       distanceThreshold: distanceThreshold,
       exact: exact,
       cachedTime: cachedTimeOfOriginalComputation,

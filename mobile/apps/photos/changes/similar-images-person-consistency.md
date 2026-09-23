@@ -1,1 +1,1 @@
-- Fixed similar photo groups retaining photos with different people after person assignments change.
+- Fixed similar photo groups not splitting or combining after person assignments change.
