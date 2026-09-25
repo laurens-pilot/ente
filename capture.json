@@ -1,0 +1,45 @@
+{
+  "source_repository": "ente/ente",
+  "source_ref": "main",
+  "source_commit": "8460e22b4795888e54ed756ad7fdee29488a558e",
+  "captured_on": "2026-09-25",
+  "device": "iOS 26 simulator",
+  "dimensions": [
+    1206,
+    2622
+  ],
+  "production_source_unmodified": true,
+  "verification_fixture": "auth@example.com; no live OTP",
+  "screenshots": [
+    {
+      "path": "before/login-dark.png",
+      "sha256": "853732d22a59f82fd0aa47313135179ebfaedc2c69ca63cb98e75805d831a8c4",
+      "flow": "Normal offline application navigation"
+    },
+    {
+      "path": "before/login-light.png",
+      "sha256": "0110af6ae9ab4cad565eed6a136d75e0d9d61e8a93247ffc05190c06e4964054",
+      "flow": "Normal offline application navigation"
+    },
+    {
+      "path": "before/settings-dark.png",
+      "sha256": "dd5ddd3711c3188268cfb9054c11d3a2022b47a5bb8bd25bf1d2fa88b1efb022",
+      "flow": "Normal offline application navigation"
+    },
+    {
+      "path": "before/settings-light.png",
+      "sha256": "7c3215e224da37e0502947a664c2b9593fbffc393577674cd9344f047a557b37",
+      "flow": "Normal offline application navigation"
+    },
+    {
+      "path": "before/verification-dark.png",
+      "sha256": "a6186d2580c2f4679edcd3cc4e5de6d81ab8ee7ddf25f007fb4e5758291379af",
+      "flow": "Production verification page with fixture data"
+    },
+    {
+      "path": "before/verification-light.png",
+      "sha256": "d1e5115a57c093583296593f69ab16789ceb243de1f807cf60d44fd9ff1fb87c",
+      "flow": "Production verification page with fixture data"
+    }
+  ]
+}
