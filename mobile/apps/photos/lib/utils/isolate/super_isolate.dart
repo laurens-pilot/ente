@@ -11,6 +11,8 @@ import "package:synchronized/synchronized.dart";
 
 @pragma('vm:entry-point')
 abstract class SuperIsolate {
+  static final _spawnedIsolates = <SuperIsolate>{};
+
   Logger get logger;
 
   Timer? _inactivityTimer;
@@ -29,6 +31,13 @@ abstract class SuperIsolate {
 
   bool get isIsolateSpawned => _isIsolateSpawned;
   bool _isIsolateSpawned = false;
+  Future<void>? _disposeFuture;
+
+  static Future<void> disposeAll() async {
+    await Future.wait(
+      _spawnedIsolates.toList().map((isolate) => isolate._disposeIsolate()),
+    );
+  }
 
   Future<void> _initIsolate() async {
     return _initIsolateLock.synchronized(() async {
@@ -52,6 +61,7 @@ abstract class SuperIsolate {
         if (shouldAutomaticDispose) _resetInactivityTimer();
         logger.info('initIsolate done');
         _isIsolateSpawned = true;
+        _spawnedIsolates.add(this);
       } catch (e) {
         logger.severe('Could not spawn isolate', e);
         _isIsolateSpawned = false;
@@ -172,14 +182,24 @@ abstract class SuperIsolate {
 
   Future<void> onDispose() async {}
 
-  void _disposeIsolate() async {
+  Future<void> _disposeIsolate() {
+    return _disposeFuture ??= _dispose().whenComplete(() {
+      _disposeFuture = null;
+    });
+  }
+
+  Future<void> _dispose() async {
     if (!_isIsolateSpawned) return;
     logger.info('Disposing isolate');
-    await onDispose();
-    await clearAllCachedData();
-    _isIsolateSpawned = false;
-    _isolate.kill();
-    _receivePort.close();
-    _inactivityTimer?.cancel();
+    try {
+      await onDispose();
+      await clearAllCachedData();
+    } finally {
+      _isIsolateSpawned = false;
+      _isolate.kill();
+      _receivePort.close();
+      _inactivityTimer?.cancel();
+      _spawnedIsolates.remove(this);
+    }
   }
 }

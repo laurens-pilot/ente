@@ -248,7 +248,7 @@ Future<void> runBackgroundTask(
   String taskId,
   TimeLogger tlog, {
   String mode = 'normal',
-  Duration? mlSelfStop,
+  required Duration? mlSelfStop,
   Duration? mlLockWait,
   MlRunControl? control,
   bool Function()? shouldStop,
@@ -256,15 +256,12 @@ Future<void> runBackgroundTask(
   // Created at task start so a stop that fires before ML begins stays
   // latched for the whole task.
   final mlRunControl = control ?? MlRunControl();
-  final mlBudget =
-      mlSelfStop ??
-      (Platform.isIOS ? kBGTaskMLSelfStopIOS : kBGTaskMLSelfStopAndroid);
-  if (mlBudget <= Duration.zero) {
+  if (mlSelfStop != null && mlSelfStop <= Duration.zero) {
     mlRunControl.requestStop(MlStopReason.backgroundDeadline);
   }
-  final mlSelfStopTimer = mlBudget > Duration.zero
+  final mlSelfStopTimer = mlSelfStop != null && mlSelfStop > Duration.zero
       ? Timer(
-          mlBudget,
+          mlSelfStop,
           () => mlRunControl.requestStop(MlStopReason.backgroundDeadline),
         )
       : null;

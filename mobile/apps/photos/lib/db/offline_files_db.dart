@@ -1,6 +1,4 @@
 import "package:logging/logging.dart";
-import "package:path/path.dart" show join;
-import "package:path_provider/path_provider.dart";
 import "package:photos/db/common/base.dart";
 import "package:photos/db/ml/schema.dart";
 import "package:sqlite_async/sqlite_async.dart";
@@ -17,26 +15,16 @@ class OfflineFilesDB with SqlDbBase {
 
   static const List<String> _migrationScripts = [createOfflineFileKeyMapTable];
 
-  Future<SqliteDatabase>? _sqliteAsyncDBFuture;
+  Future<SqliteDatabase> get asyncDB =>
+      getOrOpenDatabase(_initSqliteAsyncDatabase);
 
-  Future<SqliteDatabase> get asyncDB async {
-    _sqliteAsyncDBFuture ??= _initSqliteAsyncDatabase();
-    return _sqliteAsyncDBFuture!;
-  }
-
-  Future<SqliteDatabase> _initSqliteAsyncDatabase() async {
-    final documentsDirectory = await getApplicationDocumentsDirectory();
-    final String databaseDirectory = join(
-      documentsDirectory.path,
+  Future<SqliteDatabase> _initSqliteAsyncDatabase() {
+    return openMigratedDatabase(
       _databaseName,
-    );
-    _logger.info("Opening offline files DB at $databaseDirectory");
-    final asyncDBConnection = SqliteDatabase(
-      path: databaseDirectory,
+      _migrationScripts,
       maxReaders: 2,
+      logPath: (path) => _logger.info("Opening offline files DB at $path"),
     );
-    await migrate(asyncDBConnection, _migrationScripts);
-    return asyncDBConnection;
   }
 
   Future<int> getOrCreateLocalIntId(String localId) async {
