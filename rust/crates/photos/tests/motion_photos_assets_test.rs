@@ -4,49 +4,40 @@ use ente_photos::{
 };
 use std::path::{Path, PathBuf};
 
-fn fixture_dir() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("ENTE_TEST_FIXTURES_DIR") {
-        return Some(PathBuf::from(path).join("media/motion-photos/v1/files"));
+fn fixture_dir() -> PathBuf {
+    let root = std::env::var_os("ENTE_TEST_FIXTURES_DIR").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../test-fixtures"),
+        PathBuf::from,
+    );
+    let directory = root.join("media/motion-photos/v1/files");
+    for name in [
+        "motionphoto.jpg",
+        "motionphoto.heic",
+        "pixel_6_small_video.jpg",
+        "pixel_8.jpg",
+        "normalphoto.jpg",
+        "dual_mp4_video_last.jpg",
+        "dual_mp4_video_first.jpg",
+    ] {
+        let path = directory.join(name);
+        assert!(
+            path.is_file(),
+            "missing required motion-photo fixture: {}",
+            path.display()
+        );
     }
-
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir.parent()?.parent()?.parent()?;
-    let parent_of_repo = repo_root.parent()?;
-    Some(
-        parent_of_repo
-            .join("test-fixtures")
-            .join("media/motion-photos/v1/files"),
-    )
-}
-
-fn fixture(name: &str) -> Option<PathBuf> {
-    let mut path = fixture_dir()?;
-    path.push(name);
-    if path.exists() { Some(path) } else { None }
+    directory
 }
 
 #[test]
-fn validates_known_motion_photo_indices_when_fixtures_present() {
-    let Some(motion_jpg) = fixture("motionphoto.jpg") else {
-        eprintln!("Skipping: external fixture motionphoto.jpg not present");
-        return;
-    };
-    let Some(motion_heic) = fixture("motionphoto.heic") else {
-        eprintln!("Skipping: external fixture motionphoto.heic not present");
-        return;
-    };
-    let Some(pixel6) = fixture("pixel_6_small_video.jpg") else {
-        eprintln!("Skipping: external fixture pixel_6_small_video.jpg not present");
-        return;
-    };
-    let Some(pixel8) = fixture("pixel_8.jpg") else {
-        eprintln!("Skipping: external fixture pixel_8.jpg not present");
-        return;
-    };
-    let Some(normal) = fixture("normalphoto.jpg") else {
-        eprintln!("Skipping: external fixture normalphoto.jpg not present");
-        return;
-    };
+#[ignore = "requires external motion-photo fixtures; see crates/photos/README.md"]
+fn validates_known_motion_photo_indices() {
+    let directory = fixture_dir();
+    let motion_jpg = directory.join("motionphoto.jpg");
+    let motion_heic = directory.join("motionphoto.heic");
+    let pixel6 = directory.join("pixel_6_small_video.jpg");
+    let pixel8 = directory.join("pixel_8.jpg");
+    let normal = directory.join("normalphoto.jpg");
 
     let motion_jpg_index = get_motion_video_index_from_path(&motion_jpg)
         .expect("read motionphoto.jpg")
@@ -84,10 +75,7 @@ fn validates_known_motion_photo_indices_when_fixtures_present() {
         .expect("video present");
     assert!(motion_heic_video.len() > 1_000_000);
 
-    let Some(dual_mp4) = fixture("dual_mp4_video_last.jpg") else {
-        eprintln!("Skipping: external fixture dual_mp4_video_last.jpg not present");
-        return;
-    };
+    let dual_mp4 = directory.join("dual_mp4_video_last.jpg");
     let dual_index = get_motion_video_index_from_path(&dual_mp4)
         .expect("read dual_mp4_video_last.jpg")
         .expect("dual_mp4_video_last.jpg should have index");
@@ -99,10 +87,7 @@ fn validates_known_motion_photo_indices_when_fixtures_present() {
         .expect("video present");
     assert!(dual_video.len() > 1_000_000);
 
-    let Some(dual_mp4_first) = fixture("dual_mp4_video_first.jpg") else {
-        eprintln!("Skipping: external fixture dual_mp4_video_first.jpg not present");
-        return;
-    };
+    let dual_mp4_first = directory.join("dual_mp4_video_first.jpg");
     let dual_first_index = get_motion_video_index_from_path(&dual_mp4_first)
         .expect("read dual_mp4_video_first.jpg")
         .expect("dual_mp4_video_first.jpg should have index");
@@ -116,7 +101,9 @@ fn validates_known_motion_photo_indices_when_fixtures_present() {
 }
 
 #[test]
-fn file_extraction_matches_video_bytes_when_fixtures_present() {
+#[ignore = "requires external motion-photo fixtures; see crates/photos/README.md"]
+fn file_extraction_matches_video_bytes() {
+    let directory = fixture_dir();
     let output_directory = tempfile::tempdir().expect("output directory");
     for name in [
         "motionphoto.jpg",
@@ -125,10 +112,7 @@ fn file_extraction_matches_video_bytes_when_fixtures_present() {
         "dual_mp4_video_last.jpg",
         "dual_mp4_video_first.jpg",
     ] {
-        let Some(path) = fixture(name) else {
-            eprintln!("Skipping: external fixture {name} not present");
-            return;
-        };
+        let path = directory.join(name);
         let source = std::fs::read(&path).expect("read fixture");
         let index = get_motion_video_index_from_path(&path)
             .expect("find video")
@@ -155,7 +139,9 @@ fn file_extraction_matches_video_bytes_when_fixtures_present() {
 }
 
 #[test]
-fn reads_xmp_attributes_when_fixtures_present() {
+#[ignore = "requires external motion-photo fixtures; see crates/photos/README.md"]
+fn reads_xmp_attributes() {
+    let directory = fixture_dir();
     for (name, length, mime) in [
         ("motionphoto.heic", "80", "video/mp4"),
         ("pixel_6_small_video.jpg", "1789460", "video/mp4"),
@@ -163,10 +149,7 @@ fn reads_xmp_attributes_when_fixtures_present() {
         ("dual_mp4_video_last.jpg", "4048544", "video/mp4"),
         ("pixel_8.jpg", "9554", "image/jpeg"),
     ] {
-        let Some(path) = fixture(name) else {
-            eprintln!("Skipping: external fixture {name} not present");
-            return;
-        };
+        let path = directory.join(name);
         let data = extract_xmp_from_path(path).expect("extract fixture XMP");
         assert_eq!(data.get("Item:Length").unwrap(), length, "{name}");
         assert_eq!(data.get("Item:Mime").unwrap(), mime, "{name}");

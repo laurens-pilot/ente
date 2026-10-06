@@ -378,8 +378,29 @@ mod benchmarks {
     use super::*;
     use std::time::Instant;
 
+    fn timing_quantiles(times: &mut [f64]) -> (f64, f64) {
+        assert!(!times.is_empty());
+        times.sort_by(f64::total_cmp);
+        let middle = times.len() / 2;
+        let median = if times.len().is_multiple_of(2) {
+            (times[middle - 1] + times[middle]) / 2.0
+        } else {
+            times[middle]
+        };
+        let p95 = times[(times.len() * 95).div_ceil(100) - 1];
+        (median, p95)
+    }
+
     #[test]
-    #[ignore = "release performance and allocation measurements"]
+    fn timing_quantiles_use_the_median_and_nearest_rank_p95() {
+        let mut twenty: Vec<f64> = (1..=20).rev().map(f64::from).collect();
+        assert_eq!(timing_quantiles(&mut twenty), (10.5, 19.0));
+        assert_eq!(timing_quantiles(&mut [3.0, 1.0, 2.0]), (2.0, 3.0));
+        assert_eq!(timing_quantiles(&mut [7.0]), (7.0, 7.0));
+    }
+
+    #[test]
+    #[ignore = "release performance and buffer-size report"]
     fn render_source_and_output_budgets() -> OpResult<()> {
         for (width, height) in [(4000, 3000), (6000, 4000), (8000, 6000)] {
             let source = ImageU8::new(
@@ -401,13 +422,13 @@ mod benchmarks {
                     times.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
                 let cold = times.remove(0);
-                times.sort_by(f64::total_cmp);
+                let (median, p95) = timing_quantiles(&mut times);
                 println!(
                     "render {width}x{height} -> {}x{}, cold_ms={cold:.3}, median_ms={:.3}, p95_ms={:.3}, decoded_source_bytes={}, output_bytes={}",
                     plan.width,
                     plan.height,
-                    times[2],
-                    times[4],
+                    median,
+                    p95,
                     source.data.len(),
                     plan.width as usize * plan.height as usize * 3
                 );

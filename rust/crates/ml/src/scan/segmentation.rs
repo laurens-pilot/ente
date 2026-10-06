@@ -194,12 +194,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod model_parity_tests {
+mod model_repeatability_tests {
     use super::*;
 
     #[test]
     #[ignore = "requires ENTE_SCAN_MODEL and ENTE_SCAN_INPUT_GOLDENS"]
-    fn golden_tensor_bytes_and_same_provider_outputs_match() -> OpResult<()> {
+    fn prepared_input_matches_goldens_and_inference_is_repeatable() -> OpResult<()> {
         let model = std::env::var("ENTE_SCAN_MODEL").map_err(|e| e.to_string())?;
         let directory = std::env::var("ENTE_SCAN_INPUT_GOLDENS").map_err(|e| e.to_string())?;
         let segmenter = Segmenter::new(&model).map_err(|e| e.to_string())?;
@@ -212,18 +212,15 @@ mod model_parity_tests {
                 std::fs::read(format!("{directory}/bgr-{w}-{h}.f32")).map_err(|e| e.to_string())?;
             let actual_bytes: Vec<u8> = prepared.iter().flat_map(|v| v.to_le_bytes()).collect();
             assert_eq!(actual_bytes, golden_bytes);
-            let golden = golden_bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&b| f32::from_le_bytes(b))
-                .collect();
-            let expected = segmenter.infer(golden)?;
-            let actual = segmenter.infer(prepared)?;
-            assert_eq!(actual, expected);
+            let first = segmenter.infer(prepared.clone())?;
+            let repeated = segmenter.infer(prepared)?;
+            assert_eq!(
+                repeated, first,
+                "same-provider inference must be repeatable"
+            );
             println!(
-                "same-provider input/output parity {w}x{h}: {} float samples",
-                actual.len()
+                "input golden matched; inference repeatable for {w}x{h}: {} float samples (output correctness not checked)",
+                first.len()
             );
         }
         Ok(())

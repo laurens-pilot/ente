@@ -347,6 +347,14 @@ enum SlotHandoff<'a> {
 }
 
 fn wait_for_teardown_handoff<'a>(slot: &'a Mutex<PathSlot>, path: &Path) -> SlotHandoff<'a> {
+    wait_for_teardown_handoff_with(slot, path, std::thread::sleep)
+}
+
+fn wait_for_teardown_handoff_with<'a>(
+    slot: &'a Mutex<PathSlot>,
+    path: &Path,
+    mut wait: impl FnMut(Duration),
+) -> SlotHandoff<'a> {
     let mut dead_rounds = HANDOFF_WAIT_ROUNDS;
     let mut close_rounds = HANDOFF_CLOSE_WAIT_ROUNDS;
     loop {
@@ -375,7 +383,7 @@ fn wait_for_teardown_handoff<'a>(slot: &'a Mutex<PathSlot>, path: &Path) -> Slot
                 dead_rounds -= 1;
             }
         }
-        std::thread::sleep(HANDOFF_WAIT_PARK);
+        wait(HANDOFF_WAIT_PARK);
     }
 }
 
@@ -525,7 +533,7 @@ impl VecDb {
     }
 
     pub fn bulk_add(&self, keys: &[String], vectors: &[Vec<f32>]) -> Result<(), VecDbError> {
-        self.bulk_add_internal(keys, vectors, None)
+        self.bulk_add_internal(keys, vectors, None, |_| {})
     }
 
     pub fn bulk_add_with_attrs(
@@ -540,7 +548,7 @@ impl VecDb {
                 vectors: attrs.len(),
             });
         }
-        self.bulk_add_internal(keys, vectors, Some(attrs))
+        self.bulk_add_internal(keys, vectors, Some(attrs), |_| {})
     }
 
     fn bulk_add_internal(
@@ -548,6 +556,7 @@ impl VecDb {
         keys: &[String],
         vectors: &[Vec<f32>],
         attrs: Option<&[Option<Vec<Attribute>>]>,
+        mut after_apply: impl FnMut(usize),
     ) -> Result<(), VecDbError> {
         if keys.len() != vectors.len() {
             return Err(VecDbError::LengthMismatch {
@@ -618,13 +627,14 @@ impl VecDb {
             })
             .collect();
         state.log.append(&records)?;
-        for &index in &scheduled {
+        for (applied, &index) in scheduled.iter().enumerate() {
             apply_add(
                 &self.shared,
                 &keys[index],
                 payload_of(index),
                 attrs_of(index),
             )?;
+            after_apply(applied + 1);
         }
         apply_policy(&self.shared, &mut half, scheduled.len(), now)
     }
@@ -818,7 +828,11 @@ impl VecDb {
     }
 
     pub fn flush(&self) -> Result<(), VecDbError> {
-        let mut half = self.writable_half()?;
+        self.flush_after_contention(|| {})
+    }
+
+    fn flush_after_contention(&self, on_contended: impl FnOnce()) -> Result<(), VecDbError> {
+        let mut half = self.writable_half_after_contention(on_contended)?;
         let state = active_state(&mut half)?;
         if state.mutations_since_snapshot == 0 {
             return Ok(());
@@ -962,11 +976,25 @@ impl VecDb {
     }
 
     fn writable_half(&self) -> Result<MutexGuard<'_, WriterHalf>, VecDbError> {
+        self.writable_half_after_contention(|| {})
+    }
+
+    fn writable_half_after_contention(
+        &self,
+        on_contended: impl FnOnce(),
+    ) -> Result<MutexGuard<'_, WriterHalf>, VecDbError> {
         self.shared.ensure_open()?;
         if self.read_only {
             return Err(VecDbError::ReadOnly);
         }
-        let half = self.shared.writer_half();
+        let half = match self.shared.writer.try_lock() {
+            Ok(half) => half,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                on_contended();
+                self.shared.writer_half()
+            }
+        };
         self.shared.ensure_open()?;
         Ok(half)
     }
@@ -3636,16 +3664,18 @@ mod tests {
         drop(db);
         assert_eq!(weak.strong_count(), 0);
         let slot = Arc::new(Mutex::new(PathSlot { live: Some(weak) }));
-        let started = Instant::now();
-        let outcome = wait_for_teardown_handoff(&slot, &path);
-        let waited = started.elapsed();
+        let mut waits = 0;
+        let outcome = wait_for_teardown_handoff_with(&slot, &path, |duration| {
+            assert_eq!(duration, HANDOFF_WAIT_PARK);
+            waits += 1;
+            assert!(waits <= HANDOFF_WAIT_ROUNDS);
+        });
         match outcome {
             SlotHandoff::Expired(guard) => assert!(!guard.holds_live()),
             SlotHandoff::Join(_) => panic!("expected an expired wait, saw a join"),
             SlotHandoff::Released(_) => panic!("expected an expired wait, saw a release"),
         }
-        assert!(waited >= HANDOFF_WAIT_PARK * HANDOFF_WAIT_ROUNDS);
-        assert!(waited < HANDOFF_WAIT_PARK * HANDOFF_WAIT_ROUNDS * 2);
+        assert_eq!(waits, HANDOFF_WAIT_ROUNDS);
     }
 
     fn closed_instance(path: &Path) -> Arc<Shared> {
@@ -3671,15 +3701,18 @@ mod tests {
         let slot = Arc::new(Mutex::new(PathSlot {
             live: Some(Arc::downgrade(&closed)),
         }));
-        let started = Instant::now();
-        let outcome = wait_for_teardown_handoff(&slot, &path);
-        let waited = started.elapsed();
+        let mut waits = 0;
+        let outcome = wait_for_teardown_handoff_with(&slot, &path, |duration| {
+            assert_eq!(duration, HANDOFF_WAIT_PARK);
+            waits += 1;
+            assert!(waits <= HANDOFF_CLOSE_WAIT_ROUNDS);
+        });
         match outcome {
             SlotHandoff::Expired(guard) => assert!(guard.holds_live()),
             SlotHandoff::Join(_) => panic!("expected an expired wait, saw a join"),
             SlotHandoff::Released(_) => panic!("expected an expired wait, saw a release"),
         }
-        assert!(waited >= HANDOFF_WAIT_PARK * HANDOFF_CLOSE_WAIT_ROUNDS);
+        assert_eq!(waits, HANDOFF_CLOSE_WAIT_ROUNDS);
     }
 
     #[test]
@@ -5088,7 +5121,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_bulk_add_with_live_readers_and_flush() {
+    fn stress_bulk_add_with_readers_and_flush() {
         const READERS: usize = 3;
         const BULK: usize = 2000;
         let dir = TempDir::new().unwrap();
@@ -5156,6 +5189,83 @@ mod tests {
         assert!(flusher.join().unwrap() > 0);
         assert_eq!(writer.len().unwrap(), 50 + BULK);
         assert_eq!(writer.stats().unwrap().live_count, 50 + BULK);
+    }
+
+    #[test]
+    fn bulk_add_exposes_applied_prefix_to_readers_and_serializes_flush() {
+        const BULK: usize = 200;
+        assert!(50 + BULK < SNAPSHOT_QUIET_THRESHOLD.min(SNAPSHOT_HARD_CAP));
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("db");
+        let writer = open_writer(&path);
+        let pre = bulk_entries(10_000, 50, 900);
+        bulk_add(&writer, &pre).unwrap();
+        let bulk = bulk_entries(0, BULK, 700);
+        let expected: HashMap<String, Vec<f32>> = pre.iter().chain(bulk.iter()).cloned().collect();
+        let (keys, vectors): (Vec<_>, Vec<_>) = bulk.into_iter().unzip();
+        let inserting = open_writer(&path);
+        let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (inserted_tx, inserted_rx) = std::sync::mpsc::channel();
+        let insert = thread::spawn(move || {
+            let result = inserting.bulk_add_internal(&keys, &vectors, None, |applied| {
+                if applied == BULK / 2 {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+                }
+            });
+            inserted_tx.send(result).unwrap();
+        });
+        paused_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert!(!insert.is_finished());
+        for reader_index in 0..3 {
+            let reader = VecDb::open(&path, DIMS, Some(StorageKind::F32)).unwrap();
+            assert_eq!(reader.len().unwrap(), 50 + BULK / 2);
+            assert!(reader.contains("key-0").unwrap());
+            assert!(reader.contains(&format!("key-{}", BULK / 2 - 1)).unwrap());
+            assert!(!reader.contains(&format!("key-{}", BULK / 2)).unwrap());
+            assert!(!reader.contains(&format!("key-{}", BULK - 1)).unwrap());
+            let query = seeded_unit_vector(31_337 + reader_index, DIMS);
+            let found = reader.search(&query, &limit_params(8)).unwrap();
+            assert_eq!(found.len(), 8);
+            for entry in found {
+                assert_eq!(
+                    &reader.get(&entry.key).unwrap().unwrap(),
+                    &expected[&entry.key]
+                );
+            }
+        }
+        let flushing = open_writer(&path);
+        let (contended_tx, contended_rx) = std::sync::mpsc::channel();
+        let (flushed_tx, flushed_rx) = std::sync::mpsc::channel();
+        let flush = thread::spawn(move || {
+            let result = flushing.flush_after_contention(|| contended_tx.send(()).unwrap());
+            flushed_tx.send(result).unwrap();
+        });
+        contended_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        resume_tx.send(()).unwrap();
+        inserted_rx
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        flushed_rx
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap()
+            .unwrap();
+        insert.join().unwrap();
+        flush.join().unwrap();
+        assert_eq!(writer.len().unwrap(), 50 + BULK);
+        assert_eq!(writer.stats().unwrap().live_count, 50 + BULK);
+        assert_eq!(writer.stats().unwrap().records_since_snapshot, 0);
+        for (key, vector) in &expected {
+            assert_eq!(writer.get(key).unwrap().as_ref(), Some(vector));
+        }
+        drop(writer);
+        let reopened = open_writer(&path);
+        assert_eq!(reopened.len().unwrap(), expected.len());
+        for (key, vector) in &expected {
+            assert_eq!(reopened.get(key).unwrap().as_ref(), Some(vector));
+        }
     }
 
     #[test]

@@ -292,32 +292,56 @@ mod tests {
 
     #[test]
     fn generate_face_thumbnails_returns_jpeg_per_input_face() {
-        let decoded = synthetic_decoded_image(16, 16);
-        let face_boxes = vec![
+        let colors = [[220, 30, 50], [20, 200, 60]];
+        let mut rgb = Vec::new();
+        for y in 0..80 {
+            for x in 0..80 {
+                rgb.extend_from_slice(if x >= 40 && y < 40 {
+                    &colors[0]
+                } else if x < 40 && y >= 40 {
+                    &colors[1]
+                } else {
+                    &[20, 40, 210]
+                });
+            }
+        }
+        let decoded = DecodedImage {
+            rgb,
+            dimensions: Dimensions {
+                width: 80,
+                height: 80,
+            },
+        };
+        let face_boxes = [
             FaceBox {
-                x: 0.1,
-                y: 0.1,
-                width: 0.4,
-                height: 0.4,
+                x: 0.625,
+                y: 0.125,
+                width: 0.25,
+                height: 0.25,
             },
             FaceBox {
-                x: 0.4,
-                y: 0.2,
-                width: 0.3,
-                height: 0.5,
+                x: 0.125,
+                y: 0.625,
+                width: 0.25,
+                height: 0.25,
             },
         ];
+        let thumbnails = generate_face_thumbnails(&decoded, &face_boxes).unwrap();
 
-        let thumbnails =
-            generate_face_thumbnails(&decoded, &face_boxes).expect("thumbnails should generate");
-
-        assert_eq!(thumbnails.len(), 2);
-        for bytes in thumbnails {
-            assert!(!bytes.is_empty());
-            let decoded_jpeg = image::load_from_memory_with_format(&bytes, ImageFormat::Jpeg)
-                .expect("thumbnail bytes should decode as JPEG");
-            assert!(decoded_jpeg.width() > 0);
-            assert!(decoded_jpeg.height() > 0);
+        assert_eq!(thumbnails.len(), colors.len());
+        for (bytes, expected) in thumbnails.iter().zip(colors) {
+            let image = image::load_from_memory_with_format(bytes, ImageFormat::Jpeg)
+                .unwrap()
+                .to_rgb8();
+            assert_eq!(image.dimensions(), (512, 512));
+            for (x, y) in [(64, 64), (256, 256), (448, 448)] {
+                for (actual, expected) in image.get_pixel(x, y).0.into_iter().zip(expected) {
+                    assert!(
+                        actual.abs_diff(expected) <= 3,
+                        "pixel ({x}, {y}): {actual} != {expected}"
+                    );
+                }
+            }
         }
     }
 

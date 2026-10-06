@@ -449,17 +449,33 @@ mod tests {
 
     #[test]
     fn streamed_rows_match_area_reference_including_adam7_and_thin_images() {
-        for (width, height) in [(1, 19), (19, 1), (2, 3), (13, 17), (31, 23)] {
+        for ((width, height), targets) in [
+            ((1, 19), [(1, 1), (1, 2), (1, 7), (1, 13), (1, 19)]),
+            ((19, 1), [(1, 1), (2, 1), (7, 1), (13, 1), (19, 1)]),
+            ((2, 3), [(1, 1), (1, 2), (2, 3), (2, 3), (2, 3)]),
+            ((13, 17), [(1, 1), (1, 2), (5, 7), (9, 13), (13, 17)]),
+            ((31, 23), [(1, 1), (2, 1), (7, 5), (13, 9), (31, 23)]),
+        ] {
             let pixels = (0..width * height * 3)
                 .map(|i| ((i * 37 + 11) % 256) as u8)
                 .collect::<Vec<_>>();
             for interlaced in [false, true] {
                 let bytes = fixture(rgb_info(width, height, interlaced), &pixels);
                 assert_eq!(decode_image_from_bytes(&bytes).unwrap().rgb, pixels);
-                for max_side in [1, 2, 7, 13, 40] {
+                for (max_side, (target_width, target_height)) in
+                    [1, 2, 7, 13, 40].into_iter().zip(targets)
+                {
                     let decoded = decode_bounded(ImageInput::Bytes(&bytes), max_side).unwrap();
-                    let reference =
-                        area_reference(&pixels, width, height, &decoded.image.dimensions);
+                    let target = Dimensions {
+                        width: target_width,
+                        height: target_height,
+                    };
+                    assert_eq!(decoded.image.dimensions, target);
+                    assert_eq!(
+                        decoded.image.rgb.len(),
+                        (target_width * target_height * 3) as usize
+                    );
+                    let reference = area_reference(&pixels, width, height, &target);
                     assert_eq!(decoded.original_dimensions, Dimensions { width, height });
                     assert!(
                         decoded
@@ -762,8 +778,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "200 MP streaming memory regression; run in release mode"]
-    fn streams_200_megapixels() {
+    #[ignore = "200 MP functional smoke test; run in release mode; does not measure peak memory"]
+    fn decodes_200_megapixels_to_bounded_constant_pixels() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("large.png");
         let mut encoder = ::png::Encoder::new(File::create(&path).unwrap(), 20_000, 10_000);
@@ -785,6 +801,7 @@ mod tests {
                 height: 3000
             }
         );
+        assert_eq!(output.image.rgb.len(), 6000 * 3000 * 3);
         assert!(output.image.rgb.iter().all(|&value| value == 128));
     }
 }
