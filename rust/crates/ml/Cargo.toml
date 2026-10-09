@@ -22,8 +22,6 @@ plsfix = "0.1.8"
 rayon = "1.12.0"
 regex.workspace = true
 thiserror.workspace = true
-# The FRB photos bridge calls the SimSIMD symbol exported by usearch 2.21.x.
-# Newer usearch releases switched that implementation to numkong symbols.
 usearch = { version = "=2.21.4", optional = true }
 
 # Cargokit sets ORT_LIB_PATH to Ente's verified iOS archive.
