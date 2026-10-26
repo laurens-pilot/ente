@@ -3,9 +3,12 @@ import "dart:io" show File, Platform;
 import "dart:math" show min;
 import "dart:typed_data" show Uint8List;
 
+import "package:dio/dio.dart";
 import "package:flutter/foundation.dart" show kDebugMode;
-import "package:flutter/widgets.dart" show AppLifecycleState, WidgetsBinding;
+import "package:flutter/widgets.dart"
+    show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 import "package:logging/logging.dart";
+import "package:photos/core/configuration.dart";
 import "package:photos/core/event_bus.dart";
 import "package:photos/db/files_db.dart";
 import "package:photos/db/ml/base.dart";
@@ -40,7 +43,7 @@ import "package:photos/utils/ml_util.dart";
 import "package:photos/utils/network_util.dart";
 import "package:photos/utils/ram_check_util.dart";
 
-class MLService {
+class MLService with WidgetsBindingObserver {
   final _logger = Logger("MLService");
 
   MLService._privateConstructor();
@@ -65,9 +68,13 @@ class MLService {
   MlRunControl? _activeRunControl;
   Timer? _deniedRunRetryTimer;
   Timer? _predownloadLocalModelsTimer;
+  Timer? _syncRetryTimer;
+  MlRunControl? _syncRetryRunControl;
+  int _syncRetryGeneration = 0;
 
   static const _kPredownloadLocalModelsDelay = Duration(seconds: 10);
   static const _kDeniedRunRetryDelay = Duration(seconds: 15);
+  static const _kSyncRetryDelay = Duration(seconds: 15);
 
   bool get isRunningML =>
       MlProcessLock.instance.activeOperation == MlOperation.fullRun;
@@ -137,6 +144,9 @@ class MLService {
     });
     _syncMlControllerStatusForBg();
 
+    if (!isProcessBg) {
+      WidgetsBinding.instance.addObserver(this);
+    }
     _isInitialized = true;
     _schedulePredownloadLocalModels();
     scheduleStartupOwnedRemoteHydration();
@@ -344,6 +354,27 @@ class MLService {
     int? maxFilesToIndex,
     MlRunControl? control,
     Duration? lockWait,
+  }) {
+    _cancelSyncRetry();
+    return _runAllML(
+      force: force,
+      remoteSyncOnly: remoteSyncOnly,
+      allowImageIndexing: allowImageIndexing,
+      maxFilesToIndex: maxFilesToIndex,
+      control: control,
+      lockWait: lockWait,
+      syncRetryGeneration: _syncRetryGeneration,
+    );
+  }
+
+  Future<MlRunDisposition> _runAllML({
+    bool force = false,
+    bool remoteSyncOnly = false,
+    bool allowImageIndexing = true,
+    int? maxFilesToIndex,
+    MlRunControl? control,
+    Duration? lockWait,
+    int? syncRetryGeneration,
   }) async {
     final runControl = control ?? MlRunControl();
     // A latched stop always wins, force included.
@@ -356,7 +387,9 @@ class MLService {
     }
     if (isRunningML) {
       _logger.info("runAllML called while already running, skipping");
-      _scheduleDeniedRunRetry();
+      if (syncRetryGeneration != null) {
+        _scheduleDeniedRunRetry();
+      }
       return MlRunDisposition.denied;
     }
     if (!hasGrantedMLConsent) {
@@ -385,6 +418,8 @@ class MLService {
       return MlRunDisposition.denied;
     }
     var disposition = MlRunDisposition.completed;
+    var transientInitialSyncFailure = false;
+    final userID = Configuration.instance.getUserID();
     try {
       final attempt = await _runExclusiveWithControl(
         MlOperation.fullRun,
@@ -397,6 +432,14 @@ class MLService {
             allowImageIndexing: allowImageIndexing,
             maxFilesToIndex: maxFilesToIndex,
             control: runControl,
+            onInitialSyncError: (error) {
+              transientInitialSyncFailure =
+                  error is DioException &&
+                  (error.type == DioExceptionType.connectionError ||
+                      error.type == DioExceptionType.connectionTimeout ||
+                      error.type == DioExceptionType.sendTimeout ||
+                      error.type == DioExceptionType.receiveTimeout);
+            },
           );
         },
         lockWait: lockWait,
@@ -404,7 +447,9 @@ class MLService {
       if (attempt != MlLockAttempt.ran) {
         _logger.info("runAllML denied the ml process lock (${attempt.name})");
         disposition = MlRunDisposition.denied;
-        _scheduleDeniedRunRetry();
+        if (syncRetryGeneration != null) {
+          _scheduleDeniedRunRetry();
+        }
       }
     } catch (e, s) {
       _logger.severe("runAllML failed", e, s);
@@ -412,7 +457,74 @@ class MLService {
     } finally {
       computeController.releaseCompute(ml: true);
     }
+    if (transientInitialSyncFailure &&
+        syncRetryGeneration != null &&
+        userID != null) {
+      _scheduleSyncRetry(
+        generation: syncRetryGeneration,
+        control: runControl,
+        userID: userID,
+        mode: mode,
+        retry: () => _runAllML(
+          remoteSyncOnly: remoteSyncOnly,
+          allowImageIndexing: allowImageIndexing,
+          maxFilesToIndex: maxFilesToIndex,
+          control: runControl,
+          lockWait: lockWait,
+        ),
+      );
+    }
     return disposition;
+  }
+
+  void _cancelSyncRetry() {
+    _syncRetryGeneration++;
+    _syncRetryTimer?.cancel();
+    _syncRetryTimer = null;
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      _cancelSyncRetry();
+      _syncRetryRunControl?.requestStop(MlStopReason.appPaused);
+    }
+  }
+
+  void _scheduleSyncRetry({
+    required int generation,
+    required MlRunControl control,
+    required int userID,
+    required MLMode mode,
+    required Future<MlRunDisposition> Function() retry,
+  }) {
+    bool canRetry() =>
+        !isProcessBg &&
+        generation == _syncRetryGeneration &&
+        !control.stopRequested &&
+        hasGrantedMLConsent &&
+        Configuration.instance.getUserID() == userID &&
+        (isLocalGalleryMode ? MLMode.localGallery : MLMode.enteGallery) ==
+            mode &&
+        WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed;
+
+    if (!canRetry()) return;
+    _logger.info(
+      "Scheduling one ML retry after transient initial sync failure",
+    );
+    _syncRetryTimer = Timer(_kSyncRetryDelay, () {
+      _syncRetryTimer = null;
+      if (!canRetry()) return;
+      _logger.info("Retrying ML after transient initial sync failure");
+      _syncRetryRunControl = control;
+      unawaited(
+        retry().whenComplete(() {
+          if (identical(_syncRetryRunControl, control)) {
+            _syncRetryRunControl = null;
+          }
+        }),
+      );
+    });
   }
 
   // FG-only: one coalesced retry after a lock denial, because the natural
@@ -440,6 +552,7 @@ class MLService {
     required bool allowImageIndexing,
     required int? maxFilesToIndex,
     required MlRunControl control,
+    required void Function(Object) onInitialSyncError,
   }) async {
     assert(MlProcessLock.instance.isBusy, "ml funnel must be held");
     if (control.stopRequested) {
@@ -451,7 +564,12 @@ class MLService {
       if (remoteSyncOnly && mode == MLMode.localGallery) {
         return MlRunDisposition.completed;
       }
-      await _sync();
+      try {
+        await _sync();
+      } catch (e) {
+        onInitialSyncError(e);
+        rethrow;
+      }
       if (control.stopRequested) {
         _logRunStopped(control, "after sync");
         return MlRunDisposition.stopped;
@@ -590,6 +708,7 @@ class MLService {
   }
 
   void stopActiveRun(MlStopReason reason) {
+    _cancelSyncRetry();
     for (final control in _runControls.toList(growable: false)) {
       control.requestStop(reason);
     }

@@ -1,0 +1,1 @@
+- Machine learning now retries once after a temporary connection failure while the app is in the foreground.
