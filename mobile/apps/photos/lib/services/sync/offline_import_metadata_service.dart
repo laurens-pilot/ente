@@ -10,6 +10,7 @@ import "package:photos/main.dart" show isProcessBg;
 import "package:photos/models/file/file.dart";
 import "package:photos/models/location/location.dart";
 import "package:photos/module/download/file.dart";
+import "package:photos/module/metadata/asset_location.dart";
 import "package:photos/module/metadata/exif.dart";
 import "package:photos/module/metadata/local_file.dart";
 import 'package:photos/module/metadata/location.dart';
@@ -173,7 +174,7 @@ class OfflineImportMetadataService {
           );
         }
         if (shouldFetchAssetLocation) {
-          final latLong = await asset.latlngAsync();
+          final latLong = await getAssetLocation(asset);
           if (latLong != null) {
             file.location = Location(
               latitude: latLong.latitude,

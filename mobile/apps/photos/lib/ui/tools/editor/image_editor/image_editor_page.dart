@@ -18,6 +18,7 @@ import "package:photos/db/files_db.dart";
 import "package:photos/events/local_photos_updated_event.dart";
 import 'package:photos/models/file/file.dart' as ente;
 import "package:photos/models/location/location.dart";
+import "package:photos/module/metadata/asset_location.dart";
 import "package:photos/module/metadata/local_file.dart";
 import "package:photos/services/sync/sync_service.dart";
 import "package:photos/ui/common/photo_library_add_permission.dart";
@@ -133,7 +134,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       if (!newFile.hasLocation && widget.originalFile.localID != null) {
         final assetEntity = await widget.originalFile.getAsset;
         if (assetEntity != null) {
-          final latLong = await assetEntity.latlngAsync();
+          final latLong = await getAssetLocation(assetEntity);
           newFile.location = Location(
             latitude: latLong?.latitude,
             longitude: latLong?.longitude,

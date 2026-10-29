@@ -20,6 +20,7 @@ import "package:photos/models/location/location.dart";
 import 'package:photos/module/download/file.dart';
 import 'package:photos/module/download/thumbnail.dart';
 import 'package:photos/module/live_photo/upload.dart';
+import 'package:photos/module/metadata/asset_location.dart';
 import "package:photos/module/metadata/exif.dart";
 import 'package:photos/module/metadata/location.dart';
 import "package:photos/module/metadata/video.dart";
@@ -280,7 +281,7 @@ Future<void> _decorateEnteFileData(
 ) async {
   // Fetch missing Android Q+ location data lazily during upload.
   if (!file.hasLocation) {
-    final latLong = await asset.latlngAsync();
+    final latLong = await getAssetLocation(asset);
     if (latLong != null) {
       file.location = Location(
         latitude: latLong.latitude,
