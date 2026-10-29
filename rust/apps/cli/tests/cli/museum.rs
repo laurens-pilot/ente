@@ -241,6 +241,152 @@ fn login_save_failures_follow_the_vault_replacement() -> TestResult {
     })
 }
 
+#[test]
+fn file_lists_filter_and_sort_server_metadata() -> TestResult {
+    Museum::run_async(|origin| async move {
+        let email = format!("file-filters-{}@example.org", Uuid::new_v4());
+        let account = create_account(&origin, &email).await;
+        let home = TestHome::new();
+        login(&home, "photos", &email, &["--host", &origin]);
+        let (trips, trips_key) = create_album(&origin, &account, "Trips", "album").await;
+        let (family, family_key) = create_album(&origin, &account, "Family", "album").await;
+        let (beach, beach_key) = upload_fixture(
+            &origin,
+            &account,
+            trips,
+            &trips_key,
+            &[1; 300],
+            json!({"title": "Beach.jpg", "fileType": 0, "creationTime": 1_700_000_000_000_000i64,
+                "latitude": 1.0, "longitude": 2.0}),
+        )
+        .await;
+        export::edit_file(
+            &origin,
+            &account,
+            beach,
+            &beach_key,
+            1,
+            json!({"caption": "Sunset at the beach"}),
+        )
+        .await;
+        let (clip, _) = upload_fixture(
+            &origin,
+            &account,
+            trips,
+            &trips_key,
+            &[2; 5000],
+            json!({"title": "Clip.mp4", "fileType": 1, "creationTime": 1_717_200_000_000_000i64}),
+        )
+        .await;
+        let (live, live_key) = upload_fixture(
+            &origin,
+            &account,
+            family,
+            &family_key,
+            &[3; 1000],
+            json!({"title": "Live.heic", "fileType": 2, "creationTime": 1_735_689_600_000_000i64,
+                "latitude": 3.0, "longitude": 4.0}),
+        )
+        .await;
+        export::edit_file(
+            &origin,
+            &account,
+            live,
+            &live_key,
+            1,
+            json!({"caption": "Family dinner"}),
+        )
+        .await;
+        let (holiday, holiday_key) = upload_fixture(
+            &origin,
+            &account,
+            family,
+            &family_key,
+            &[4; 2000],
+            json!({"title": "Holiday.JPG", "fileType": 0, "creationTime": 1_262_304_000_000_000i64}),
+        )
+        .await;
+        export::edit_file(
+            &origin,
+            &account,
+            holiday,
+            &holiday_key,
+            1,
+            json!({"editedTime": 1_710_028_800_000_000i64}),
+        )
+        .await;
+        export::place(
+            &origin,
+            &account,
+            trips,
+            &trips_key,
+            holiday,
+            &holiday_key,
+            "add-files",
+        )
+        .await;
+        let list = |args: &[&str]| {
+            let mut command = vec!["photos", "file", "list"];
+            command.extend(args);
+            home.json(&command)
+        };
+        let ids = |args: &[&str]| {
+            list(args)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["id"].as_str().unwrap().parse::<i64>().unwrap())
+                .collect::<Vec<_>>()
+        };
+        let by_id = |mut files: Vec<i64>| {
+            files.sort_unstable();
+            files
+        };
+
+        let listed = list(&[]);
+        assert_eq!(listed.as_array().unwrap().len(), 4);
+        for file in listed.as_array().unwrap() {
+            assert!(file["sizeBytes"].as_u64().is_some_and(|size| size > 0));
+        }
+        for (args, expected) in [
+            (vec!["--type", "image"], by_id(vec![beach, holiday])),
+            (
+                vec!["--type", "video", "--type", "livephoto"],
+                by_id(vec![clip, live]),
+            ),
+            (
+                vec!["--since", "2024-01-01", "--before", "2025-01-01"],
+                by_id(vec![clip, holiday]),
+            ),
+            (vec!["--search", "BEACH sunset"], vec![beach]),
+            (vec!["--search", "family dinner"], vec![live]),
+            (vec!["--no-location"], by_id(vec![clip, holiday])),
+            (vec!["--album", "Family", "--no-location"], vec![holiday]),
+            (vec!["--sort", "size"], vec![clip, holiday, live, beach]),
+            (vec!["--sort", "created"], vec![live, clip, holiday, beach]),
+            (
+                vec!["--sort", "created", "--reverse"],
+                vec![beach, holiday, clip, live],
+            ),
+            (
+                vec!["--album", "Trips", "--sort", "size"],
+                vec![clip, holiday, beach],
+            ),
+            (
+                vec!["--type", "image", "--sort", "size", "--limit", "1"],
+                vec![holiday],
+            ),
+        ] {
+            assert_eq!(ids(&args), expected, "{args:?}");
+        }
+        assert_eq!(
+            home.json(&["--offline", "photos", "file", "list", "--sort", "size"]),
+            list(&["--sort", "size"])
+        );
+        Ok(())
+    })
+}
+
 async fn exercise(origin: String) -> TestResult {
     let alice_email = format!("alice-{}@example.org", Uuid::new_v4());
     let bob_email = format!("bob-{}@example.org", Uuid::new_v4());
