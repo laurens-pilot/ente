@@ -1,16 +1,16 @@
 mod export;
 pub mod replica;
 
-use std::{io::Seek, path::Path};
+use std::{cmp::Ordering, io::Seek, path::Path};
 
 use anyhow::{Context, Result, ensure};
 use ente_core::Session;
-use ente_photos::files;
+use ente_photos::files::{self, File, Kind};
 use serde_json::json;
 
 use crate::{
     api,
-    args::{AlbumCommand, App, FileCommand, Options, PhotosCommand},
+    args::{AlbumCommand, App, FileCommand, FileQuery, FileSort, FileType, Options, PhotosCommand},
     core_db::SqliteResult,
     db, home,
     output::{self, AlbumView, FileView, MAX_CANDIDATES, select},
@@ -169,17 +169,24 @@ async fn file(
         Ok::<_, anyhow::Error>((file, entry.album_ids))
     };
     match command {
-        FileCommand::List(args) => replica.files(album_id, None, None, |rows| {
+        FileCommand::List { query, list } => replica.files(album_id, None, None, |rows| {
             let files = rows.filter_map(|row| {
                 let entry = match row {
                     Ok(entry) => entry,
                     Err(error) => return Some(Err(error.into())),
                 };
-                match entry
-                    .file
-                    .and_then(|file| FileView::new(file, &entry.album_ids))
-                {
-                    Ok(file) => Some(Ok(file)),
+                let listed = entry.file.and_then(|file| {
+                    if !matches(&query, &file) {
+                        return Ok(None);
+                    }
+                    let key = SortKey {
+                        created_at_micros: file.created_at_micros,
+                        size: file.size,
+                    };
+                    FileView::new(file, &entry.album_ids).map(|view| Some((key, view)))
+                });
+                match listed {
+                    Ok(listed) => listed.map(Ok),
                     Err(error) => {
                         eprintln!("file {}: {error:#}", entry.id);
                         incomplete = true;
@@ -187,7 +194,20 @@ async fn file(
                     }
                 }
             });
-            output::files(files, &args, options.json)
+            let Some(sort) = query.sort else {
+                return output::files(
+                    files.map(|row| row.map(|(_, view)| view)),
+                    &list,
+                    options.json,
+                );
+            };
+            let mut files = files.collect::<Result<Vec<_>>>()?;
+            files.sort_by(|(a, _), (b, _)| compare(sort, query.reverse, a, b));
+            output::files(
+                files.into_iter().map(|(_, view)| Ok(view)),
+                &list,
+                options.json,
+            )
         }),
         FileCommand::View { file } => {
             let (file, album_ids) = find(&file)?;
@@ -233,4 +253,52 @@ async fn file(
     }?;
     ensure!(!incomplete, "file results are incomplete");
     Ok(())
+}
+
+struct SortKey {
+    created_at_micros: i64,
+    size: Option<u64>,
+}
+
+fn matches(query: &FileQuery, file: &File) -> bool {
+    (query.types.is_empty() || query.types.iter().any(|&kind| file_kind(kind) == file.kind))
+        && query
+            .since
+            .is_none_or(|since| file.created_at_micros >= since)
+        && query
+            .before
+            .is_none_or(|before| file.created_at_micros < before)
+        && (!query.no_location || file.location.is_none())
+        && query
+            .search
+            .as_deref()
+            .is_none_or(|text| contains_words(file, text))
+}
+
+fn file_kind(kind: FileType) -> Kind {
+    match kind {
+        FileType::Image => Kind::Image,
+        FileType::Video => Kind::Video,
+        FileType::LivePhoto => Kind::LivePhoto,
+    }
+}
+
+fn contains_words(file: &File, text: &str) -> bool {
+    let name = file.name.to_lowercase();
+    let caption = file.caption.as_deref().unwrap_or_default().to_lowercase();
+    text.to_lowercase()
+        .split_whitespace()
+        .all(|word| name.contains(word) || caption.contains(word))
+}
+
+fn compare(sort: FileSort, reverse: bool, a: &SortKey, b: &SortKey) -> Ordering {
+    let newest_or_largest_first = match sort {
+        FileSort::Created => b.created_at_micros.cmp(&a.created_at_micros),
+        FileSort::Size => b.size.cmp(&a.size),
+    };
+    if reverse {
+        newest_or_largest_first.reverse()
+    } else {
+        newest_or_largest_first
+    }
 }

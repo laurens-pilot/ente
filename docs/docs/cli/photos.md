@@ -90,16 +90,31 @@ ente photos file download 1580559962386999 --output ./IMG_0001.jpg
 
 A file selector is a file ID or an exact name; when several files share a name, the CLI lists the candidates and you pick an ID. Download prints `Downloaded "IMG_0001.jpg" to ./IMG_0001.jpg.` and refuses to overwrite an existing file. A Live Photo downloads as a ZIP archive. Lists show 100 results and then print `Showing first 100 results; use --limit N or --all to see more.` on the terminal.
 
+## Filter and sort files
+
+```sh
+ente photos file list --type video --since 2024-01-01 --before 2025-01-01
+ente photos file list --search "beach sunset" --no-location
+ente photos file list --sort size --limit 20
+```
+
+- `--type` takes `image`, `video` or `livephoto`; repeat it to include several types.
+- `--since` and `--before` compare `createdAt`, which includes dates edited in Ente. `--since` includes the given instant and `--before` excludes it. Both accept `YYYY-MM-DD` (midnight UTC) or RFC 3339 with a timezone, such as `2024-06-01T00:00:00+02:00`.
+- `--search` finds files whose name or caption contains every word, ignoring case.
+- `--no-location` keeps files without a location.
+
+A file must match every filter you pass. `--sort created` lists the newest files first and `--sort size` the largest first; add `--reverse` for the opposite order. Files with an unknown size sort as the smallest, and ties keep ID order. Without `--sort`, files are listed by ID.
+
 ## Read as JSON
 
 Lists return arrays and `view` returns one object. IDs are strings; timestamps are RFC 3339 strings in UTC.
 
-| Command                    | Fields                                                                                                                                                                                                                                                              |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `album list`, `album view` | `id`, `name`, `type` (`album`, `folder`, `favorites`, `uncategorized`, `defaultHidden`, `quicklink`), `visibility` (`visible`, `archived`, `hidden`), `ownerId`, `updatedAt`                                                                                        |
-| `file list`, `file view`   | `id`, `name`, `type` (`image`, `video`, `livephoto`), `ownerId`, `albumIds`, `createdAt`, `updatedAt`; nullable `modifiedAt`, `location` (`latitude`, `longitude`), `caption`, `hash`, `dateTime`, `offsetTime`, `visibility`, `durationSeconds`, `width`, `height` |
-| `file download`            | `id`, `output`, `bytes`                                                                                                                                                                                                                                             |
-| `export`                   | See [Automation](./automation.md#export-summary)                                                                                                                                                                                                                    |
+| Command                    | Fields                                                                                                                                                                                                                                                                           |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `album list`, `album view` | `id`, `name`, `type` (`album`, `folder`, `favorites`, `uncategorized`, `defaultHidden`, `quicklink`), `visibility` (`visible`, `archived`, `hidden`), `ownerId`, `updatedAt`                                                                                                     |
+| `file list`, `file view`   | `id`, `name`, `type` (`image`, `video`, `livephoto`), `ownerId`, `albumIds`, `createdAt`, `updatedAt`; nullable `modifiedAt`, `location` (`latitude`, `longitude`), `caption`, `hash`, `dateTime`, `offsetTime`, `visibility`, `durationSeconds`, `width`, `height`, `sizeBytes` |
+| `file download`            | `id`, `output`, `bytes`                                                                                                                                                                                                                                                          |
+| `export`                   | See [Automation](./automation.md#export-summary)                                                                                                                                                                                                                                 |
 
 ## Read offline
 

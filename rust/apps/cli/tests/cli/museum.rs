@@ -395,6 +395,7 @@ async fn exercise(origin: String) -> TestResult {
     assert_eq!(files[0]["id"], file_id);
     assert_eq!(files[0]["name"], "original.jpg");
     assert_eq!(files[0]["type"], "image");
+    assert!(files[0]["sizeBytes"].as_u64().is_some_and(|size| size > 0));
     assert_eq!(files[0]["albumIds"], json!([album.to_string()]));
     let output_dir = tempfile::tempdir().unwrap();
     let output_path = output_dir.path().join("owned.jpg");

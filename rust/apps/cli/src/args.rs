@@ -549,15 +549,20 @@ Use --album to limit the albums read. With --json, list returns an array and vie
 Fields: id, name, type, ownerId (strings); albumIds (string array);
 createdAt, updatedAt (RFC3339 timestamp strings).
 Nullable fields: modifiedAt (RFC3339 string); location ({latitude, longitude}, numbers);
-caption, hash, dateTime, offsetTime, visibility (strings); durationSeconds, width, height (integers).
-dateTime and offsetTime retain the stored metadata strings.
+caption, hash, dateTime, offsetTime, visibility (strings); durationSeconds, width, height, sizeBytes (integers).
+dateTime and offsetTime retain the stored metadata strings. sizeBytes is the stored size reported by the server.
 hash comes from Ente's stored metadata. For Live Photos, it can contain the image and video hashes separated by a colon.";
 
 #[derive(Subcommand)]
 pub enum FileCommand {
     #[command(about = "List files, including shared and hidden ones")]
     #[command(after_long_help = FILE_HELP)]
-    List(ListArgs),
+    List {
+        #[command(flatten)]
+        query: FileQuery,
+        #[command(flatten)]
+        list: ListArgs,
+    },
     #[command(about = "Show a file's metadata")]
     #[command(after_long_help = FILE_HELP)]
     View {
@@ -574,6 +579,75 @@ pub enum FileCommand {
         #[arg(long, value_name = "PATH", help = "Write to this new file")]
         output: PathBuf,
     },
+}
+
+#[derive(Args)]
+pub struct FileQuery {
+    #[arg(
+        long = "type",
+        value_enum,
+        value_name = "TYPE",
+        help = "Include files of this type; repeat for multiple types"
+    )]
+    pub types: Vec<FileType>,
+    #[arg(
+        long,
+        value_name = "WHEN",
+        value_parser = crate::admin::parse_date,
+        help = "Include files created at or after this instant",
+        long_help = "Include files created at or after this instant. Accepts YYYY-MM-DD (00:00 UTC at the start of that date) or RFC3339 with a timezone. Compares createdAt, which includes edits to a file's date."
+    )]
+    pub since: Option<i64>,
+    #[arg(
+        long,
+        value_name = "WHEN",
+        value_parser = crate::admin::parse_date,
+        help = "Include files created before this instant",
+        long_help = "Include files created before this instant. Accepts YYYY-MM-DD (00:00 UTC at the start of that date) or RFC3339 with a timezone. Compares createdAt, which includes edits to a file's date."
+    )]
+    pub before: Option<i64>,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        value_parser = nonempty_search,
+        help = "Find files by words in their name or caption",
+        long_help = "Find files whose name or caption contains every word of TEXT, ignoring case. Quote text containing spaces."
+    )]
+    pub search: Option<String>,
+    #[arg(long, help = "Include only files without a location")]
+    pub no_location: bool,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "ORDER",
+        help = "Sort by creation time or size instead of ID",
+        long_help = "Sort by createdAt, newest first, or by sizeBytes, largest first. Files with an unknown size sort as the smallest. Ties keep ID order."
+    )]
+    pub sort: Option<FileSort>,
+    #[arg(long, requires = "sort", help = "Reverse the --sort order")]
+    pub reverse: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum FileType {
+    Image,
+    Video,
+    #[value(name = "livephoto")]
+    LivePhoto,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum FileSort {
+    Created,
+    Size,
+}
+
+fn nonempty_search(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        Err("supply search text".into())
+    } else {
+        Ok(text.to_owned())
+    }
 }
 
 const ACCOUNT_HELP: &str = "Reads accounts stored on this device without network access.
