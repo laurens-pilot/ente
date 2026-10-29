@@ -611,7 +611,7 @@ pub struct FileQuery {
         value_name = "TEXT",
         value_parser = nonempty_search,
         help = "Find files by words in their name or caption",
-        long_help = "Find files whose name or caption contains every word of TEXT, ignoring case. Quote text containing spaces."
+        long_help = "Find files where every word of TEXT occurs in either the name or the caption, ignoring case. Quote text containing spaces."
     )]
     pub search: Option<String>,
     #[arg(long, help = "Include only files without a location")]

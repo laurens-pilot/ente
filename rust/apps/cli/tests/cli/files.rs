@@ -577,7 +577,7 @@ fn photos_lists_limit_output_and_stream_complete_results() {
         )
         .unwrap();
     drop(connection);
-    for as_json in [false, true] {
+    for (as_json, sorted) in [(false, false), (true, false), (false, true), (true, true)] {
         let mut args = vec![
             "--offline",
             "photos",
@@ -589,6 +589,9 @@ fn photos_lists_limit_output_and_stream_complete_results() {
         ];
         if as_json {
             args.push("--json");
+        }
+        if sorted {
+            args.extend(["--sort", "created"]);
         }
         let output = home.run(&args);
         assert!(failure(&output).contains("timestamp is outside the supported range"));
@@ -683,6 +686,7 @@ fn file_lists_filter_and_sort_synced_metadata() {
         (vec!["--search", "family dinner"], vec![3]),
         (vec!["--search", "holiday jpg"], vec![4]),
         (vec!["--search", "beach dinner"], vec![]),
+        (vec!["--search", "jpg sunset"], vec![1]),
         (vec!["--no-location"], vec![2, 4]),
         (vec!["--type", "image", "--no-location"], vec![4]),
         (vec!["--sort", "created"], vec![3, 2, 4, 1]),

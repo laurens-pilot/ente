@@ -100,7 +100,7 @@ ente photos file list --sort size --limit 20
 
 - `--type` takes `image`, `video` or `livephoto`; repeat it to include several types.
 - `--since` and `--before` compare `createdAt`, which includes dates edited in Ente. `--since` includes the given instant and `--before` excludes it. Both accept `YYYY-MM-DD` (midnight UTC) or RFC 3339 with a timezone, such as `2024-06-01T00:00:00+02:00`.
-- `--search` finds files whose name or caption contains every word, ignoring case.
+- `--search` finds files where every word occurs in either the name or the caption, ignoring case.
 - `--no-location` keeps files without a location.
 
 A file must match every filter you pass. `--sort created` lists the newest files first and `--sort size` the largest first; add `--reverse` for the opposite order. Files with an unknown size sort as the smallest, and ties keep ID order. Without `--sort`, files are listed by ID.
