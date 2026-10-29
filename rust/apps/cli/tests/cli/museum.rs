@@ -362,6 +362,19 @@ fn file_lists_filter_and_sort_server_metadata() -> TestResult {
             (vec!["--search", "family dinner"], vec![live]),
             (vec!["--no-location"], by_id(vec![clip, holiday])),
             (vec!["--album", "Family", "--no-location"], vec![holiday]),
+            (vec!["--min-size", "0.0015MB"], by_id(vec![clip, holiday])),
+            (vec!["--max-size", "0.0015MB"], by_id(vec![beach, live])),
+            (
+                vec![
+                    "--album",
+                    "Trips",
+                    "--min-size",
+                    "0.0015MB",
+                    "--sort",
+                    "size",
+                ],
+                vec![clip, holiday],
+            ),
             (vec!["--sort", "size"], vec![clip, holiday, live, beach]),
             (vec!["--sort", "created"], vec![live, clip, holiday, beach]),
             (

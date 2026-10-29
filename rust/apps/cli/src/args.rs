@@ -618,6 +618,22 @@ pub struct FileQuery {
     pub no_location: bool,
     #[arg(
         long,
+        value_name = "SIZE",
+        value_parser = file_size,
+        help = "Include files of at least this size, e.g. 100MB",
+        long_help = "Include files whose sizeBytes is at least SIZE. Accepts MB, GB and TB, case-insensitive, using powers of 1024; fractions are allowed, such as 0.5MB. Files with an unknown size are left out."
+    )]
+    pub min_size: Option<u64>,
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = file_size,
+        help = "Include files of at most this size, e.g. 1.5GB",
+        long_help = "Include files whose sizeBytes is at most SIZE. Accepts MB, GB and TB, case-insensitive, using powers of 1024; fractions are allowed, such as 0.5MB. Files with an unknown size are left out."
+    )]
+    pub max_size: Option<u64>,
+    #[arg(
+        long,
         value_enum,
         value_name = "ORDER",
         help = "Sort by creation time or size instead of ID",
@@ -648,6 +664,11 @@ fn nonempty_search(text: &str) -> Result<String, String> {
     } else {
         Ok(text.to_owned())
     }
+}
+
+fn file_size(input: &str) -> Result<u64, String> {
+    let bytes = crate::admin::parse_size(input)?;
+    u64::try_from(bytes).map_err(|error| error.to_string())
 }
 
 const ACCOUNT_HELP: &str = "Reads accounts stored on this device without network access.

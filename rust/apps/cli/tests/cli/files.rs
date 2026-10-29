@@ -633,7 +633,7 @@ fn file_lists_filter_and_sort_synced_metadata() {
                 2,
                 json!({"title": "Clip.mp4", "fileType": 1, "creationTime": 1_717_200_000_000_000i64}),
                 json!({}),
-                Some(5000),
+                Some(5_242_880),
             ),
             file(
                 3,
@@ -689,6 +689,12 @@ fn file_lists_filter_and_sort_synced_metadata() {
         (vec!["--search", "jpg sunset"], vec![1]),
         (vec!["--no-location"], vec![2, 4]),
         (vec!["--type", "image", "--no-location"], vec![4]),
+        (vec!["--min-size", "5MB"], vec![2]),
+        (vec!["--min-size", "0.5mb"], vec![2]),
+        (vec!["--max-size", "5MB"], vec![1, 2, 4]),
+        (vec!["--max-size", "1MB"], vec![1, 4]),
+        (vec!["--min-size", "1MB", "--max-size", "4MB"], vec![]),
+        (vec!["--max-size", "1MB", "--sort", "created"], vec![4, 1]),
         (vec!["--sort", "created"], vec![3, 2, 4, 1]),
         (vec!["--sort", "created", "--reverse"], vec![1, 4, 2, 3]),
         (vec!["--sort", "size"], vec![2, 1, 4, 3]),
@@ -730,6 +736,8 @@ fn file_lists_filter_and_sort_synced_metadata() {
         vec!["--type", "gif"],
         vec!["--sort", "name"],
         vec!["--reverse"],
+        vec!["--min-size", "100KB"],
+        vec!["--max-size", "0MB"],
     ] {
         let mut command = vec!["--offline", "photos", "file", "list"];
         command.extend(&args);

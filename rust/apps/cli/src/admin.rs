@@ -273,14 +273,14 @@ pub fn parse_size(input: &str) -> Result<i64, String> {
     .into_iter()
     .find_map(|(unit, multiplier)| input.strip_suffix(unit).map(|number| (number, multiplier)))
     .ok_or("use a size such as 500GB or 1.5TB (MB/GB/TB use powers of 1024)")?;
-    let value = number.parse::<f64>().map_err(|_| "invalid storage size")?;
+    let value = number.parse::<f64>().map_err(|_| "invalid size")?;
     let bytes = value * multiplier as f64;
     if !number.chars().all(|c| c.is_ascii_digit() || c == '.')
         || !bytes.is_finite()
         || bytes < 1.0
         || bytes >= i64::MAX as f64
     {
-        return Err("storage must be positive and fit in a signed 64-bit byte count".into());
+        return Err("size must be positive and fit in a signed 64-bit byte count".into());
     }
     Ok(bytes as i64)
 }

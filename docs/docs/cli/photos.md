@@ -96,12 +96,14 @@ A file selector is a file ID or an exact name; when several files share a name, 
 ente photos file list --type video --since 2024-01-01 --before 2025-01-01
 ente photos file list --search "beach sunset" --no-location
 ente photos file list --sort size --limit 20
+ente photos file list --type video --min-size 500MB
 ```
 
 - `--type` takes `image`, `video` or `livephoto`; repeat it to include several types.
 - `--since` and `--before` compare `createdAt`, which includes dates edited in Ente. `--since` includes the given instant and `--before` excludes it. Both accept `YYYY-MM-DD` (midnight UTC) or RFC 3339 with a timezone, such as `2024-06-01T00:00:00+02:00`.
 - `--search` finds files where every word occurs in either the name or the caption, ignoring case.
 - `--no-location` keeps files without a location.
+- `--min-size` and `--max-size` keep files whose `sizeBytes` is at least or at most the given size. Both accept MB, GB or TB in powers of 1024, such as `500MB` or `1.5GB`. `sizeBytes` is the size of the stored encrypted file, slightly larger than the original. Files with an unknown size are left out.
 
 A file must match every filter you pass. `--sort created` lists the newest files first and `--sort size` the largest first; add `--reverse` for the opposite order. Files with an unknown size sort as the smallest, and ties keep ID order. Without `--sort`, files are listed by ID.
 

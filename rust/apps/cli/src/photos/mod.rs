@@ -270,6 +270,12 @@ fn matches(query: &FileQuery, file: &File) -> bool {
             .is_none_or(|before| file.created_at_micros < before)
         && (!query.no_location || file.location.is_none())
         && query
+            .min_size
+            .is_none_or(|min| file.size.is_some_and(|size| size >= min))
+        && query
+            .max_size
+            .is_none_or(|max| file.size.is_some_and(|size| size <= max))
+        && query
             .search
             .as_deref()
             .is_none_or(|text| contains_words(file, text))
