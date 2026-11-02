@@ -961,7 +961,7 @@ Future<MLResult> analyzeImageRust(Map args) async {
 }
 
 bool isExpectedMlSkipError(Object error) {
-  if (error is RepeatedFileDecryptionError) {
+  if (error is RepeatedFileDecryptionError || error is RepeatedMlCrashError) {
     return true;
   }
   final message = _normalizedErrorMessage(error);
@@ -977,6 +977,9 @@ bool isExpectedMlSkipError(Object error) {
 String formatExpectedMlSkipReasonForLogs(Object error) {
   if (error is RepeatedFileDecryptionError) {
     return "origin decryption failed after three retries with identical ciphertext";
+  }
+  if (error is RepeatedMlCrashError) {
+    return "the app process died repeatedly while processing this file";
   }
   final normalized = _normalizedErrorMessage(error);
   if (normalized.contains("invalidimageformatexception")) {

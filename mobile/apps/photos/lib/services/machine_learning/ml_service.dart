@@ -2,7 +2,8 @@ import "dart:async";
 import "dart:io" show File, Platform;
 
 import "package:flutter/foundation.dart" show kDebugMode;
-import "package:flutter/widgets.dart" show AppLifecycleState, WidgetsBinding;
+import "package:flutter/widgets.dart"
+    show AppLifecycleListener, AppLifecycleState, WidgetsBinding;
 import "package:logging/logging.dart";
 import "package:photos/core/event_bus.dart";
 import "package:photos/db/files_db.dart";
@@ -23,6 +24,7 @@ import "package:photos/services/filedata/model/file_data.dart";
 import "package:photos/services/machine_learning/face_ml/face_clustering/face_clustering.dart";
 import "package:photos/services/machine_learning/face_ml/face_clustering/face_clustering_service.dart";
 import "package:photos/services/machine_learning/face_ml/person/person_service.dart";
+import "package:photos/services/machine_learning/ml_crash_guard.dart";
 import "package:photos/services/machine_learning/ml_exceptions.dart";
 import "package:photos/services/machine_learning/ml_indexing_isolate.dart";
 import "package:photos/services/machine_learning/ml_model_download_service.dart";
@@ -60,6 +62,7 @@ class MLService {
   bool _mlControllerStatus = false;
   final Set<MlRunControl> _runControls = {};
   MlRunControl? _activeRunControl;
+  final _crashGuard = MlCrashGuard();
   Timer? _deniedRunRetryTimer;
   Timer? _predownloadLocalModelsTimer;
 
@@ -134,6 +137,7 @@ class MLService {
       stopActiveRun(MlStopReason.modeChanged);
     });
     _syncMlControllerStatusForBg();
+    _trackAppResumedForCrashGuard();
 
     _isInitialized = true;
     _schedulePredownloadLocalModels();
@@ -148,6 +152,19 @@ class MLService {
     _mlControllerStatus = computeController.shouldRunCompute;
     _logger.info(
       "Background init synced MLController status to $_mlControllerStatus",
+    );
+  }
+
+  void _trackAppResumedForCrashGuard() {
+    if (isProcessBg) {
+      return;
+    }
+    _crashGuard.setAppResumed(
+      WidgetsBinding.instance.lifecycleState == AppLifecycleState.resumed,
+    );
+    AppLifecycleListener(
+      onStateChange: (state) =>
+          _crashGuard.setAppResumed(state == AppLifecycleState.resumed),
     );
   }
 
@@ -568,6 +585,7 @@ class MLService {
     _activeRunControl = control;
     control.attachOnStop(() {
       MLIndexingIsolate.instance.shouldPauseIndexingAndClustering = true;
+      _crashGuard.markStopRequested();
     });
   }
 
@@ -624,6 +642,7 @@ class MLService {
     bool rustRuntimePrepared = false;
     try {
       _logger.info('starting image indexing');
+      await _crashGuard.recover(mode);
       if (allowImageIndexing && localSettings.isMLLocalIndexingEnabled) {
         await MLModelDownloadService.instance.ensureModelsDownloaded(
           onlyIndexingModels: true,
@@ -672,6 +691,7 @@ class MLService {
           }
         }
         final futures = <Future<bool>>[];
+        final suspects = <FileMLInstruction>[];
         final instructions = maxFilesToIndex == null
             ? chunk
             : chunk.take(maxFilesToIndex - fileAttemptCount);
@@ -681,7 +701,11 @@ class MLService {
             stopRun = true;
             break;
           }
-          futures.add(_processImage(instruction));
+          if (_crashGuard.isSuspect(instruction.fileKey)) {
+            suspects.add(instruction);
+          } else {
+            futures.add(_processImage(instruction));
+          }
         }
         fileAttemptCount += futures.length;
         // Drain: work that was already started must complete (and commit)
@@ -692,6 +716,20 @@ class MLService {
           (previousValue, element) => previousValue + (element ? 1 : 0),
         );
         fileAnalyzedCount += sumFutures;
+        for (final suspect in suspects) {
+          if (control.stopRequested) {
+            _logRunStopped(control, "between suspect indexing instructions");
+            stopRun = true;
+            break;
+          }
+          if (!_crashGuard.canRetrySuspect(suspect.fileKey)) {
+            continue;
+          }
+          fileAttemptCount++;
+          if (await _processImage(suspect)) {
+            fileAnalyzedCount++;
+          }
+        }
         if (fileAttemptCount == maxFilesToIndex) {
           allowImageIndexing = false;
         }
@@ -794,14 +832,18 @@ class MLService {
     // won't be retried and its cached download/export can be dropped.
     bool indexedOrSkipped = false;
     try {
-      final String filePath = await getImagePathForML(instruction.file);
-      if (_shouldDeleteAfterMLProcessing(instruction.file)) {
-        pathToDeleteAfterMLProcessing = filePath;
+      if (_crashGuard.hasRepeatedlyCrashed(instruction.fileKey)) {
+        throw RepeatedMlCrashError();
       }
-
-      final MLResult? result = await MLIndexingIsolate.instance.analyzeImage(
-        instruction,
-        filePath,
+      final MLResult? result = await _crashGuard.track(
+        instruction.fileKey,
+        () async {
+          final String filePath = await getImagePathForML(instruction.file);
+          if (_shouldDeleteAfterMLProcessing(instruction.file)) {
+            pathToDeleteAfterMLProcessing = filePath;
+          }
+          return MLIndexingIsolate.instance.analyzeImage(instruction, filePath);
+        },
       );
       if (result == null) {
         if (!(_activeRunControl?.stopRequested ?? false) &&
@@ -938,9 +980,11 @@ class MLService {
       return false;
     } finally {
       if (indexedOrSkipped) {
-        if (pathToDeleteAfterMLProcessing != null) {
+        _crashGuard.forget(instruction.fileKey);
+        final exportedPath = pathToDeleteAfterMLProcessing;
+        if (exportedPath != null) {
           try {
-            await File(pathToDeleteAfterMLProcessing).delete();
+            await File(exportedPath).delete();
           } catch (e, s) {
             _logger.warning(
               "Failed to delete origin file exported for ML at $pathToDeleteAfterMLProcessing",

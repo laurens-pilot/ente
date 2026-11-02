@@ -24,3 +24,5 @@ class ThumbnailRetrievalException implements Exception {
 class CouldNotRetrieveAnyFileData implements Exception, LocallyHandledError {}
 
 class RepeatedFileDecryptionError implements Exception, LocallyHandledError {}
+
+class RepeatedMlCrashError implements Exception, LocallyHandledError {}
