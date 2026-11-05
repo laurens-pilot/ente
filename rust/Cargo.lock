@@ -2659,6 +2659,7 @@ dependencies = [
  "fast_image_resize",
  "heic_decoder",
  "image",
+ "jpeg-encoder",
  "jxl",
  "kamadak-exif",
  "log",

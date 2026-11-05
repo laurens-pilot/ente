@@ -19,6 +19,12 @@ const END_OF_IMAGE: &[u8] = b"\xff\xd9";
 const READ_ROWS: usize = 36;
 const DECODER_BYTES: u64 = 1024 * 1024;
 const DECODER_BYTES_PER_COLUMN: u64 = 512;
+const METADATA_COPIES: u64 = 4;
+
+struct FirstScan {
+    components: u8,
+    end: usize,
+}
 
 pub(crate) fn decode(
     input: ImageInput<'_>,
@@ -29,7 +35,7 @@ pub(crate) fn decode(
             decode_bytes(bytes, 0, options)
         }
         ImageInput::Bytes(bytes) => {
-            let mut terminated = buffer(bytes.len() as u64, options.max_memory_bytes)?;
+            let mut terminated = input_buffer(bytes.len() as u64, options.max_memory_bytes)?;
             terminated.extend_from_slice(bytes);
             terminated.extend_from_slice(END_OF_IMAGE);
             decode_bytes(&terminated, terminated.len() as u64, options)
@@ -37,17 +43,19 @@ pub(crate) fn decode(
         ImageInput::Path(path) => {
             let read_error =
                 |error| ImageError::Decode(format!("failed to read image file '{path}': {error}"));
-            let mut file = File::open(path).map_err(read_error)?;
+            let file = File::open(path).map_err(read_error)?;
             let length = file.metadata().map_err(read_error)?.len();
-            let mut bytes = buffer(length, options.max_memory_bytes)?;
-            file.read_to_end(&mut bytes).map_err(read_error)?;
+            let mut bytes = input_buffer(length, options.max_memory_bytes)?;
+            file.take(length)
+                .read_to_end(&mut bytes)
+                .map_err(read_error)?;
             bytes.extend_from_slice(END_OF_IMAGE);
             decode_bytes(&bytes, bytes.len() as u64, options)
         }
     }
 }
 
-fn buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>> {
+fn input_buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>> {
     let length = input_bytes.saturating_add(END_OF_IMAGE.len() as u64);
     if length > max_memory_bytes {
         return Err(too_large());
@@ -61,9 +69,15 @@ fn buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>> {
 
 fn decode_bytes(
     bytes: &[u8],
-    input_bytes: u64,
+    owned_input_bytes: u64,
     options: BoundedDecodeOptions,
 ) -> ImageResult<BoundedDecodedImage> {
+    let scan = first_scan(bytes).ok_or_else(|| unsupported("malformed header segments"))?;
+    let retained_bytes =
+        owned_input_bytes.saturating_add(METADATA_COPIES.saturating_mul(scan.end as u64));
+    if retained_bytes > options.max_memory_bytes {
+        return Err(too_large());
+    }
     let mut decoder = JpegDecoder::new_with_options(
         ZCursor::new(bytes),
         DecoderOptions::default()
@@ -72,19 +86,17 @@ fn decode_bytes(
             .set_max_height(usize::from(u16::MAX)),
     );
     decoder.decode_headers().map_err(jpeg_error)?;
+    if decoder.inner_reader().position().ok() != Some(scan.end as u64) {
+        return Err(unsupported("malformed header segments"));
+    }
     let info = decoder
         .info()
         .ok_or_else(|| ImageError::Decode("JPEG headers were not decoded".into()))?;
     if !info.sof.is_sequential_dct() {
-        return Err(ImageError::Decode(format!(
-            "unsupported JPEG for bounded decoding: {:?}",
-            info.sof
-        )));
+        return Err(unsupported(&format!("{:?}", info.sof)));
     }
-    if first_scan_components(bytes) != Some(info.components) {
-        return Err(ImageError::Decode(
-            "unsupported JPEG for bounded decoding: components are in separate scans".into(),
-        ));
+    if scan.components != info.components {
+        return Err(unsupported("components are in separate scans"));
     }
     let source = Dimensions {
         width: u32::from(info.width),
@@ -104,7 +116,7 @@ fn decode_bytes(
     };
     decoder.set_options(decoder.options().jpeg_set_out_colorspace(color));
     let target = target_dimensions(&source, options.max_side);
-    if required_bytes(input_bytes, &source, &target) > options.max_memory_bytes {
+    if required_bytes(retained_bytes, &source, &target) > options.max_memory_bytes {
         return Err(too_large());
     }
     let orientation = decoder
@@ -115,17 +127,17 @@ fn decode_bytes(
     let mut converter = IccConverter::new(profile.as_deref());
     let mut output = Downsampler::new(source.clone(), target.clone(), false)?;
     let row_bytes = source.width as usize * color.num_components();
-    let mut buffer = vec![0; row_bytes * READ_ROWS];
+    let mut rows_buffer = vec![0; row_bytes * READ_ROWS];
     let mut session = decoder.scanline_output();
     let mut y = 0;
     loop {
         match session
-            .read_scanlines(&mut buffer, row_bytes)
+            .read_scanlines(&mut rows_buffer, row_bytes)
             .map_err(jpeg_error)?
         {
             ScanlineReadStatus::RowsProcessed { rows } => {
                 let rgb = rows_rgb(
-                    &buffer[..rows * row_bytes],
+                    &rows_buffer[..rows * row_bytes],
                     source.width,
                     rows as u32,
                     color,
@@ -153,35 +165,39 @@ fn decode_bytes(
     oriented_output(output.finish(), source, target, orientation)
 }
 
-fn required_bytes(input_bytes: u64, source: &Dimensions, target: &Dimensions) -> u64 {
+fn required_bytes(retained_bytes: u64, source: &Dimensions, target: &Dimensions) -> u64 {
     let oriented_copy = u64::from(target.width) * u64::from(target.height) * 3;
-    input_bytes
+    retained_bytes
         .saturating_add(Downsampler::bytes(source, target, false))
         .saturating_add(oriented_copy)
         .saturating_add(DECODER_BYTES + u64::from(source.width) * DECODER_BYTES_PER_COLUMN)
 }
 
-fn first_scan_components(bytes: &[u8]) -> Option<u8> {
+fn first_scan(bytes: &[u8]) -> Option<FirstScan> {
     let mut offset = 2;
     loop {
         if *bytes.get(offset)? != 0xff {
-            offset += 1;
-            continue;
+            return None;
         }
-        offset += 1;
-        while matches!(bytes.get(offset), Some(0x00 | 0xff)) {
+        while *bytes.get(offset)? == 0xff {
             offset += 1;
         }
-        let marker = *bytes.get(offset)?;
-        offset += 1;
-        match marker {
-            0x01 | 0xd0..=0xd8 => {}
-            0xda => return bytes.get(offset + 2).copied(),
-            _ => {
-                let length = bytes.get(offset..offset + 2)?;
-                offset += usize::from(u16::from_be_bytes([length[0], length[1]]));
-            }
+        let marker = bytes[offset];
+        let length = usize::from(u16::from_be_bytes([
+            *bytes.get(offset + 1)?,
+            *bytes.get(offset + 2)?,
+        ]));
+        if length < 2 || matches!(marker, 0x00 | 0x01 | 0xd0..=0xd9) {
+            return None;
         }
+        let end = offset + 1 + length;
+        if marker == 0xda {
+            return Some(FirstScan {
+                components: *bytes.get(offset + 3)?,
+                end,
+            });
+        }
+        offset = end;
     }
 }
 
@@ -212,15 +228,18 @@ fn rows_rgb(
     Ok(converter.apply(image).into_rgb8().into_raw())
 }
 
+fn unsupported(reason: &str) -> ImageError {
+    ImageError::Decode(format!("unsupported JPEG for bounded decoding: {reason}"))
+}
+
 fn jpeg_error(error: DecodeErrors) -> ImageError {
     ImageError::Decode(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use image::{
-        ExtendedColorType, GenericImageView, ImageEncoder, Rgb, codecs::jpeg::JpegEncoder,
-    };
+    use image::{ExtendedColorType, ImageEncoder, codecs::jpeg::JpegEncoder};
+    use jpeg_encoder::{ColorType, Encoder, JpegColorType, SamplingFactor};
 
     use super::*;
     use crate::{
@@ -248,6 +267,20 @@ mod tests {
             encoder.set_exif_metadata(exif).unwrap();
         }
         encoder.write_image(pixels, width, height, color).unwrap();
+        bytes
+    }
+
+    fn encode_layout(
+        pixels: &[u8],
+        width: u16,
+        height: u16,
+        color: ColorType,
+        configure: impl FnOnce(&mut Encoder<&mut Vec<u8>>),
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder::new(&mut bytes, 90);
+        configure(&mut encoder);
+        encoder.encode(pixels, width, height, color).unwrap();
         bytes
     }
 
@@ -292,6 +325,16 @@ mod tests {
             .unwrap()
     }
 
+    fn with_separate_scans(bytes: &[u8]) -> Vec<u8> {
+        let sos = marker(bytes, 0xda);
+        let components = usize::from(bytes[sos + 4]);
+        let mut separate = bytes[..sos + 2].to_vec();
+        separate.extend_from_slice(&[0, 8, 1]);
+        separate.extend_from_slice(&bytes[sos + 5..sos + 7]);
+        separate.extend_from_slice(&bytes[sos + 5 + 2 * components..]);
+        separate
+    }
+
     fn with_dimensions(bytes: &[u8], width: u16, height: u16) -> Vec<u8> {
         let mut patched = bytes.to_vec();
         let sof = marker(&patched, 0xc0);
@@ -319,6 +362,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn subsampled_cmyk_and_restart_layouts_match_the_full_decoder() {
+        let samplings = [
+            SamplingFactor::F_1_1,
+            SamplingFactor::F_2_1,
+            SamplingFactor::F_1_2,
+            SamplingFactor::F_2_2,
+        ];
+        for (width, height) in [(1, 19), (19, 1), (13, 17), (37, 53), (70, 41)] {
+            let pixels = rgb(u32::from(width), u32::from(height));
+            let cmyk = (0..usize::from(width) * usize::from(height) * 4)
+                .map(|i| ((i * 53 + 7) % 256) as u8)
+                .collect::<Vec<_>>();
+            for sampling in samplings {
+                let bytes = encode_layout(&pixels, width, height, ColorType::Rgb, |encoder| {
+                    encoder.set_sampling_factor(sampling)
+                });
+                for max_side in [7, 6000] {
+                    assert_matches_full_decoder(
+                        &bytes,
+                        max_side,
+                        &format!("{width}x{height} {sampling:?}"),
+                    );
+                }
+            }
+            for (label, bytes) in [
+                (
+                    "CMYK",
+                    encode_layout(&cmyk, width, height, ColorType::Cmyk, |_| {}),
+                ),
+                (
+                    "YCCK",
+                    encode_layout(&cmyk, width, height, ColorType::CmykAsYcck, |encoder| {
+                        encoder.set_sampling_factor(SamplingFactor::F_2_2)
+                    }),
+                ),
+                (
+                    "restart interval",
+                    encode_layout(&pixels, width, height, ColorType::Rgb, |encoder| {
+                        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+                        encoder.set_restart_interval(1);
+                    }),
+                ),
+            ] {
+                for max_side in [7, 6000] {
+                    assert_matches_full_decoder(
+                        &bytes,
+                        max_side,
+                        &format!("{width}x{height} {label}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn data_after_the_end_marker_is_ignored() {
+        let bytes = encode_layout(&rgb(37, 53), 37, 53, ColorType::Rgb, |encoder| {
+            encoder.set_sampling_factor(SamplingFactor::F_2_2)
+        });
+        let mut trailed = bytes.clone();
+        trailed.extend_from_slice(&encode(
+            &rgb(5, 5),
+            5,
+            5,
+            ExtendedColorType::Rgb8,
+            None,
+            None,
+        ));
+        trailed.extend_from_slice(b"\0\0\0\x18ftypmp42 trailing video");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.jpg");
+        std::fs::write(&path, &trailed).unwrap();
+        let expected = decode_bounded(ImageInput::Bytes(&bytes), options(6000)).unwrap();
+        for input in [
+            ImageInput::Bytes(&trailed),
+            ImageInput::Path(path.to_str().unwrap()),
+        ] {
+            assert_eq!(
+                decode_bounded(input, options(6000)).unwrap().image.rgb,
+                expected.image.rgb
+            );
+        }
+        assert_matches_full_decoder(&trailed, 6000, "trailing data");
     }
 
     #[test]
@@ -382,42 +511,89 @@ mod tests {
 
     #[test]
     fn progressive_and_separate_scan_jpegs_are_rejected() {
-        let bytes = encode(&rgb(24, 24), 24, 24, ExtendedColorType::Rgb8, None, None);
-        let mut progressive = bytes.clone();
-        progressive[marker(&bytes, 0xc0) + 1] = 0xc2;
-        let sos = marker(&bytes, 0xda);
-        let components = usize::from(bytes[sos + 4]);
-        let mut separate = bytes[..sos + 2].to_vec();
-        separate.extend_from_slice(&[0, 8, 1]);
-        separate.extend_from_slice(&bytes[sos + 5..sos + 7]);
-        separate.extend_from_slice(&bytes[sos + 5 + 2 * components..]);
-        for patched in [progressive, separate] {
+        let pixels = rgb(24, 24);
+        let progressive = encode_layout(&pixels, 24, 24, ColorType::Rgb, |encoder| {
+            encoder.set_progressive(true)
+        });
+        let separate = with_separate_scans(&encode(
+            &pixels,
+            24,
+            24,
+            ExtendedColorType::Rgb8,
+            None,
+            None,
+        ));
+        let optimized = encode_layout(&pixels, 24, 24, ColorType::Rgb, |encoder| {
+            encoder.set_optimized_huffman_tables(true)
+        });
+        let quadruple = encode_layout(&pixels, 24, 24, ColorType::Rgb, |encoder| {
+            encoder.set_sampling_factor(SamplingFactor::F_4_1)
+        });
+        for bytes in [progressive, separate, optimized, quadruple] {
             assert!(matches!(
-                decode_bounded(ImageInput::Bytes(&patched), options(8)),
+                decode_bounded(ImageInput::Bytes(&bytes), options(8)),
                 Err(ImageError::Decode(message)) if message.contains("unsupported JPEG")
             ));
         }
     }
 
     #[test]
-    fn first_scan_components_skips_segments_fill_and_stray_bytes() {
+    fn separate_scan_jpegs_behind_unusual_header_bytes_are_rejected_before_buffering() {
+        let large = with_dimensions(
+            &with_separate_scans(&encode(
+                &rgb(24, 24),
+                24,
+                24,
+                ExtendedColorType::Rgb8,
+                None,
+                None,
+            )),
+            4000,
+            4000,
+        );
+        let mut after_start = large[..2].to_vec();
+        after_start.extend_from_slice(b"\xff\x01\x00\x07\xff\xda\x00\x0c\x03");
+        after_start.extend_from_slice(&large[2..]);
+        let sos = marker(&large, 0xda);
+        let mut before_scan = large[..sos].to_vec();
+        before_scan.extend_from_slice(b"\xff\x00\xda\x00\x08\x03");
+        before_scan.extend_from_slice(&large[sos..]);
+        for bytes in [large, after_start, before_scan] {
+            let budget = MemoryBudget::new(4 * 1024 * 1024);
+            let result = budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(6000)));
+            assert!(
+                matches!(&result, Err(ImageError::Decode(message)) if message.contains("unsupported JPEG")),
+                "{result:?}"
+            );
+            assert!(!budget.is_exceeded());
+        }
+    }
+
+    #[test]
+    fn first_scan_accepts_only_contiguous_header_segments() {
         let bytes = encode(&rgb(8, 8), 8, 8, ExtendedColorType::Rgb8, None, None);
-        assert_eq!(first_scan_components(&bytes), Some(3));
+        let sos = marker(&bytes, 0xda);
+        let scan = first_scan(&bytes).unwrap();
+        assert_eq!(scan.components, 3);
+        assert_eq!(scan.end, sos + 2 + 12);
         let gray = encode(&[90; 64], 8, 8, ExtendedColorType::L8, None, None);
-        assert_eq!(first_scan_components(&gray), Some(1));
-        assert_eq!(
-            first_scan_components(b"\xff\xd8\xff\xe0\0\x04ab\x12\x34\xff\xda\0\x08\x02"),
-            Some(2)
-        );
-        assert_eq!(
-            first_scan_components(b"\xff\xd8\xff\xff\xe1\0\x05\xff\xda\x7f\xff\0\xda\0\x08\x01"),
-            Some(1)
-        );
-        assert_eq!(
-            first_scan_components(b"\xff\xd8\xff\xe0\0\x10\xff\xda"),
-            None
-        );
-        assert_eq!(first_scan_components(b"\xff\xd8\xff\xda\0\x08"), None);
+        assert_eq!(first_scan(&gray).unwrap().components, 1);
+        let filled =
+            first_scan(b"\xff\xd8\xff\xe0\0\x04ab\xff\xff\xda\0\x0a\x02\x01\0\x02\x11\0\x3f\0")
+                .unwrap();
+        assert_eq!((filled.components, filled.end), (2, 21));
+        for header in [
+            &b"\xff\xd8\xff\xe0\0\x04ab\x12\xff\xda\0\x08\x01"[..],
+            b"\xff\xd8\xff\0\xda\0\x08\x01",
+            b"\xff\xd8\xff\x01\0\x07\xff\xda\0\x08\x01",
+            b"\xff\xd8\xff\xd0\0\x04ab\xff\xda\0\x08\x01",
+            b"\xff\xd8\xff\xd9\xff\xda\0\x08\x01",
+            b"\xff\xd8\xff\xe0\0\x01\xff\xda\0\x08\x01",
+            b"\xff\xd8\xff\xe0\0\x10\xff\xda",
+            b"\xff\xd8\xff\xda\0\x08",
+        ] {
+            assert!(first_scan(header).is_none(), "{header:x?}");
+        }
     }
 
     #[test]
@@ -520,28 +696,97 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.jpg");
         let profile = moxcms::ColorProfile::new_display_p3().encode().unwrap();
-        for (width, height, max_side) in [(1, 1, 1), (640, 480, 6000), (1200, 900, 300)] {
-            let bytes = encode(
-                &rgb(width, height),
-                width,
-                height,
-                ExtendedColorType::Rgb8,
-                Some(profile.clone()),
-                None,
-            );
+        let wide = rgb(4000, 40);
+        let mut files = [(1, 1, 1), (640, 480, 6000), (1200, 900, 300)]
+            .map(|(width, height, max_side)| {
+                let bytes = encode(
+                    &rgb(width, height),
+                    width,
+                    height,
+                    ExtendedColorType::Rgb8,
+                    Some(profile.clone()),
+                    None,
+                );
+                (bytes, max_side)
+            })
+            .to_vec();
+        for sampling in [
+            SamplingFactor::F_1_1,
+            SamplingFactor::F_2_1,
+            SamplingFactor::F_1_2,
+            SamplingFactor::F_2_2,
+        ] {
+            files.push((
+                encode_layout(&wide, 4000, 40, ColorType::Rgb, |encoder| {
+                    encoder.set_sampling_factor(sampling)
+                }),
+                300,
+            ));
+        }
+        for (bytes, max_side) in files {
             std::fs::write(&path, &bytes).unwrap();
-            let source = Dimensions { width, height };
+            let mut decoder = JpegDecoder::new(ZCursor::new(&bytes));
+            decoder.decode_headers().unwrap();
+            let (width, height) = decoder.dimensions().unwrap();
+            let source = Dimensions {
+                width: width as u32,
+                height: height as u32,
+            };
             let target = target_dimensions(&source, max_side);
-            let budget =
-                MemoryBudget::new(required_bytes(bytes.len() as u64, &source, &target) as usize);
+            let retained = bytes.len() as u64
+                + END_OF_IMAGE.len() as u64
+                + METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+            let budget = MemoryBudget::new(required_bytes(retained, &source, &target) as usize);
             let decoded = budget
                 .enter(|| {
                     decode_bounded(ImageInput::Path(path.to_str().unwrap()), options(max_side))
                 })
                 .unwrap();
             assert_eq!(decoded.image.dimensions, target);
-            assert!(!budget.is_exceeded(), "{width}x{height}");
+            assert!(!budget.is_exceeded(), "{source:?}");
         }
+    }
+
+    #[test]
+    fn large_metadata_counts_towards_the_budget() {
+        let profile = (0..2 * 1024 * 1024)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect::<Vec<_>>();
+        let bytes = encode(
+            &[10, 20, 30],
+            1,
+            1,
+            ExtendedColorType::Rgb8,
+            Some(profile),
+            None,
+        );
+        assert!(bytes.ends_with(END_OF_IMAGE));
+        let source = Dimensions {
+            width: 1,
+            height: 1,
+        };
+        let retained = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+        let estimate = required_bytes(retained, &source, &source);
+        let budget = MemoryBudget::new(estimate as usize);
+        assert!(
+            budget
+                .enter(|| decode_bounded(
+                    ImageInput::Bytes(&bytes),
+                    BoundedDecodeOptions::default()
+                ))
+                .is_ok()
+        );
+        assert!(!budget.is_exceeded());
+        assert!(matches!(
+            decode_bounded(
+                ImageInput::Bytes(&bytes),
+                BoundedDecodeOptions {
+                    max_memory_bytes: 2 * 1024 * 1024,
+                    ..BoundedDecodeOptions::default()
+                }
+            ),
+            Err(ImageError::TooLarge(_))
+        ));
     }
 
     #[test]
@@ -573,23 +818,29 @@ mod tests {
     }
 
     struct Pattern {
-        width: u32,
-        height: u32,
+        width: u16,
+        height: u16,
     }
 
-    impl GenericImageView for Pattern {
-        type Pixel = Rgb<u8>;
-
-        fn dimensions(&self) -> (u32, u32) {
-            (self.width, self.height)
+    impl jpeg_encoder::ImageBuffer for Pattern {
+        fn get_jpeg_color_type(&self) -> JpegColorType {
+            JpegColorType::Ycbcr
         }
 
-        fn get_pixel(&self, x: u32, y: u32) -> Rgb<u8> {
-            Rgb([
-                (x % 251) as u8,
-                (y % 241) as u8,
-                ((x / 7 + y / 5) % 239) as u8,
-            ])
+        fn width(&self) -> u16 {
+            self.width
+        }
+
+        fn height(&self) -> u16 {
+            self.height
+        }
+
+        fn fill_buffers(&self, y: u16, buffers: &mut [Vec<u8>; 4]) {
+            for x in 0..self.width {
+                buffers[0].push((x % 251) as u8);
+                buffers[1].push((y % 241) as u8);
+                buffers[2].push(((x / 7 + y / 5) % 239) as u8);
+            }
         }
     }
 
@@ -599,8 +850,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("large.jpg");
         let mut bytes = Vec::new();
-        JpegEncoder::new_with_quality(&mut bytes, 90)
-            .encode_image(&Pattern {
+        let mut encoder = Encoder::new(&mut bytes, 90);
+        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder
+            .encode_image(Pattern {
                 width: 16_320,
                 height: 12_240,
             })
