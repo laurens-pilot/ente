@@ -15,13 +15,15 @@ use crate::{
 };
 
 pub(crate) const SIGNATURE: &[u8] = b"\xff\xd8\xff";
+const START_OF_IMAGE: &[u8] = b"\xff\xd8";
 const END_OF_IMAGE: &[u8] = b"\xff\xd9";
-const READ_ROWS: usize = 36;
+const MAX_STRIPE_ROWS: usize = 36;
+const HEADER_PARSING_BYTES: u64 = 16 * 1024 * 1024;
 const DECODER_BYTES: u64 = 1024 * 1024;
-const DECODER_BYTES_PER_COLUMN: u64 = 512;
-const METADATA_COPIES: u64 = 4;
+const DECODER_BYTES_PER_COLUMN: u64 = 1024;
+const METADATA_COPIES: u64 = 12;
 
-struct FirstScan {
+struct ScanHeader {
     components: u8,
     end: usize,
 }
@@ -31,14 +33,16 @@ pub(crate) fn decode(
     options: BoundedDecodeOptions,
 ) -> ImageResult<BoundedDecodedImage> {
     match input {
-        ImageInput::Bytes(bytes) if bytes.ends_with(END_OF_IMAGE) => {
-            decode_bytes(bytes, 0, options)
-        }
         ImageInput::Bytes(bytes) => {
-            let mut terminated = input_buffer(bytes.len() as u64, options.max_memory_bytes)?;
-            terminated.extend_from_slice(bytes);
+            let scan = first_scan(bytes)?;
+            let end = scan_data_end(bytes, &scan)?;
+            if bytes[end..].starts_with(END_OF_IMAGE) {
+                return decode_bytes(&bytes[..end + END_OF_IMAGE.len()], &scan, 0, options);
+            }
+            let mut terminated = input_buffer(end as u64, options.max_memory_bytes)?;
+            terminated.extend_from_slice(&bytes[..end]);
             terminated.extend_from_slice(END_OF_IMAGE);
-            decode_bytes(&terminated, terminated.len() as u64, options)
+            decode_bytes(&terminated, &scan, terminated.capacity() as u64, options)
         }
         ImageInput::Path(path) => {
             let read_error =
@@ -49,8 +53,10 @@ pub(crate) fn decode(
             file.take(length)
                 .read_to_end(&mut bytes)
                 .map_err(read_error)?;
+            let scan = first_scan(&bytes)?;
+            bytes.truncate(scan_data_end(&bytes, &scan)?);
             bytes.extend_from_slice(END_OF_IMAGE);
-            decode_bytes(&bytes, bytes.len() as u64, options)
+            decode_bytes(&bytes, &scan, bytes.capacity() as u64, options)
         }
     }
 }
@@ -67,15 +73,33 @@ fn input_buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>>
     Ok(buffer)
 }
 
+fn first_scan(bytes: &[u8]) -> ImageResult<ScanHeader> {
+    next_scan(bytes, START_OF_IMAGE.len()).ok_or_else(|| unsupported("malformed header segments"))
+}
+
+fn scan_data_end(bytes: &[u8], scan: &ScanHeader) -> ImageResult<usize> {
+    let end = bytes
+        .get(scan.end..)
+        .and_then(|data| {
+            data.windows(2)
+                .position(|pair| pair[0] == 0xff && !matches!(pair[1], 0x00 | 0xd0..=0xd7 | 0xff))
+        })
+        .map_or(bytes.len(), |position| scan.end + position);
+    if next_scan(bytes, end).is_some() {
+        return Err(unsupported("more than one scan"));
+    }
+    Ok(end)
+}
+
 fn decode_bytes(
     bytes: &[u8],
+    scan: &ScanHeader,
     owned_input_bytes: u64,
     options: BoundedDecodeOptions,
 ) -> ImageResult<BoundedDecodedImage> {
-    let scan = first_scan(bytes).ok_or_else(|| unsupported("malformed header segments"))?;
     let retained_bytes =
         owned_input_bytes.saturating_add(METADATA_COPIES.saturating_mul(scan.end as u64));
-    if retained_bytes > options.max_memory_bytes {
+    if retained_bytes.saturating_add(HEADER_PARSING_BYTES) > options.max_memory_bytes {
         return Err(too_large());
     }
     let mut decoder = JpegDecoder::new_with_options(
@@ -127,8 +151,9 @@ fn decode_bytes(
     let mut converter = IccConverter::new(profile.as_deref());
     let mut output = Downsampler::new(source.clone(), target.clone(), false)?;
     let row_bytes = source.width as usize * color.num_components();
-    let mut rows_buffer = vec![0; row_bytes * READ_ROWS];
+    let mut rows_buffer = vec![0; row_bytes * MAX_STRIPE_ROWS];
     let mut session = decoder.scanline_output();
+    let ended_early = || ImageError::Decode("JPEG ended before all rows were decoded".into());
     let mut y = 0;
     loop {
         match session
@@ -149,17 +174,11 @@ fn decode_bytes(
                 }
             }
             ScanlineReadStatus::Complete => break,
-            _ => {
-                return Err(ImageError::Decode(
-                    "JPEG ended before all rows were decoded".into(),
-                ));
-            }
+            _ => return Err(ended_early()),
         }
     }
     if y != source.height {
-        return Err(ImageError::Decode(
-            "JPEG ended before all rows were decoded".into(),
-        ));
+        return Err(ended_early());
     }
     session.finish().map_err(jpeg_error)?;
     oriented_output(output.finish(), source, target, orientation)
@@ -173,8 +192,7 @@ fn required_bytes(retained_bytes: u64, source: &Dimensions, target: &Dimensions)
         .saturating_add(DECODER_BYTES + u64::from(source.width) * DECODER_BYTES_PER_COLUMN)
 }
 
-fn first_scan(bytes: &[u8]) -> Option<FirstScan> {
-    let mut offset = 2;
+fn next_scan(bytes: &[u8], mut offset: usize) -> Option<ScanHeader> {
     loop {
         if *bytes.get(offset)? != 0xff {
             return None;
@@ -192,7 +210,7 @@ fn first_scan(bytes: &[u8]) -> Option<FirstScan> {
         }
         let end = offset + 1 + length;
         if marker == 0xda {
-            return Some(FirstScan {
+            return Some(ScanHeader {
                 components: *bytes.get(offset + 3)?,
                 end,
             });
@@ -570,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn first_scan_accepts_only_contiguous_header_segments() {
+    fn next_scan_accepts_only_contiguous_header_segments() {
         let bytes = encode(&rgb(8, 8), 8, 8, ExtendedColorType::Rgb8, None, None);
         let sos = marker(&bytes, 0xda);
         let scan = first_scan(&bytes).unwrap();
@@ -592,7 +610,10 @@ mod tests {
             b"\xff\xd8\xff\xe0\0\x10\xff\xda",
             b"\xff\xd8\xff\xda\0\x08",
         ] {
-            assert!(first_scan(header).is_none(), "{header:x?}");
+            assert!(
+                next_scan(header, START_OF_IMAGE.len()).is_none(),
+                "{header:x?}"
+            );
         }
     }
 
@@ -787,6 +808,211 @@ mod tests {
             ),
             Err(ImageError::TooLarge(_))
         ));
+    }
+
+    fn plain_64() -> Vec<u8> {
+        encode_layout(&rgb(64, 64), 64, 64, ColorType::Rgb, |encoder| {
+            encoder.set_sampling_factor(SamplingFactor::F_2_2)
+        })
+    }
+
+    #[test]
+    fn scan_data_ends_at_the_first_marker_after_the_scan() {
+        let scan = ScanHeader {
+            components: 3,
+            end: 0,
+        };
+        let data = b"\x12\xff\x00\x34\xff\xd3\x56\xff\xff\xd9\xff\xe1";
+        assert_eq!(scan_data_end(data, &scan).unwrap(), 8);
+        assert_eq!(scan_data_end(b"\x12\x34\xff", &scan).unwrap(), 3);
+        assert_eq!(scan_data_end(b"\x12\x34", &scan).unwrap(), 2);
+        assert_eq!(
+            scan_data_end(b"\x12\xff\xe1\0\x04ab\xff\xd9", &scan).unwrap(),
+            1
+        );
+        assert_eq!(
+            scan_data_end(b"\x12\xff\xe1\0\x04ab\x99\xff\xda\0\x08\x01", &scan).unwrap(),
+            1
+        );
+        for later_scan in [
+            &b"\x12\xff\xda\0\x08\x01\x01\0\0\x3f\0"[..],
+            b"\x12\xff\xe1\0\x04ab\xff\xff\xda\0\x08\x01\x01\0\0\x3f\0",
+        ] {
+            assert!(matches!(
+                scan_data_end(later_scan, &scan),
+                Err(ImageError::Decode(message)) if message.contains("more than one scan")
+            ));
+        }
+        let beyond = ScanHeader {
+            components: 3,
+            end: 9,
+        };
+        assert_eq!(scan_data_end(b"\xff\xd8", &beyond).unwrap(), 2);
+    }
+
+    #[test]
+    fn metadata_after_the_scan_is_not_kept_by_the_decoder() {
+        let plain = plain_64();
+        let mut bytes = plain[..plain.len() - END_OF_IMAGE.len()].to_vec();
+        for sequence in 1..=64 {
+            let mut chunk = b"ICC_PROFILE\0".to_vec();
+            chunk.extend_from_slice(&[sequence, 64]);
+            chunk.extend(std::iter::repeat_n(sequence, 65_000));
+            bytes.extend_from_slice(&[0xff, 0xe2]);
+            bytes.extend_from_slice(&u16::try_from(chunk.len() + 2).unwrap().to_be_bytes());
+            bytes.extend_from_slice(&chunk);
+        }
+        bytes.extend_from_slice(END_OF_IMAGE);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.jpg");
+        std::fs::write(&path, &bytes).unwrap();
+        let expected = decode_bounded(ImageInput::Bytes(&plain), options(6000)).unwrap();
+        let source = Dimensions {
+            width: 64,
+            height: 64,
+        };
+        let header = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+        for (input, owned) in [
+            (ImageInput::Bytes(&bytes), 0),
+            (
+                ImageInput::Path(path.to_str().unwrap()),
+                (bytes.len() + END_OF_IMAGE.len()) as u64,
+            ),
+        ] {
+            let budget =
+                MemoryBudget::new(required_bytes(owned + header, &source, &source) as usize);
+            let decoded = budget
+                .enter(|| decode_bounded(input, BoundedDecodeOptions::default()))
+                .unwrap();
+            assert!(!budget.is_exceeded());
+            assert_eq!(decoded.image.rgb, expected.image.rgb);
+        }
+    }
+
+    #[test]
+    fn later_scans_are_rejected() {
+        let plain = plain_64();
+        let sos = marker(&plain, 0xda);
+        let scan = &plain[sos..plain.len() - END_OF_IMAGE.len()];
+        let mut repeated = plain[..plain.len() - END_OF_IMAGE.len()].to_vec();
+        repeated.extend_from_slice(scan);
+        repeated.extend_from_slice(END_OF_IMAGE);
+        let mut behind_segment = plain[..plain.len() - END_OF_IMAGE.len()].to_vec();
+        behind_segment.extend_from_slice(b"\xff\xfe\0\x05abc");
+        behind_segment.extend_from_slice(scan);
+        behind_segment.extend_from_slice(END_OF_IMAGE);
+        for bytes in [repeated, behind_segment] {
+            assert!(matches!(
+                decode_bounded(ImageInput::Bytes(&bytes), options(6000)),
+                Err(ImageError::Decode(message)) if message.contains("more than one scan")
+            ));
+        }
+    }
+
+    #[test]
+    fn huffman_table_expansion_fits_the_header_allowance() {
+        let plain = plain_64();
+        let mut segment = Vec::new();
+        for _ in 0..65_533 / 17 {
+            segment.push(0x10);
+            segment.extend_from_slice(&[0; 16]);
+        }
+        let mut bytes = plain[..START_OF_IMAGE.len()].to_vec();
+        bytes.extend_from_slice(&[0xff, 0xc4]);
+        bytes.extend_from_slice(&u16::try_from(segment.len() + 2).unwrap().to_be_bytes());
+        bytes.extend_from_slice(&segment);
+        bytes.extend_from_slice(&plain[START_OF_IMAGE.len()..]);
+        let allowance =
+            METADATA_COPIES * first_scan(&bytes).unwrap().end as u64 + HEADER_PARSING_BYTES;
+        let budget = MemoryBudget::new(allowance as usize);
+        let decoded = budget
+            .enter(|| decode_bounded(ImageInput::Bytes(&bytes), BoundedDecodeOptions::default()))
+            .unwrap();
+        assert!(!budget.is_exceeded());
+        assert_eq!(
+            decoded.image.rgb,
+            decode_bounded(ImageInput::Bytes(&plain), options(6000))
+                .unwrap()
+                .image
+                .rgb
+        );
+        let budget = MemoryBudget::new(1024 * 1024);
+        let result = budget.enter(|| {
+            decode_bounded(
+                ImageInput::Bytes(&bytes),
+                BoundedDecodeOptions {
+                    max_memory_bytes: allowance - 1,
+                    ..BoundedDecodeOptions::default()
+                },
+            )
+        });
+        assert!(matches!(result, Err(ImageError::TooLarge(_))));
+        assert!(!budget.is_exceeded());
+    }
+
+    fn eight_bit_lookup_table_profile(grid: usize, marker_value: u8) -> Vec<u8> {
+        use moxcms::{
+            ColorProfile, LutMultidimensionalType, LutStore, LutWarehouse, Matrix3d, ToneReprCurve,
+            Vector3d,
+        };
+        let identity = || ToneReprCurve::Lut(vec![0, u16::MAX]);
+        let mut table = Vec::with_capacity(grid * grid * grid * 3);
+        for red in 0..grid {
+            for green in 0..grid {
+                for blue in 0..grid {
+                    for value in [red, green, blue] {
+                        table.push((value * 255 / (grid - 1)) as u8);
+                    }
+                }
+            }
+        }
+        table[1] = marker_value;
+        let mut grid_points = [0; 16];
+        grid_points[..3].fill(grid as u8);
+        let mut profile = ColorProfile::new_display_p3();
+        profile.red_trc = None;
+        profile.green_trc = None;
+        profile.blue_trc = None;
+        profile.lut_a_to_b_perceptual =
+            Some(LutWarehouse::Multidimensional(LutMultidimensionalType {
+                num_input_channels: 3,
+                num_output_channels: 3,
+                grid_points,
+                clut: Some(LutStore::Store8(table)),
+                a_curves: vec![identity(), identity(), identity()],
+                b_curves: vec![identity(), identity(), identity()],
+                m_curves: Vec::new(),
+                matrix: Matrix3d::IDENTITY,
+                bias: Vector3d::default(),
+            }));
+        profile.encode().unwrap()
+    }
+
+    #[test]
+    fn uncached_lookup_table_profiles_fit_the_estimate() {
+        let profile = eight_bit_lookup_table_profile(60, 0x5a);
+        let bytes = encode_layout(&rgb(64, 64), 64, 64, ColorType::Rgb, |encoder| {
+            encoder.set_sampling_factor(SamplingFactor::F_2_2);
+            encoder.add_icc_profile(&profile).unwrap();
+        });
+        let source = Dimensions {
+            width: 64,
+            height: 64,
+        };
+        let retained = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+        let estimate = required_bytes(retained, &source, &source);
+        let budget = MemoryBudget::new(estimate as usize);
+        let decoded = budget.enter(|| {
+            decode_bounded(
+                ImageInput::Bytes(&bytes),
+                BoundedDecodeOptions {
+                    max_memory_bytes: estimate + HEADER_PARSING_BYTES,
+                    ..BoundedDecodeOptions::default()
+                },
+            )
+        });
+        assert!(decoded.is_ok());
+        assert!(!budget.is_exceeded());
     }
 
     #[test]
