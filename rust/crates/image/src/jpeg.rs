@@ -262,6 +262,7 @@ mod tests {
     use super::*;
     use crate::{
         bounded::tests::{fixtures_dir, options},
+        color_management::tests::{localized_text, profile_with_text},
         decode::decode_image_from_bytes,
         decode_bounded,
         memory_budget::MemoryBudget,
@@ -383,6 +384,21 @@ mod tests {
     }
 
     #[test]
+    fn sides_longer_than_16384_match_the_full_decoder() {
+        for (width, height) in [(16_400, 8), (8, 16_400)] {
+            let bytes = encode(
+                &rgb(width, height),
+                width,
+                height,
+                ExtendedColorType::Rgb8,
+                None,
+                None,
+            );
+            assert_matches_full_decoder(&bytes, 6000, &format!("{width}x{height}"));
+        }
+    }
+
+    #[test]
     fn subsampled_cmyk_and_restart_layouts_match_the_full_decoder() {
         let samplings = [
             SamplingFactor::F_1_1,
@@ -498,6 +514,35 @@ mod tests {
     }
 
     #[test]
+    fn profiles_with_excessive_localized_text_are_skipped_within_the_budget() {
+        let pixels = rgb(64, 64);
+        let profile = profile_with_text(&[*b"desc"], &localized_text(4096, 65_536));
+        let bytes = encode(
+            &pixels,
+            64,
+            64,
+            ExtendedColorType::Rgb8,
+            Some(profile),
+            None,
+        );
+        let unprofiled = decode_image_from_bytes(&encode(
+            &pixels,
+            64,
+            64,
+            ExtendedColorType::Rgb8,
+            None,
+            None,
+        ))
+        .unwrap();
+        let budget = MemoryBudget::new(4 * 1024 * 1024);
+        let bounded =
+            budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(6000)).unwrap());
+        assert!(!budget.is_exceeded());
+        assert_eq!(bounded.image.rgb, unprofiled.rgb);
+        assert_eq!(decode_image_from_bytes(&bytes).unwrap().rgb, unprofiled.rgb);
+    }
+
+    #[test]
     fn applies_all_exif_orientations_after_downsampling() {
         let pixels = rgb(16, 8);
         for orientation in 1..=8 {
@@ -553,6 +598,23 @@ mod tests {
                 Err(ImageError::Decode(message)) if message.contains("unsupported JPEG")
             ));
         }
+    }
+
+    #[test]
+    fn progressive_jpegs_with_one_scan_are_rejected_before_buffering() {
+        let mut bytes = with_dimensions(&plain_64(), 4000, 4000);
+        let sof = marker(&bytes, 0xc0);
+        bytes[sof + 1] = 0xc2;
+        let sos = marker(&bytes, 0xda);
+        let components = usize::from(bytes[sos + 4]);
+        bytes[sos + 6 + 2 * components] = 0;
+        let budget = MemoryBudget::new(4 * 1024 * 1024);
+        let result = budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(8)));
+        assert!(
+            matches!(&result, Err(ImageError::Decode(message)) if message.contains("Progressive DCT")),
+            "{result:?}"
+        );
+        assert!(!budget.is_exceeded());
     }
 
     #[test]
