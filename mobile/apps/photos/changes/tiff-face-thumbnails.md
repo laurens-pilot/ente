@@ -1,1 +1,1 @@
-- Fixed face thumbnails for supported YCbCr TIFF and DNG photos and avoided repeated attempts for explicitly unsupported TIFF formats.
+- Fixed missing face thumbnails for some TIFF and DNG photos and delays when unsupported TIFF images fall back to thumbnails.

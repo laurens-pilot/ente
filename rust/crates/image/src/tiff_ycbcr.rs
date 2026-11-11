@@ -1,46 +1,44 @@
 use std::io::{Read, Seek};
 
-use image::RgbImage;
 use tiff::{decoder::Decoder, decoder::ifd::Value, tags::Tag};
 
 use crate::{ImageError, ImageResult};
+
+const YCBCR_COEFFICIENTS: Tag = Tag::Unknown(529);
+const REFERENCE_BLACK_WHITE: Tag = Tag::Unknown(532);
 
 pub(super) fn convert_ycbcr8_to_rgb<R: Read + Seek>(
     decoder: &mut Decoder<R>,
     width: u32,
     height: u32,
-    data: Vec<u8>,
-) -> ImageResult<RgbImage> {
+    mut data: Vec<u8>,
+) -> ImageResult<Vec<u8>> {
     let planar = decoder
         .find_tag_unsigned::<u16>(Tag::PlanarConfiguration)
         .map_err(|error| ImageError::Decode(format!("failed to read TIFF planar layout: {error}")))?
         .unwrap_or(1);
     if planar != 1 {
-        return Err(ImageError::Decode(format!(
+        return Err(ImageError::Unsupported(format!(
             "unsupported TIFF YCbCr planar configuration: {planar}"
         )));
     }
     let [red_luma, green_luma, blue_luma] =
-        read_rationals(decoder, Tag::Unknown(529), [0.299, 0.587, 0.114])?;
-    if red_luma < 0.0
-        || green_luma <= 0.0
-        || blue_luma < 0.0
-        || (red_luma + green_luma + blue_luma - 1.0).abs() > 0.000001
-    {
+        read_rationals(decoder, YCBCR_COEFFICIENTS, [0.299, 0.587, 0.114])?;
+    if green_luma <= 0.0 || (red_luma + green_luma + blue_luma - 1.0).abs() > 0.000001 {
         return Err(ImageError::Decode(
             "invalid TIFF YCbCr luma coefficients".to_string(),
         ));
     }
     let references = read_rationals(
         decoder,
-        Tag::Unknown(532),
+        REFERENCE_BLACK_WHITE,
         [0.0, 255.0, 128.0, 255.0, 128.0, 255.0],
     )?;
     if references
         .as_chunks::<2>()
         .0
         .iter()
-        .any(|pair| pair[0] < 0.0 || pair[1] > 255.0 || pair[1] <= pair[0])
+        .any(|pair| pair[1] > 255.0 || pair[1] <= pair[0])
     {
         return Err(ImageError::Decode(
             "invalid TIFF YCbCr reference levels".to_string(),
@@ -53,35 +51,24 @@ pub(super) fn convert_ycbcr8_to_rgb<R: Read + Seek>(
     let blue_cb = 2.0 * (1.0 - blue_luma);
     let green_cb = blue_luma * blue_cb / green_luma;
     let green_cr = red_luma * red_cr / green_luma;
-    if ![y_scale, cb_scale, cr_scale, green_cb, green_cr]
-        .into_iter()
-        .all(f64::is_finite)
-    {
-        return Err(ImageError::Decode(
-            "invalid TIFF YCbCr conversion coefficients".to_string(),
-        ));
-    }
     if data.len() as u64 != u64::from(width) * u64::from(height) * 3 {
         return Err(ImageError::Decode(
             "TIFF YCbCr buffer length does not match dimensions".to_string(),
         ));
     }
-    let mut image = RgbImage::from_raw(width, height, data).ok_or_else(|| {
-        ImageError::Decode("TIFF YCbCr buffer length does not match dimensions".to_string())
-    })?;
-    for pixel in image.pixels_mut() {
+    for pixel in data.as_chunks_mut::<3>().0 {
         let y = (f64::from(pixel[0]) - references[0]) * y_scale;
         let cb = (f64::from(pixel[1]) - references[2]) * cb_scale;
         let cr = (f64::from(pixel[2]) - references[4]) * cr_scale;
-        *pixel = image::Rgb([
+        *pixel = [
             (y + red_cr * cr).round().clamp(0.0, 255.0) as u8,
             (y - green_cb * cb - green_cr * cr)
                 .round()
                 .clamp(0.0, 255.0) as u8,
             (y + blue_cb * cb).round().clamp(0.0, 255.0) as u8,
-        ]);
+        ];
     }
-    Ok(image)
+    Ok(data)
 }
 
 fn read_rationals<R: Read + Seek, const N: usize>(
@@ -134,20 +121,116 @@ mod tests {
         {
             let mut encoder = TiffEncoder::new(&mut encoded).unwrap();
             let mut image = encoder
-                .new_image::<colortype::RGB8>((pixels.len() / 3) as u32, 1)
-                .unwrap();
-            image
-                .encoder()
-                .write_tag(Tag::PhotometricInterpretation, 6u16)
-                .unwrap();
-            image
-                .encoder()
-                .write_tag(Tag::ChromaSubsampling, &[1u16, 1][..])
+                .new_image::<colortype::YCbCr8>((pixels.len() / 3) as u32, 1)
                 .unwrap();
             configure(image.encoder());
             image.write_data(pixels).unwrap();
         }
         encoded.into_inner()
+    }
+
+    fn tiff_fixture(
+        data: &[u8],
+        configure: impl FnOnce(&mut DirectoryEncoder<'_, &mut Cursor<Vec<u8>>, TiffKindStandard>, u32),
+    ) -> Vec<u8> {
+        let mut encoded = Cursor::new(Vec::new());
+        {
+            let mut encoder = TiffEncoder::new(&mut encoded).unwrap();
+            let mut tags = encoder.image_directory().unwrap();
+            let offset = tags.write_data(data).unwrap() as u32;
+            tags.write_tag(Tag::ImageLength, 2u32).unwrap();
+            tags.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
+                .unwrap();
+            tags.write_tag(Tag::SamplesPerPixel, 3u16).unwrap();
+            tags.write_tag(Tag::Compression, 1u16).unwrap();
+            tags.write_tag(Tag::ChromaSubsampling, &[1u16, 1][..])
+                .unwrap();
+            tags.write_tag(Tag::RowsPerStrip, 2u32).unwrap();
+            tags.write_tag(Tag::StripOffsets, offset).unwrap();
+            tags.write_tag(Tag::StripByteCounts, data.len() as u32)
+                .unwrap();
+            configure(&mut tags, offset);
+            tags.finish().unwrap();
+        }
+        encoded.into_inner()
+    }
+
+    #[test]
+    fn unsupported_tiff_formats_have_a_stable_error_category() {
+        let mut fixtures = Vec::new();
+        for photometric in [None, Some(65535u16), Some(8)] {
+            fixtures.push(tiff_fixture(&[128; 12], |tags, _| {
+                tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+                if let Some(value) = photometric {
+                    tags.write_tag(Tag::PhotometricInterpretation, value)
+                        .unwrap();
+                }
+            }));
+        }
+        fixtures.push(tiff_fixture(&[128; 16], |tags, _| {
+            tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+            tags.write_tag(Tag::PhotometricInterpretation, 6u16)
+                .unwrap();
+            tags.write_tag(Tag::BitsPerSample, &[8u16, 16, 8][..])
+                .unwrap();
+        }));
+        fixtures.push(tiff_fixture(&[100, 100, 100, 100, 128, 128], |tags, _| {
+            tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+            tags.write_tag(Tag::PhotometricInterpretation, 6u16)
+                .unwrap();
+            tags.write_tag(Tag::ChromaSubsampling, &[2u16, 2][..])
+                .unwrap();
+        }));
+        fixtures.push(tiff_fixture(&[128; 24], |tags, _| {
+            tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+            tags.write_tag(Tag::PhotometricInterpretation, 6u16)
+                .unwrap();
+            tags.write_tag(Tag::BitsPerSample, &[16u16, 16, 16][..])
+                .unwrap();
+        }));
+        fixtures.push(tiff_fixture(&[128; 12], |tags, offset| {
+            tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+            tags.write_tag(Tag::PhotometricInterpretation, 6u16)
+                .unwrap();
+            tags.write_tag(Tag::PlanarConfiguration, 2u16).unwrap();
+            tags.write_tag(Tag::StripOffsets, &[offset, offset + 4, offset + 8][..])
+                .unwrap();
+            tags.write_tag(Tag::StripByteCounts, &[4u32, 4, 4][..])
+                .unwrap();
+        }));
+        for bytes in fixtures {
+            let error = decode_image_from_bytes(&bytes).unwrap_err();
+            assert!(matches!(error, ImageError::Unsupported(_)), "{error}");
+            assert!(error.to_string().starts_with("unsupported image format: "));
+        }
+    }
+
+    #[test]
+    fn malformed_tiff_metadata_remains_retryable() {
+        let mut fixtures = Vec::new();
+        for bits in [&[0u16][..], &[0, 0, 0][..], &[8, 0, 8][..]] {
+            fixtures.push(tiff_fixture(&[128; 12], |tags, _| {
+                tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
+                tags.write_tag(
+                    Tag::PhotometricInterpretation,
+                    if bits.len() == 1 { 1u16 } else { 6 },
+                )
+                .unwrap();
+                tags.write_tag(Tag::SamplesPerPixel, bits.len() as u16)
+                    .unwrap();
+                tags.write_tag(Tag::BitsPerSample, bits).unwrap();
+            }));
+        }
+        fixtures.push(tiff_fixture(&[128; 12], |tags, _| {
+            tags.write_tag(Tag::PhotometricInterpretation, 6u16)
+                .unwrap();
+        }));
+        for bytes in fixtures {
+            assert!(matches!(
+                decode_image_from_bytes(&bytes),
+                Err(ImageError::Decode(_))
+            ));
+        }
     }
 
     #[test]
@@ -184,9 +267,10 @@ mod tests {
         ];
         let references = [16, 235, 128, 240, 128, 240].map(|n| Rational { n, d: 1 });
         let bytes = ycbcr_fixture(&[100, 100, 150], |tags| {
-            tags.write_tag(Tag::Unknown(529), &coefficients[..])
+            tags.write_tag(YCBCR_COEFFICIENTS, &coefficients[..])
                 .unwrap();
-            tags.write_tag(Tag::Unknown(532), &references[..]).unwrap();
+            tags.write_tag(REFERENCE_BLACK_WHITE, &references[..])
+                .unwrap();
         });
         assert_eq!(decode_image_from_bytes(&bytes).unwrap().rgb, [135, 103, 50]);
     }
@@ -226,28 +310,13 @@ mod tests {
         JpegEncoder::new_with_quality(&mut jpeg, 95)
             .encode(&pixels, 2, 2, image::ExtendedColorType::Rgb8)
             .unwrap();
-        let mut encoded = Cursor::new(Vec::new());
-        {
-            let mut encoder = TiffEncoder::new(&mut encoded).unwrap();
-            let mut tags = encoder.image_directory().unwrap();
-            let offset = tags.write_data(jpeg.as_slice()).unwrap();
+        let encoded = tiff_fixture(&jpeg, |tags, _| {
             tags.write_tag(Tag::ImageWidth, 2u32).unwrap();
-            tags.write_tag(Tag::ImageLength, 2u32).unwrap();
-            tags.write_tag(Tag::BitsPerSample, &[8u16, 8, 8][..])
-                .unwrap();
-            tags.write_tag(Tag::SamplesPerPixel, 3u16).unwrap();
             tags.write_tag(Tag::Compression, 7u16).unwrap();
             tags.write_tag(Tag::PhotometricInterpretation, 6u16)
                 .unwrap();
-            tags.write_tag(Tag::ChromaSubsampling, &[2u16, 2][..])
-                .unwrap();
-            tags.write_tag(Tag::RowsPerStrip, 2u32).unwrap();
-            tags.write_tag(Tag::StripOffsets, offset as u32).unwrap();
-            tags.write_tag(Tag::StripByteCounts, jpeg.len() as u32)
-                .unwrap();
-            tags.finish().unwrap();
-        }
-        let decoded = decode_image_from_bytes(&encoded.into_inner()).unwrap();
+        });
+        let decoded = decode_image_from_bytes(&encoded).unwrap();
         let reference = decode_image_from_bytes(&jpeg).unwrap();
         assert_eq!(decoded.rgb.len(), reference.rgb.len());
         assert!(
@@ -267,16 +336,23 @@ mod tests {
             vec![Rational { n: 1, d: 4 }; 2],
         ] {
             let bytes = ycbcr_fixture(&[100, 128, 128], |tags| {
-                tags.write_tag(Tag::Unknown(529), values.as_slice())
+                tags.write_tag(YCBCR_COEFFICIENTS, values.as_slice())
                     .unwrap();
             });
-            assert!(decode_image_from_bytes(&bytes).is_err());
+            assert!(matches!(
+                decode_image_from_bytes(&bytes),
+                Err(ImageError::Decode(_))
+            ));
         }
         let references = [0, 0, 128, 255, 128, 255].map(|n| Rational { n, d: 1 });
         let bytes = ycbcr_fixture(&[100, 128, 128], |tags| {
-            tags.write_tag(Tag::Unknown(532), &references[..]).unwrap();
+            tags.write_tag(REFERENCE_BLACK_WHITE, &references[..])
+                .unwrap();
         });
-        assert!(decode_image_from_bytes(&bytes).is_err());
+        assert!(matches!(
+            decode_image_from_bytes(&bytes),
+            Err(ImageError::Decode(_))
+        ));
     }
 
     #[test]

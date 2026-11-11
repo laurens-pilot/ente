@@ -27,6 +27,7 @@ use tiff::{
 use crate::{
     color_management::apply_icc_profile_to_srgb,
     error::{ImageError, ImageResult},
+    tiff_ycbcr::convert_ycbcr8_to_rgb,
     types::{DecodedImage, Dimensions},
 };
 
@@ -168,12 +169,16 @@ fn tiff_fallback_failure(
     if matches!(primary_error, ImageError::TooLarge(_)) {
         return primary_error;
     }
-    let ImageError::Decode(fallback_message) = fallback_error else {
-        return fallback_error;
+    let message = |fallback_message| {
+        format!(
+            "failed to decode TIFF with image crate: {primary_message}; fallback with tiff crate also failed: {fallback_message}"
+        )
     };
-    ImageError::Decode(format!(
-        "failed to decode TIFF with image crate: {primary_message}; fallback with tiff crate also failed: {fallback_message}"
-    ))
+    match fallback_error {
+        ImageError::Decode(error) => ImageError::Decode(message(error)),
+        ImageError::Unsupported(error) => ImageError::Unsupported(message(error)),
+        other => other,
+    }
 }
 
 fn decode_reader_with_image_crate<R>(
@@ -230,14 +235,14 @@ fn decode_tiff_from_bytes(image_bytes: &[u8]) -> ImageResult<DecodedDynamicImage
 
 fn decode_tiff<R: Read + Seek>(reader: R, source: &str) -> ImageResult<DecodedDynamicImage> {
     let mut decoder = TiffDecoder::new(reader)
-        .map_err(|e| ImageError::Decode(format!("failed to initialize TIFF decoder: {e}")))?;
+        .map_err(|error| tiff_decode_error(error, "initialize TIFF decoder"))?;
     let (width, height) = decoder
         .dimensions()
-        .map_err(|e| ImageError::Decode(format!("failed to read TIFF dimensions: {e}")))?;
+        .map_err(|error| tiff_decode_error(error, "read TIFF dimensions"))?;
     ensure_within_decode_pixel_cap(width, height)?;
     let color_type = decoder
         .colortype()
-        .map_err(|e| ImageError::Decode(format!("failed to read TIFF color type: {e}")))?;
+        .map_err(|error| tiff_decode_error(error, "read TIFF color type"))?;
     let icc_profile = decoder.get_tag_u8_vec(TiffTag::IccProfile).ok();
     let orientation = decoder
         .find_tag_unsigned::<u16>(TiffTag::Orientation)
@@ -245,30 +250,36 @@ fn decode_tiff<R: Read + Seek>(reader: R, source: &str) -> ImageResult<DecodedDy
         .flatten()
         .and_then(|value| u8::try_from(value).ok())
         .and_then(Orientation::from_exif);
-    let decoded = decoder.read_image().map_err(tiff_decode_error)?;
-    let image = match (color_type, decoded) {
-        (TiffColorType::YCbCr(8), TiffDecodingResult::U8(data)) => DynamicImage::ImageRgb8(
-            crate::tiff_ycbcr::convert_ycbcr8_to_rgb(&mut decoder, width, height, data)?,
-        ),
-        (color_type, decoded) => {
-            dynamic_image_from_tiff(source, width, height, color_type, decoded)?
+    let decoded = decoder
+        .read_image()
+        .map_err(|error| tiff_decode_error(error, "decode TIFF image data"))?;
+    let (color_type, decoded) = match (color_type, decoded) {
+        (TiffColorType::YCbCr(8), TiffDecodingResult::U8(data)) => {
+            let data = convert_ycbcr8_to_rgb(&mut decoder, width, height, data)?;
+            (TiffColorType::RGB(8), TiffDecodingResult::U8(data))
         }
+        other => other,
     };
 
     Ok(DecodedDynamicImage {
-        image,
+        image: dynamic_image_from_tiff(source, width, height, color_type, decoded)?,
         icc_profile,
         orientation,
     })
 }
 
-fn tiff_decode_error(error: tiff::TiffError) -> ImageError {
-    if matches!(error, tiff::TiffError::LimitsExceeded) {
-        return ImageError::TooLarge(image::ImageError::Limits(
+fn tiff_decode_error(error: tiff::TiffError, operation: &str) -> ImageError {
+    let message = format!("failed to {operation}: {error}");
+    match error {
+        tiff::TiffError::LimitsExceeded => ImageError::TooLarge(image::ImageError::Limits(
             image::error::LimitError::from_kind(image::error::LimitErrorKind::InsufficientMemory),
-        ));
+        )),
+        tiff::TiffError::UnsupportedError(
+            tiff::TiffUnsupportedError::InconsistentBitsPerSample(bits),
+        ) if bits.contains(&0) => ImageError::Decode(message),
+        tiff::TiffError::UnsupportedError(_) => ImageError::Unsupported(message),
+        _ => ImageError::Decode(message),
     }
-    ImageError::Decode(format!("failed to decode TIFF image data: {error}"))
 }
 
 fn dynamic_image_from_tiff(
@@ -319,7 +330,7 @@ fn dynamic_image_from_tiff(
                 .ok_or_else(|| tiff_buffer_mismatch_error(source, width, height, "RGBA(16)"))?;
             Ok(DynamicImage::ImageRgba16(image))
         }
-        (observed_color_type, observed_result_type) => Err(ImageError::Decode(format!(
+        (observed_color_type, observed_result_type) => Err(ImageError::Unsupported(format!(
             "unsupported TIFF pixel format for '{source}': color_type={observed_color_type:?}, sample_type={}",
             tiff_result_type_name(&observed_result_type)
         ))),
