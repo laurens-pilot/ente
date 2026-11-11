@@ -6,7 +6,10 @@ import "package:photos/utils/isolate/isolate_operations.dart";
 import "package:photos/utils/isolate/super_isolate.dart";
 
 final _unsupportedImageFormatError = RegExp(
-  r'^Exception: decode error: (The file extension .+ was not recognized as an image format|The image format .+ is not supported)$',
+  r'^Exception: decode error: (The file extension .+ was not recognized as an image format|The image format .+ is not supported|'
+  r'failed to decode TIFF with image crate: [^\r\n]+; fallback with tiff crate also failed: '
+  r'(failed to (initialize TIFF decoder|read TIFF color type|decode TIFF image data): unsupported error: [^\r\n]+|'
+  r'unsupported TIFF pixel format for [^\r\n]+|unsupported TIFF YCbCr planar configuration: [^\r\n]+))$',
 );
 
 class UnsupportedFaceThumbnailException implements Exception {

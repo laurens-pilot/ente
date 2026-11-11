@@ -1,0 +1,1 @@
+- Fixed face thumbnails for supported YCbCr TIFF and DNG photos and avoided repeated attempts for explicitly unsupported TIFF formats.

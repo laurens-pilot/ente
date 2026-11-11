@@ -246,9 +246,17 @@ fn decode_tiff<R: Read + Seek>(reader: R, source: &str) -> ImageResult<DecodedDy
         .and_then(|value| u8::try_from(value).ok())
         .and_then(Orientation::from_exif);
     let decoded = decoder.read_image().map_err(tiff_decode_error)?;
+    let image = match (color_type, decoded) {
+        (TiffColorType::YCbCr(8), TiffDecodingResult::U8(data)) => DynamicImage::ImageRgb8(
+            crate::tiff_ycbcr::convert_ycbcr8_to_rgb(&mut decoder, width, height, data)?,
+        ),
+        (color_type, decoded) => {
+            dynamic_image_from_tiff(source, width, height, color_type, decoded)?
+        }
+    };
 
     Ok(DecodedDynamicImage {
-        image: dynamic_image_from_tiff(source, width, height, color_type, decoded)?,
+        image,
         icc_profile,
         orientation,
     })

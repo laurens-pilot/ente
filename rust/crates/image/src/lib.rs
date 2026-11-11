@@ -9,6 +9,7 @@ mod jxl;
 mod memory_budget;
 mod png;
 mod resample;
+mod tiff_ycbcr;
 pub mod types;
 
 pub use bounded::{BoundedDecodeOptions, BoundedDecodedImage, ImageInput, decode_bounded};
