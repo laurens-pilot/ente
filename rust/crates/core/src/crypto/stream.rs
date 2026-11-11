@@ -367,6 +367,8 @@ impl<R: Read> StreamingDecryptor<R> {
             self.seen_final = true;
             ensure_reader_exhausted(&mut self.reader)?;
             self.finished = true;
+        } else if self.buffer.is_empty() {
+            return Err(Error::StreamTruncated);
         }
 
         self.data_start = 0;
