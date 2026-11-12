@@ -93,6 +93,7 @@ class FilesDB with SqlDbBase {
     ...createEntityDataTable(),
     ...addAddedTime(),
     ...addFileMaterializationOrderIndex(),
+    ...addUploadedFileIDIndex(),
   ];
 
   static const List<String> _columnNames = [
@@ -419,6 +420,16 @@ class FilesDB with SqlDbBase {
     ];
   }
 
+  static List<String> addUploadedFileIDIndex() {
+    return [
+      '''
+        CREATE INDEX IF NOT EXISTS uploaded_file_id_index
+        ON $filesTable($columnUploadedFileID)
+        WHERE $columnUploadedFileID IS NOT NULL;
+      ''',
+    ];
+  }
+
   Future<void> clearTable() async {
     final db = await instance.sqliteAsyncDB;
     await db.execute('DELETE FROM $filesTable');
@@ -655,7 +666,7 @@ class FilesDB with SqlDbBase {
     final results = await db.getAll(
       'SELECT $columnLocalID, $columnUploadedFileID, $columnFileSize FROM $filesTable'
       ' WHERE $columnLocalID IS NOT NULL AND ($columnOwnerID IS NULL OR $columnOwnerID = ?) '
-      'AND ($columnUploadedFileID IS NOT NULL AND $columnUploadedFileID IS NOT -1) '
+      'AND NOT ($columnUploadedFileID IS NULL OR $columnUploadedFileID = -1) '
       'AND $columnUpdationTime IS NOT NULL',
       [ownerID],
     );
@@ -1634,8 +1645,7 @@ class FilesDB with SqlDbBase {
     final rows = await db.getAll('''
       SELECT $columnUploadedFileID, $columnCreationTime
       FROM $filesTable
-      WHERE 
-      ($columnUploadedFileID IS NOT NULL AND $columnUploadedFileID IS NOT -1);
+      WHERE NOT ($columnUploadedFileID IS NULL OR $columnUploadedFileID = -1);
     ''');
     final result = <int, int>{};
     for (final row in rows) {

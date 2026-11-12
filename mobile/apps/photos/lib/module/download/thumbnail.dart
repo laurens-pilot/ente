@@ -104,14 +104,14 @@ preloadThumbnailWithPendingRequestRef(EnteFile file) async {
 // cachedThumbnailPath requires an uploaded file ID.
 Future<File?> getThumbnailForUploadedFile(EnteFile file) async {
   final cachedThumbnail = cachedThumbnailPath(file);
-  if (await cachedThumbnail.exists()) {
+  if (await _cachedThumbnailHasContent(cachedThumbnail)) {
     _logger.info("Thumbnail already exists for ${file.uploadedFileID}");
     return cachedThumbnail;
   }
   final thumbnail = await getThumbnail(file);
-  if (thumbnail != null) {
+  if (thumbnail != null && thumbnail.isNotEmpty) {
     // getThumbnail may have already written this path.
-    if (!await cachedThumbnail.exists()) {
+    if (!await _cachedThumbnailHasContent(cachedThumbnail)) {
       final didWrite = await _writeCachedThumbnail(
         cachedThumbnail,
         thumbnail,
@@ -407,6 +407,9 @@ Future<Uint8List?> _readCachedThumbnailIfPresent(
   }
   try {
     final data = await cachedThumbnail.readAsBytes();
+    if (data.isEmpty) {
+      return null;
+    }
     ThumbnailInMemoryLruCache.put(file, data, size);
     return data;
   } on FileSystemException catch (e) {
@@ -421,35 +424,45 @@ Future<Uint8List?> _readCachedThumbnailIfPresent(
   }
 }
 
+Future<bool> _cachedThumbnailHasContent(File cachedThumbnail) async {
+  try {
+    return await cachedThumbnail.length() > 0;
+  } on FileSystemException catch (e) {
+    if (isFileSystemPathMissing(e)) return false;
+    rethrow;
+  }
+}
+
 Future<bool> _writeCachedThumbnail(
   File cachedThumbnail,
   Uint8List data, {
   bool flush = false,
 }) async {
+  if (data.isEmpty) return false;
+  final temporary = File("${cachedThumbnail.path}.${const Uuid().v4()}.tmp");
+  var published = false;
   try {
-    await cachedThumbnail.writeAsBytes(data, flush: flush);
-    return true;
-  } on FileSystemException catch (e) {
-    if (!isFileSystemPathMissing(e)) {
-      rethrow;
-    }
-    _logger.info(
-      "Thumbnail cache directory missing during write; recreating: "
-      "${cachedThumbnail.parent.path}",
-    );
-    await cachedThumbnail.parent.create(recursive: true);
-    try {
-      await cachedThumbnail.writeAsBytes(data, flush: flush);
-      return true;
-    } on FileSystemException catch (retryError) {
-      if (isFileSystemPathMissing(retryError)) {
-        _logger.info(
-          "Thumbnail cache path still missing after recreate; skipping write: "
-          "${cachedThumbnail.path}",
-        );
-        return false;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        await temporary.writeAsBytes(data, flush: flush);
+        await temporary.rename(cachedThumbnail.path);
+        published = true;
+        return true;
+      } on FileSystemException catch (e) {
+        if (!isFileSystemPathMissing(e)) rethrow;
+        if (attempt == 0) {
+          await cachedThumbnail.parent.create(recursive: true);
+        }
       }
-      rethrow;
+    }
+    return false;
+  } finally {
+    if (!published) {
+      try {
+        await deleteFileSystemEntityIfPresent(temporary);
+      } on FileSystemException catch (e, s) {
+        _logger.warning("Could not remove temporary thumbnail", e, s);
+      }
     }
   }
 }

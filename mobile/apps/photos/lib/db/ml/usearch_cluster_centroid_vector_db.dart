@@ -72,7 +72,10 @@ class UsearchClusterCentroidVectorDB implements ClusterCentroidVectorDB {
 
     late VectorDb vectorDB;
     try {
-      vectorDB = VectorDb(filePath: dbPath, dimensions: _embeddingDimension);
+      vectorDB = await VectorDb.newInstance(
+        filePath: dbPath,
+        dimensions: _embeddingDimension,
+      );
     } catch (e, s) {
       _logger.severe(
         "Could not open cluster centroid vector DB at path $dbPath",
@@ -82,7 +85,10 @@ class UsearchClusterCentroidVectorDB implements ClusterCentroidVectorDB {
       _logger.severe("Deleting the index file and trying again");
       await deleteIndexFile();
       try {
-        vectorDB = VectorDb(filePath: dbPath, dimensions: _embeddingDimension);
+        vectorDB = await VectorDb.newInstance(
+          filePath: dbPath,
+          dimensions: _embeddingDimension,
+        );
       } catch (e, s) {
         _logger.severe(
           "Still can't open cluster centroid vector DB at path $dbPath",

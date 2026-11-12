@@ -1,0 +1,1 @@
+- Improved large-library performance and recovery from incomplete thumbnail caches.

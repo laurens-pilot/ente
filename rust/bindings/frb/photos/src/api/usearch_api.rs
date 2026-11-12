@@ -11,7 +11,6 @@ pub struct VectorDB {
 }
 
 impl VectorDB {
-    #[frb(sync)]
     pub fn new(file_path: &str, dimensions: usize) -> Result<Self, String> {
         Ok(Self {
             inner: vector_db::VectorDB::new(file_path, dimensions)?,

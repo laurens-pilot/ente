@@ -425,9 +425,18 @@ class SuperLogging {
     StackTrace? stackTrace,
   }) {
     if (fileIsEnabled) {
-      fileQueueEntries.add(str + '\n');
-      if (fileQueueEntries.length == 1) {
-        flushQueue();
+      final entry = str.length > _maxLogEntryCharacters
+          ? '${str.substring(0, _maxLogEntryCharacters)}\n[log entry truncated]\n'
+          : '$str\n';
+      while (fileQueueEntries.isNotEmpty &&
+          (fileQueueEntries.length >= _maxQueuedLogEntries ||
+              _queuedLogCharacters + entry.length > _maxQueuedLogCharacters)) {
+        _queuedLogCharacters -= fileQueueEntries.removeFirst().length;
+      }
+      fileQueueEntries.add(entry);
+      _queuedLogCharacters += entry.length;
+      if (!isFlushing && _fileLogRetryTimer == null && logFile != null) {
+        unawaited(flushQueue());
       }
     }
 
@@ -442,17 +451,44 @@ class SuperLogging {
 
   static final Queue<String> fileQueueEntries = Queue();
   static bool isFlushing = false;
+  static const _maxQueuedLogEntries = 4096;
+  static const _maxQueuedLogCharacters = 1024 * 1024;
+  static const _maxLogEntryCharacters = 64 * 1024;
+  static int _queuedLogCharacters = 0;
+  static Timer? _fileLogRetryTimer;
 
-  static void flushQueue() async {
-    if (isFlushing || logFile == null) {
+  static Future<void> flushQueue() async {
+    if (isFlushing ||
+        logFile == null ||
+        _fileLogRetryTimer != null ||
+        fileQueueEntries.isEmpty) {
       return;
     }
     isFlushing = true;
-    final entry = fileQueueEntries.removeFirst();
-    await logFile!.writeAsString(entry, mode: FileMode.append, flush: true);
-    isFlushing = false;
-    if (fileQueueEntries.isNotEmpty) {
-      flushQueue();
+    try {
+      while (fileQueueEntries.isNotEmpty) {
+        final file = logFile;
+        if (file == null) return;
+        final batch = StringBuffer();
+        while (fileQueueEntries.isNotEmpty &&
+            batch.length < _maxLogEntryCharacters) {
+          final entry = fileQueueEntries.removeFirst();
+          _queuedLogCharacters -= entry.length;
+          batch.write(entry);
+        }
+        await file.writeAsString(
+          batch.toString(),
+          mode: FileMode.append,
+          flush: true,
+        );
+      }
+    } on FileSystemException {
+      _fileLogRetryTimer = Timer(const Duration(seconds: 1), () {
+        _fileLogRetryTimer = null;
+        unawaited(flushQueue());
+      });
+    } finally {
+      isFlushing = false;
     }
   }
 
