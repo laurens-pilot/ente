@@ -21,7 +21,7 @@ const MAX_STRIPE_ROWS: usize = 36;
 const HEADER_PARSING_BYTES: u64 = 16 * 1024 * 1024;
 const DECODER_BYTES: u64 = 1024 * 1024;
 const DECODER_BYTES_PER_COLUMN: u64 = 1024;
-const METADATA_COPIES: u64 = 12;
+const METADATA_COPIES: u64 = 16;
 
 struct ScanHeader {
     components: u8,
@@ -262,7 +262,9 @@ mod tests {
     use super::*;
     use crate::{
         bounded::tests::{fixtures_dir, options},
-        color_management::tests::{localized_text, profile_with_text},
+        color_management::tests::{
+            localized_text, lookup_table, lookup_table_with_inputs, profile_with_tag,
+        },
         decode::decode_image_from_bytes,
         decode_bounded,
         memory_budget::MemoryBudget,
@@ -514,17 +516,8 @@ mod tests {
     }
 
     #[test]
-    fn profiles_with_excessive_localized_text_are_skipped_within_the_budget() {
+    fn profiles_that_expand_when_parsed_are_skipped_within_the_budget() {
         let pixels = rgb(64, 64);
-        let profile = profile_with_text(&[*b"desc"], &localized_text(4096, 65_536));
-        let bytes = encode(
-            &pixels,
-            64,
-            64,
-            ExtendedColorType::Rgb8,
-            Some(profile),
-            None,
-        );
         let unprofiled = decode_image_from_bytes(&encode(
             &pixels,
             64,
@@ -534,12 +527,32 @@ mod tests {
             None,
         ))
         .unwrap();
-        let budget = MemoryBudget::new(4 * 1024 * 1024);
-        let bounded =
-            budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(6000)).unwrap());
-        assert!(!budget.is_exceeded());
-        assert_eq!(bounded.image.rgb, unprofiled.rgb);
-        assert_eq!(decode_image_from_bytes(&bytes).unwrap().rgb, unprofiled.rgb);
+        let lookup_tables = [
+            *b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2", *b"gamt",
+        ];
+        for profile in [
+            profile_with_tag(&[*b"desc"], &localized_text(4096, 65_536)),
+            profile_with_tag(&lookup_tables, &lookup_table(96, 4_000)),
+            profile_with_tag(&lookup_tables, &lookup_table_with_inputs(96, 4_000)),
+        ] {
+            let bytes = encode(
+                &pixels,
+                64,
+                64,
+                ExtendedColorType::Rgb8,
+                Some(profile),
+                None,
+            );
+            let budget = MemoryBudget::new(4 * 1024 * 1024);
+            let bounded =
+                budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(6000)).unwrap());
+            assert!(!budget.is_exceeded());
+            assert_eq!(bounded.image.rgb, unprofiled.rgb);
+            let budget = MemoryBudget::new(4 * 1024 * 1024);
+            let full = budget.enter(|| decode_image_from_bytes(&bytes).unwrap());
+            assert!(!budget.is_exceeded());
+            assert_eq!(full.rgb, unprofiled.rgb);
+        }
     }
 
     #[test]
@@ -1050,31 +1063,62 @@ mod tests {
         profile.encode().unwrap()
     }
 
+    fn tag(profile: &[u8], signature: [u8; 4]) -> Vec<u8> {
+        let count = u32::from_be_bytes(profile[128..132].try_into().unwrap()) as usize;
+        let entry = profile[132..132 + 12 * count]
+            .as_chunks::<12>()
+            .0
+            .iter()
+            .find(|entry| entry[..4] == signature)
+            .unwrap();
+        let offset = u32::from_be_bytes(entry[4..8].try_into().unwrap()) as usize;
+        let size = u32::from_be_bytes(entry[8..12].try_into().unwrap()) as usize;
+        profile[offset..offset + size].to_vec()
+    }
+
     #[test]
     fn uncached_lookup_table_profiles_fit_the_estimate() {
-        let profile = eight_bit_lookup_table_profile(60, 0x5a);
-        let bytes = encode_layout(&rgb(64, 64), 64, 64, ColorType::Rgb, |encoder| {
-            encoder.set_sampling_factor(SamplingFactor::F_2_2);
-            encoder.add_icc_profile(&profile).unwrap();
-        });
-        let source = Dimensions {
-            width: 64,
-            height: 64,
-        };
-        let retained = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
-        let estimate = required_bytes(retained, &source, &source);
-        let budget = MemoryBudget::new(estimate as usize);
-        let decoded = budget.enter(|| {
-            decode_bounded(
-                ImageInput::Bytes(&bytes),
-                BoundedDecodeOptions {
-                    max_memory_bytes: estimate + HEADER_PARSING_BYTES,
-                    ..BoundedDecodeOptions::default()
-                },
-            )
-        });
-        assert!(decoded.is_ok());
-        assert!(!budget.is_exceeded());
+        let lookup_tables = [
+            *b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2", *b"gamt",
+        ];
+        let shared = profile_with_tag(
+            &lookup_tables,
+            &tag(&eight_bit_lookup_table_profile(85, 0x6b), *b"A2B0"),
+        );
+        let pixels = rgb(64, 64);
+        let unprofiled = decode_bounded(
+            ImageInput::Bytes(&encode_layout(&pixels, 64, 64, ColorType::Rgb, |encoder| {
+                encoder.set_sampling_factor(SamplingFactor::F_2_2);
+            })),
+            options(6000),
+        )
+        .unwrap();
+        for profile in [eight_bit_lookup_table_profile(60, 0x5a), shared] {
+            let bytes = encode_layout(&pixels, 64, 64, ColorType::Rgb, |encoder| {
+                encoder.set_sampling_factor(SamplingFactor::F_2_2);
+                encoder.add_icc_profile(&profile).unwrap();
+            });
+            let source = Dimensions {
+                width: 64,
+                height: 64,
+            };
+            let retained = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+            let estimate = required_bytes(retained, &source, &source);
+            let budget = MemoryBudget::new(estimate as usize);
+            let decoded = budget
+                .enter(|| {
+                    decode_bounded(
+                        ImageInput::Bytes(&bytes),
+                        BoundedDecodeOptions {
+                            max_memory_bytes: estimate + HEADER_PARSING_BYTES,
+                            ..BoundedDecodeOptions::default()
+                        },
+                    )
+                })
+                .unwrap();
+            assert!(!budget.is_exceeded());
+            assert_ne!(decoded.image.rgb, unprofiled.image.rgb);
+        }
     }
 
     #[test]
