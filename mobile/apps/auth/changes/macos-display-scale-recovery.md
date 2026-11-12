@@ -1,0 +1,1 @@
+- Recover code-card click alignment on macOS when display scaling gets out of sync after switching displays.

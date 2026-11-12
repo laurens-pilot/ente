@@ -12,6 +12,7 @@ import 'package:ente_auth/services/auth_theme_preferences.dart';
 import 'package:ente_auth/services/authenticator_service.dart';
 import 'package:ente_auth/services/billing_service.dart';
 import 'package:ente_auth/services/local_backup_service.dart';
+import 'package:ente_auth/services/macos_display_scale_service.dart';
 import 'package:ente_auth/services/notification_service.dart';
 import 'package:ente_auth/services/preference_service.dart';
 import 'package:ente_auth/services/update_service.dart';
@@ -202,6 +203,7 @@ void _registerWindowsProtocol() {
 }
 
 Future<void> _init() async {
+  await MacOSDisplayScaleService.init();
   _registerWindowsProtocol();
   await CryptoUtil.init();
   await EnteAuthRust.init();

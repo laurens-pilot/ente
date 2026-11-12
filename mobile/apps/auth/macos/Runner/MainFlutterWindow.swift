@@ -3,6 +3,8 @@ import FlutterMacOS
 import window_manager
 
 class MainFlutterWindow: NSWindow {
+  private var displayScaleGuard: DisplayScaleGuard?
+
   override func awakeFromNib() {
     let flutterViewController = FlutterViewController.init()
     let windowFrame = self.frame
@@ -12,6 +14,7 @@ class MainFlutterWindow: NSWindow {
     RegisterGeneratedPlugins(registry: flutterViewController)
 
     super.awakeFromNib()
+    displayScaleGuard = DisplayScaleGuard(window: self, controller: flutterViewController)
   }
 
   override public func order(_ place: NSWindow.OrderingMode, relativeTo otherWin: Int) {
