@@ -988,6 +988,22 @@ mod tests {
             assert!(!budget.is_exceeded());
             assert_eq!(decoded.image.rgb, expected.image.rgb);
         }
+        let owned = (bytes.len() + END_OF_IMAGE.len()) as u64;
+        let admitted = required_bytes(owned + header, &source, &source) + HEADER_PARSING_BYTES;
+        let decode_path = |max_memory_bytes| {
+            decode_bounded(
+                ImageInput::Path(path.to_str().unwrap()),
+                BoundedDecodeOptions {
+                    max_memory_bytes,
+                    ..BoundedDecodeOptions::default()
+                },
+            )
+        };
+        assert!(decode_path(admitted).is_ok());
+        assert!(matches!(
+            decode_path(admitted - 1),
+            Err(ImageError::TooLarge(_))
+        ));
     }
 
     #[test]
