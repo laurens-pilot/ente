@@ -97,9 +97,10 @@ fn decode_bytes(
     owned_input_bytes: u64,
     options: BoundedDecodeOptions,
 ) -> ImageResult<BoundedDecodedImage> {
-    let retained_bytes =
-        owned_input_bytes.saturating_add(METADATA_COPIES.saturating_mul(scan.end as u64));
-    if retained_bytes.saturating_add(HEADER_PARSING_BYTES) > options.max_memory_bytes {
+    let retained_bytes = owned_input_bytes
+        .saturating_add(METADATA_COPIES.saturating_mul(scan.end as u64))
+        .saturating_add(HEADER_PARSING_BYTES);
+    if retained_bytes > options.max_memory_bytes {
         return Err(too_large());
     }
     let mut decoder = JpegDecoder::new_with_options(
@@ -358,7 +359,10 @@ mod tests {
 
     fn with_dimensions(bytes: &[u8], width: u16, height: u16) -> Vec<u8> {
         let mut patched = bytes.to_vec();
-        let sof = marker(&patched, 0xc0);
+        let sof = patched
+            .windows(2)
+            .rposition(|window| window == [0xff, 0xc0])
+            .unwrap();
         patched[sof + 5..sof + 7].copy_from_slice(&height.to_be_bytes());
         patched[sof + 7..sof + 9].copy_from_slice(&width.to_be_bytes());
         patched
@@ -1119,6 +1123,58 @@ mod tests {
             assert!(!budget.is_exceeded());
             assert_ne!(decoded.image.rgb, unprofiled.image.rgb);
         }
+    }
+
+    #[test]
+    fn rotated_images_with_expanding_profiles_fit_the_admitted_budget() {
+        let lookup_tables = [
+            *b"A2B0", *b"A2B1", *b"A2B2", *b"B2A0", *b"B2A1", *b"B2A2", *b"gamt",
+        ];
+        let mut exif = b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+        let bytes = with_dimensions(
+            &encode(
+                &rgb(16, 16),
+                16,
+                16,
+                ExtendedColorType::Rgb8,
+                Some(profile_with_tag(&lookup_tables, &lookup_table(4, 40_000))),
+                Some(exif),
+            ),
+            500,
+            5200,
+        );
+        let source = Dimensions {
+            width: 500,
+            height: 5200,
+        };
+        let retained = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
+        let estimate = required_bytes(retained, &source, &source);
+        let decode = |max_memory_bytes: u64| {
+            let budget = MemoryBudget::new(max_memory_bytes as usize);
+            let result = budget.enter(|| {
+                decode_bounded(
+                    ImageInput::Bytes(&bytes),
+                    BoundedDecodeOptions {
+                        max_memory_bytes,
+                        ..BoundedDecodeOptions::default()
+                    },
+                )
+            });
+            assert!(!budget.is_exceeded(), "{max_memory_bytes}");
+            result
+        };
+        assert!(matches!(decode(estimate), Err(ImageError::TooLarge(_))));
+        assert_eq!(
+            decode(estimate + HEADER_PARSING_BYTES)
+                .unwrap()
+                .image
+                .dimensions,
+            Dimensions {
+                width: 5200,
+                height: 500
+            }
+        );
     }
 
     #[test]
