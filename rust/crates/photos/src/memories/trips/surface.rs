@@ -8,7 +8,9 @@ use crate::memories::UPDATE_FREQUENCY_DAYS;
 use crate::memories::calendar::{LocalDate, MICROS_PER_DAY};
 use crate::memories::geo::distance_km;
 use crate::memories::input::{CachedTrip, MemoriesRequest, Period, ShownTrip};
-use crate::memories::output::{BaseMemory, Memory, MemoryBoundary, MemoryKind, TripMemory};
+use crate::memories::output::{
+    BaseMemory, Memory, MemoryBoundary, MemoryKind, TripMemory, TripName,
+};
 use crate::memories::photo::{Photo, sort_chronologically};
 use crate::memories::places::Places;
 use crate::memories::selector::Selector;
@@ -38,7 +40,7 @@ struct Candidate<'a, 'p> {
 
 #[derive(PartialEq, Eq, Hash)]
 enum Title<'t> {
-    Place(&'t str),
+    Name(&'t TripName),
     Year(i32),
 }
 
@@ -335,8 +337,8 @@ fn is_day_trip(trip: &Trip) -> bool {
 }
 
 fn title<'t>(trip: &'t Trip) -> Title<'t> {
-    match &trip.location_name {
-        Some(name) => Title::Place(name),
+    match &trip.name {
+        Some(name) => Title::Name(name),
         None => Title::Year(trip.year()),
     }
 }
@@ -359,7 +361,7 @@ fn trip_memory(
 fn trip_kind(trip: &Trip) -> MemoryKind {
     MemoryKind::Trip(TripMemory {
         location: trip.location,
-        location_name: trip.location_name.clone(),
+        name: trip.name.clone(),
         year: trip.year(),
         key: trip.key.clone(),
     })

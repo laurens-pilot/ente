@@ -4721,6 +4721,14 @@
       "year": {}
     }
   },
+  "tripLocationPair": "{firstLocation} & {secondLocation}",
+  "@tripLocationPair": {
+    "description": "Two place names joined for a trip memory title, used as the location in 'Trip to {location}'",
+    "placeholders": {
+      "firstLocation": {},
+      "secondLocation": {}
+    }
+  },
   "tripToLocation": "Trip to {location}",
   "@tripToLocation": {
     "placeholders": {
