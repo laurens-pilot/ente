@@ -63,7 +63,7 @@ pub(crate) fn decode(
 
 fn input_buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>> {
     let length = input_bytes.saturating_add(END_OF_IMAGE.len() as u64);
-    if length > max_memory_bytes {
+    if length.saturating_add(HEADER_PARSING_BYTES) > max_memory_bytes {
         return Err(too_large());
     }
     let mut buffer = Vec::new();
@@ -792,6 +792,28 @@ mod tests {
     }
 
     #[test]
+    fn files_close_to_the_budget_are_rejected_before_reading() {
+        let max_memory_bytes = 1024 * 1024;
+        let mut bytes = encode(&rgb(16, 16), 16, 16, ExtendedColorType::Rgb8, None, None);
+        bytes.resize(max_memory_bytes - END_OF_IMAGE.len(), 0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("padded.jpg");
+        std::fs::write(&path, &bytes).unwrap();
+        let budget = MemoryBudget::new(max_memory_bytes);
+        let result = budget.enter(|| {
+            decode_bounded(
+                ImageInput::Path(path.to_str().unwrap()),
+                BoundedDecodeOptions {
+                    max_memory_bytes: max_memory_bytes as u64,
+                    ..BoundedDecodeOptions::default()
+                },
+            )
+        });
+        assert!(matches!(result, Err(ImageError::TooLarge(_))));
+        assert!(!budget.is_exceeded());
+    }
+
+    #[test]
     fn memory_estimate_covers_the_decode() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.jpg");
@@ -1132,18 +1154,25 @@ mod tests {
         ];
         let mut exif = b"II\x2a\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
         exif.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
-        let bytes = with_dimensions(
-            &encode(
-                &rgb(16, 16),
-                16,
-                16,
-                ExtendedColorType::Rgb8,
-                Some(profile_with_tag(&lookup_tables, &lookup_table(4, 40_000))),
-                Some(exif),
-            ),
-            500,
-            5200,
-        );
+        let image = |profile| {
+            with_dimensions(
+                &encode(
+                    &rgb(16, 16),
+                    16,
+                    16,
+                    ExtendedColorType::Rgb8,
+                    profile,
+                    Some(exif.clone()),
+                ),
+                500,
+                5200,
+            )
+        };
+        let unprofiled = decode_bounded(ImageInput::Bytes(&image(None)), options(6000)).unwrap();
+        let bytes = image(Some(profile_with_tag(
+            &lookup_tables,
+            &lookup_table(4, 40_000),
+        )));
         let source = Dimensions {
             width: 500,
             height: 5200,
@@ -1165,16 +1194,15 @@ mod tests {
             result
         };
         assert!(matches!(decode(estimate), Err(ImageError::TooLarge(_))));
+        let decoded = decode(estimate + HEADER_PARSING_BYTES).unwrap();
         assert_eq!(
-            decode(estimate + HEADER_PARSING_BYTES)
-                .unwrap()
-                .image
-                .dimensions,
+            decoded.image.dimensions,
             Dimensions {
                 width: 5200,
                 height: 500
             }
         );
+        assert_ne!(decoded.image.rgb, unprofiled.image.rgb);
     }
 
     #[test]
