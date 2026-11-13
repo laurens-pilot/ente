@@ -973,37 +973,31 @@ mod tests {
             height: 64,
         };
         let header = METADATA_COPIES * first_scan(&bytes).unwrap().end as u64;
-        for (input, owned) in [
-            (ImageInput::Bytes(&bytes), 0),
+        for (file, owned) in [
+            (None, plain.len() as u64),
             (
-                ImageInput::Path(path.to_str().unwrap()),
+                Some(path.to_str().unwrap()),
                 (bytes.len() + END_OF_IMAGE.len()) as u64,
             ),
         ] {
-            let budget =
-                MemoryBudget::new(required_bytes(owned + header, &source, &source) as usize);
+            let input = || file.map_or(ImageInput::Bytes(&bytes), ImageInput::Path);
+            let estimate = required_bytes(owned + header, &source, &source);
+            let admitted = estimate + HEADER_PARSING_BYTES;
+            let limit = |max_memory_bytes| BoundedDecodeOptions {
+                max_memory_bytes,
+                ..BoundedDecodeOptions::default()
+            };
+            let budget = MemoryBudget::new(estimate as usize);
             let decoded = budget
-                .enter(|| decode_bounded(input, BoundedDecodeOptions::default()))
+                .enter(|| decode_bounded(input(), limit(admitted)))
                 .unwrap();
             assert!(!budget.is_exceeded());
             assert_eq!(decoded.image.rgb, expected.image.rgb);
+            assert!(matches!(
+                decode_bounded(input(), limit(admitted - 1)),
+                Err(ImageError::TooLarge(_))
+            ));
         }
-        let owned = (bytes.len() + END_OF_IMAGE.len()) as u64;
-        let admitted = required_bytes(owned + header, &source, &source) + HEADER_PARSING_BYTES;
-        let decode_path = |max_memory_bytes| {
-            decode_bounded(
-                ImageInput::Path(path.to_str().unwrap()),
-                BoundedDecodeOptions {
-                    max_memory_bytes,
-                    ..BoundedDecodeOptions::default()
-                },
-            )
-        };
-        assert!(decode_path(admitted).is_ok());
-        assert!(matches!(
-            decode_path(admitted - 1),
-            Err(ImageError::TooLarge(_))
-        ));
     }
 
     #[test]
