@@ -41,6 +41,7 @@ abstract class MemorySpec {
       return TripMemorySpec(
         location: memory.location,
         locationName: memory.locationName,
+        secondLocationName: memory.secondLocationName,
         tripYear: memory.tripYear,
         tripKey: memory.tripKey,
       );
@@ -174,12 +175,14 @@ class TripMemorySpec extends MemorySpec {
 
   final Location location;
   final String? locationName;
+  final String? secondLocationName;
   final int? tripYear;
   final String? tripKey;
 
   const TripMemorySpec({
     required this.location,
     required this.locationName,
+    required this.secondLocationName,
     required this.tripYear,
     required this.tripKey,
   });
@@ -192,6 +195,7 @@ class TripMemorySpec extends MemorySpec {
         longitude: location["longitude"] as double?,
       ),
       locationName: json["locationName"] as String?,
+      secondLocationName: json["secondLocationName"] as String?,
       tripYear: json["tripYear"] as int?,
       tripKey: json["tripKey"] as String?,
     );
@@ -218,6 +222,7 @@ class TripMemorySpec extends MemorySpec {
       location,
       id: id,
       locationName: locationName,
+      secondLocationName: secondLocationName,
       tripYear: tripYear,
       tripKey: tripKey,
     );
@@ -234,6 +239,7 @@ class TripMemorySpec extends MemorySpec {
         "longitude": location.longitude,
       },
       "locationName": locationName,
+      "secondLocationName": secondLocationName,
       "tripYear": tripYear,
       "tripKey": tripKey,
     };

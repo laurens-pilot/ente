@@ -28,6 +28,7 @@ pub use input::{
 pub use output::{
     BaseLocation, BaseMemory, Birthday, ClipMemoryType, Memory, MemoryBoundary, MemoryKind,
     PeopleActivity, PeopleMemory, PeopleMemoryType, SmartMemories, TimeMemory, TripMemory,
+    TripName,
 };
 pub use store::compute_smart_memories_from_store;
 

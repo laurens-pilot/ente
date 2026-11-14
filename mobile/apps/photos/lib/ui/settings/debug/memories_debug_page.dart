@@ -176,13 +176,7 @@ class _MemoriesDebugPageState extends State<MemoriesDebugPage> {
                         count: entry.key == MemoryType.trips
                             ? entry.value
                                   .whereType<TripMemory>()
-                                  .where(
-                                    (m) =>
-                                        m.locationName == null ||
-                                        !m.locationName!.toLowerCase().contains(
-                                          "base",
-                                        ),
-                                  )
+                                  .where((m) => !m.isBase)
                                   .length
                             : entry.value.length,
                         icon: _memoryTypeIcon(entry.key),
@@ -318,8 +312,10 @@ class _MemoriesDebugPageState extends State<MemoriesDebugPage> {
         ];
         return parts.join(" • ");
       case TripMemory():
-        return memory.locationName ??
-            (memory.tripYear != null ? memory.tripYear!.toString() : "");
+        final names = [memory.locationName, memory.secondLocationName].nonNulls;
+        return names.isNotEmpty
+            ? names.join(" & ")
+            : memory.tripYear?.toString() ?? "";
       case ClipMemory():
         return _enumLabel(memory.clipMemoryType.name);
       case TimeMemory():
