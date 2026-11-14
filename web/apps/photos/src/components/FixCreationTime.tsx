@@ -1,4 +1,10 @@
 import {
+    initialFileTimeRepairProgress,
+    repairFileCreationTimes,
+    type FileTimeRepairOption,
+    type FileTimeRepairProgress,
+} from "@/services/fix-creation-time";
+import {
     AlertCircleIcon,
     Cancel01Icon,
     Tick02Icon,
@@ -24,19 +30,9 @@ import {
     v2SubmitButtonSx,
 } from "ente-base/components/SingleInput.styles";
 import type { ModalVisibilityProps } from "ente-base/components/utils/modal";
-import log from "ente-base/log";
-import { downloadManager } from "ente-gallery/services/download";
-import { extractExifDates } from "ente-gallery/services/exif";
-import { tryParseEpochMicrosecondsFromFileName } from "ente-gallery/services/upload/date";
-import { fileLogID, type EnteFile } from "ente-media/file";
-import {
-    fileCreationPhotoDate,
-    fileFileName,
-    type ParsedMetadataDate,
-} from "ente-media/file-metadata";
-import { FileType } from "ente-media/file-type";
+import type { EnteFile } from "ente-media/file";
+import type { ParsedMetadataDate } from "ente-media/file-metadata";
 import { FileDateTimePicker } from "ente-new/photos/components/FileDateTimePicker";
-import { updateFilePublicMagicMetadata } from "ente-new/photos/services/file";
 import { useFormik } from "formik";
 import { t } from "i18next";
 import React, { useEffect, useState } from "react";
@@ -53,7 +49,9 @@ export const FixCreationTime: React.FC<FixCreationTimeProps> = ({
     onRemotePull,
 }) => {
     const [step, setStep] = useState<Step | undefined>();
-    const [progress, setProgress] = useState({ completed: 0, total: 0 });
+    const [progress, setProgress] = useState(() =>
+        initialFileTimeRepairProgress(files.length),
+    );
 
     useEffect(() => {
         if (open) setStep(undefined);
@@ -61,14 +59,17 @@ export const FixCreationTime: React.FC<FixCreationTimeProps> = ({
 
     const onSubmit = async (values: FormValues) => {
         setStep("running");
-        const completedWithErrors = await updateFiles(
+        const result = await repairFileCreationTimes(
             files,
             values.option,
             values.customDate,
             setProgress,
         );
-        setStep(completedWithErrors ? "completed-with-errors" : "completed");
-        await onRemotePull();
+        try {
+            await onRemotePull();
+        } finally {
+            setStep(result.failed > 0 ? "completed-with-errors" : "completed");
+        }
     };
 
     const message = messageForStatus(step);
@@ -131,14 +132,13 @@ export const FixCreationTime: React.FC<FixCreationTimeProps> = ({
                         color: "text.muted",
                         fontWeight: 400,
                     }}
-                    role={step == "completed" ? "status" : undefined}
                 >
                     {(step == "completed-with-errors" ? undefined : message) ??
                         (step == "running"
                             ? t("fix_creation_time_in_progress")
                             : t("fix_creation_time_options"))}
                 </Typography>
-                {step == "running" && <Progress {...progress} />}
+                {step && <Progress {...progress} running={step == "running"} />}
                 <OptionsForm {...{ step, files, onSubmit, onClose }} />
             </Stack>
         </Dialog>
@@ -147,21 +147,9 @@ export const FixCreationTime: React.FC<FixCreationTimeProps> = ({
 
 type Step = "running" | "completed" | "completed-with-errors";
 
-type FixOption =
-    | "date-time-original"
-    | "date-time-digitized"
-    | "metadata-date"
-    | "file-name"
-    | "custom";
-
 interface FormValues {
-    option: FixOption;
+    option: FileTimeRepairOption;
     customDate: ParsedMetadataDate | undefined;
-}
-
-interface FixProgress {
-    completed: number;
-    total: number;
 }
 
 const messageForStatus = (step?: Step) => {
@@ -170,21 +158,44 @@ const messageForStatus = (step?: Step) => {
         case "running":
             return undefined;
         case "completed":
-            return t("fix_creation_time_completed");
+            return t("fix_creation_time_finished");
         case "completed-with-errors":
             return t("fix_creation_time_completed_with_errors");
     }
 };
 
-const Progress: React.FC<FixProgress> = ({ completed, total }) => (
-    <Stack sx={{ gap: 2 }}>
-        <Typography role="status" sx={{ textAlign: "center" }}>
-            {completed} / {total} · {t("fix_creation_time_file_updated")}
+const Progress: React.FC<FileTimeRepairProgress & { running: boolean }> = ({
+    running,
+    processed,
+    total,
+    updated,
+    unchanged,
+    skipped,
+    failed,
+}) => (
+    <Stack sx={{ gap: 2 }} role="status">
+        <Typography sx={{ textAlign: "center" }}>
+            {t("fix_creation_time_progress", { processed, total })}
         </Typography>
-        <LinearProgress
-            variant="determinate"
-            value={total ? Math.round((completed * 100) / total) : 0}
-        />
+        <Typography sx={{ textAlign: "center" }}>
+            {t("fix_creation_time_result", {
+                updated,
+                unchanged,
+                skipped,
+                failed,
+            })}
+        </Typography>
+        {skipped > 0 && (
+            <Typography sx={{ textAlign: "center", color: "text.muted" }}>
+                {t("fix_creation_time_skipped_reason")}
+            </Typography>
+        )}
+        {running && (
+            <LinearProgress
+                variant="determinate"
+                value={total ? Math.round((processed * 100) / total) : 0}
+            />
+        )}
     </Stack>
 );
 
@@ -212,7 +223,7 @@ const OptionsForm: React.FC<OptionsFormProps> = ({
             onSubmit,
         });
 
-    const options: { value: FixOption; label: string }[] = [
+    const options: { value: FileTimeRepairOption; label: string }[] = [
         { value: "date-time-original", label: t("exif_date_time_original") },
         { value: "date-time-digitized", label: t("exif_date_time_digitized") },
         { value: "metadata-date", label: t("exif_metadata_date") },
@@ -422,85 +433,4 @@ const submitButtonSx = {
         backgroundColor: "fill.faint",
         opacity: 1,
     },
-};
-
-const updateFiles = async (
-    files: EnteFile[],
-    fixOption: FixOption,
-    customDate: ParsedMetadataDate | undefined,
-    setProgress: (progress: FixProgress) => void,
-) => {
-    setProgress({ completed: 0, total: files.length });
-    let hadErrors = false;
-    for (const [i, file] of files.entries()) {
-        try {
-            await updateFileDate(file, fixOption, customDate);
-        } catch (e) {
-            log.error(`Failed to update date of ${fileLogID(file)}`, e);
-            hadErrors = true;
-        } finally {
-            setProgress({ completed: i + 1, total: files.length });
-        }
-    }
-    return hadErrors;
-};
-
-const updateFileDate = async (
-    file: EnteFile,
-    fixOption: FixOption,
-    customDate: ParsedMetadataDate | undefined,
-) => {
-    let newDate: ParsedMetadataDate | undefined;
-
-    if (fixOption == "custom") {
-        newDate = customDate && {
-            dateTime: customDate.dateTime,
-            // The picker reports this computer's offset, not the photo's, so
-            // leave the offset unset.
-            offset: undefined,
-            timestamp: customDate.timestamp,
-        };
-    } else if (fixOption == "file-name") {
-        const editedTime = tryParseEpochMicrosecondsFromFileName(
-            fileFileName(file),
-        );
-        if (editedTime === undefined) return;
-
-        const existingDate = fileCreationPhotoDate(file);
-        if (editedTime == existingDate.getTime()) return;
-
-        await updateFilePublicMagicMetadata(file, {
-            editedTime,
-            dateTime: undefined,
-            offsetTime: undefined,
-        });
-        return;
-    } else if (file.metadata.fileType == FileType.image) {
-        const blob = await downloadManager.fileBlob(file);
-        const { DateTimeOriginal, DateTimeDigitized, MetadataDate, DateTime } =
-            await extractExifDates(new File([blob], fileFileName(file)));
-
-        switch (fixOption) {
-            case "date-time-original":
-                newDate = DateTimeOriginal ?? DateTime;
-                break;
-            case "date-time-digitized":
-                newDate = DateTimeDigitized;
-                break;
-            case "metadata-date":
-                newDate = MetadataDate;
-                break;
-        }
-    }
-
-    if (!newDate) return;
-
-    const existingDate = fileCreationPhotoDate(file);
-    if (newDate.timestamp == existingDate.getTime()) return;
-
-    await updateFilePublicMagicMetadata(file, {
-        dateTime: newDate.dateTime,
-        offsetTime: newDate.offset,
-        editedTime: newDate.timestamp,
-    });
 };
