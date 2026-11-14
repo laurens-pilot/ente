@@ -1,0 +1,2 @@
+- Fixed dates in filenames being missed when they follow a sequence number.
+- The Fix time dialog now shows updated, unchanged, skipped and failed files separately.
