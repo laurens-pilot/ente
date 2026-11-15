@@ -1,0 +1,1 @@
+- The Fix time dialog now shows updated, unchanged, skipped and failed files separately.

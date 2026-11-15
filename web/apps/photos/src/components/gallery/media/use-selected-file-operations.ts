@@ -217,7 +217,9 @@ export const useSelectedFileOperations = ({
                                 dispatch({ type: "markTempHidden", files }),
                             () => dispatch({ type: "clearTempHidden" }),
                             (files) => {
-                                setFixCreationTimeFiles(files);
+                                setFixCreationTimeFiles(
+                                    files.map((file) => ({ ...file })),
+                                );
                                 showFixCreationTime();
                             },
                         );
