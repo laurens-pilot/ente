@@ -10,6 +10,7 @@ class TripMemory extends SmartMemory {
 
   final Location location;
   final String? tripKey;
+  final String? secondLocationName;
 
   String? locationName;
   int? tripYear;
@@ -21,6 +22,7 @@ class TripMemory extends SmartMemory {
     this.location, {
     super.id,
     this.locationName,
+    this.secondLocationName,
     this.tripYear,
     this.tripKey,
     super.firstCreationTime,
@@ -41,6 +43,7 @@ class TripMemory extends SmartMemory {
     int? firstDateToShow,
     int? lastDateToShow,
     String? locationName,
+    String? secondLocationName,
     int? tripYear,
     String? tripKey,
   }) {
@@ -51,6 +54,7 @@ class TripMemory extends SmartMemory {
       location,
       id: id,
       locationName: locationName ?? this.locationName,
+      secondLocationName: secondLocationName ?? this.secondLocationName,
       tripYear: tripYear ?? this.tripYear,
       tripKey: tripKey ?? this.tripKey,
       firstCreationTime: firstCreationTime,
@@ -63,7 +67,13 @@ class TripMemory extends SmartMemory {
     assert(locationName != null || tripYear != null);
     if (locationName != null) {
       if (isBase) return locationName!;
-      return locals.tripToLocation(location: locationName!);
+      final location = secondLocationName == null
+          ? locationName!
+          : locals.tripLocationPair(
+              firstLocation: locationName!,
+              secondLocation: secondLocationName!,
+            );
+      return locals.tripToLocation(location: location);
     }
     if (tripYear != null) {
       if (tripYear == DateTime.now().year - 1) {

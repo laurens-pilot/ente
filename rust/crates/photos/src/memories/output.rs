@@ -123,9 +123,15 @@ pub struct Birthday {
 #[derive(Clone, Debug, PartialEq)]
 pub struct TripMemory {
     pub location: Coordinate,
-    pub location_name: Option<String>,
+    pub name: Option<TripName>,
     pub year: i32,
     pub key: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TripName {
+    Place(String),
+    Pair { first: String, second: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]

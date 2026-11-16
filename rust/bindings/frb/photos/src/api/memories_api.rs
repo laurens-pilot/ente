@@ -5,7 +5,7 @@ pub use ente_photos::memories::{
     BaseLocation, BaseMemory, Birthday, CachedTrip, ClipMemoryType, LocalDate, MemoriesRequest,
     Memory, MemoryBoundary, MemoryFile, MemoryKind, MemoryPerson, PeopleActivity, PeopleMemory,
     PeopleMemoryType, Period, ShownClipMemory, ShownPerson, ShownTrip, SmartMemories, TimeMemory,
-    TripDetection, TripMemory,
+    TripDetection, TripMemory, TripName,
 };
 use flutter_rust_bridge::frb;
 
@@ -178,9 +178,15 @@ pub struct _Birthday {
 #[frb(mirror(TripMemory))]
 pub struct _TripMemory {
     pub location: Coordinate,
-    pub location_name: Option<String>,
+    pub name: Option<TripName>,
     pub year: i32,
     pub key: String,
+}
+
+#[frb(mirror(TripName))]
+pub enum _TripName {
+    Place(String),
+    Pair { first: String, second: String },
 }
 
 #[frb(mirror(BaseMemory))]

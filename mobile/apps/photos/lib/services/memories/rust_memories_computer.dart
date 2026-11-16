@@ -341,7 +341,15 @@ class _Inputs {
         first,
         last,
         RustMemoriesComputer._location(trip.location),
-        locationName: trip.locationName,
+        locationName: switch (trip.name) {
+          rust.TripName_Place(field0: final place) => place,
+          rust.TripName_Pair(first: final place) => place,
+          null => null,
+        },
+        secondLocationName: switch (trip.name) {
+          rust.TripName_Pair(second: final place) => place,
+          _ => null,
+        },
         tripYear: trip.year,
         tripKey: trip.key,
         capMemories: capMemories,

@@ -5,6 +5,7 @@ use ente_location::CountryCode;
 use super::Placed;
 use crate::memories::geo::{Located, distance_km};
 use crate::memories::input::CityLookup;
+use crate::memories::output::TripName;
 use crate::memories::places::{CityPhotos, Places};
 
 const DOMINANT_COUNTRY_SHARE: f64 = 0.8;
@@ -17,7 +18,7 @@ pub(super) fn trip_name(
     places: &Places,
     home_countries: &HashSet<CountryCode>,
     lookup: Option<&dyn CityLookup>,
-) -> Option<String> {
+) -> Option<TripName> {
     let foreign: Vec<Placed> = points
         .iter()
         .copied()
@@ -36,7 +37,8 @@ pub(super) fn trip_name(
     let cities = places.cities(&members);
     let foreign_country = dominant_country(points)
         .filter(|country| !home_countries.contains(country))
-        .and_then(|country| lookup?.country_name(country));
+        .and_then(|country| lookup?.country_name(country))
+        .map(TripName::Place);
     let Some(top) = cities.first() else {
         return foreign_country;
     };
@@ -51,7 +53,7 @@ pub(super) fn trip_name(
         return foreign_country;
     }
     if top.photos * 2 > points.len() {
-        return Some(top.name.to_owned());
+        return Some(TripName::Place(top.name.to_owned()));
     }
     let pair_covers_trip = significant.len() == 2
         && (significant[0].photos + significant[1].photos) * 2 > points.len();
@@ -59,8 +61,11 @@ pub(super) fn trip_name(
         return Some(country);
     }
     Some(match significant.get(1) {
-        Some(second) => format!("{} & {}", top.name, second.name),
-        None => top.name.to_owned(),
+        Some(second) => TripName::Pair {
+            first: top.name.to_owned(),
+            second: second.name.to_owned(),
+        },
+        None => TripName::Place(top.name.to_owned()),
     })
 }
 

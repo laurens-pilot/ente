@@ -71,7 +71,7 @@ pub(in crate::memories) fn analyze<'p>(
                 points[points.len() - 1].member.photo,
             );
             let home_countries = homes.countries_on(points[0].member.photo.date.days_since_epoch());
-            trip.location_name = naming::trip_name(&points, places, &home_countries, lookup);
+            trip.name = naming::trip_name(&points, places, &home_countries, lookup);
             trip
         })
         .collect();
@@ -354,7 +354,7 @@ mod tests {
     use crate::memories::tests::{file, located_file, micros, period};
     use crate::memories::{
         CityLookup, MemoriesRequest, Memory, MemoryFile, MemoryKind, ShownTrip, TripDetection,
-        compute_all_trip_memories, compute_smart_memories,
+        TripName, compute_all_trip_memories, compute_smart_memories,
     };
 
     const AMSTERDAM: (f64, f64) = (52.37, 4.90);
@@ -630,36 +630,44 @@ mod tests {
         compute_all_trip_memories(&request, period(NOW), Some(&Atlas), TripDetection::Improved)
     }
 
-    fn trips(files: Vec<MemoryFile>) -> Vec<(i64, Option<String>)> {
-        let mut trips: Vec<(i64, Option<String>)> = memories(files)
+    fn trips(files: Vec<MemoryFile>) -> Vec<(i64, Option<TripName>)> {
+        let mut trips: Vec<(i64, Option<TripName>)> = memories(files)
             .into_iter()
             .filter_map(|memory| match memory.kind {
                 MemoryKind::Trip(trip) => {
                     let ids: Vec<i64> = memory.file_ids.iter().map(|id| id / 1000).collect();
                     assert!(ids.iter().all(|&id| id == ids[0]), "{ids:?}");
-                    Some((ids[0], trip.location_name))
+                    Some((ids[0], trip.name))
                 }
                 _ => None,
             })
             .collect();
-        trips.sort();
+        trips.sort_by_key(|&(id, _)| id);
         trips
     }
 
-    fn named(trips: &[(i64, &str)]) -> Vec<(i64, Option<String>)> {
+    fn named(trips: &[(i64, &str)]) -> Vec<(i64, Option<TripName>)> {
         trips
             .iter()
-            .map(|&(id, name)| (id, Some(name.to_owned())))
+            .map(|&(id, name)| (id, Some(trip_name(name))))
             .collect()
+    }
+
+    fn trip_name(label: &str) -> TripName {
+        match label.split_once(" & ") {
+            Some((first, second)) => TripName::Pair {
+                first: first.to_owned(),
+                second: second.to_owned(),
+            },
+            None => TripName::Place(label.to_owned()),
+        }
     }
 
     fn trip_key(files: &[MemoryFile], name: &str) -> String {
         memories(files.to_vec())
             .into_iter()
             .find_map(|memory| match memory.kind {
-                MemoryKind::Trip(trip) if trip.location_name.as_deref() == Some(name) => {
-                    Some(trip.key)
-                }
+                MemoryKind::Trip(trip) if trip.name == Some(trip_name(name)) => Some(trip.key),
                 _ => None,
             })
             .unwrap()

@@ -13,6 +13,7 @@ use super::calendar::{LocalDate, MICROS_PER_DAY};
 use super::geo::{
     Cluster, Located, cluster_by_location, distance_km, is_within, mean_location, two_decimals,
 };
+use super::output::TripName;
 use super::photo::Photo;
 use super::places::Places;
 
@@ -39,7 +40,7 @@ struct Trip<'p> {
     members: Vec<Located<'p>>,
     capped_members: Vec<Located<'p>>,
     location: Coordinate,
-    location_name: Option<String>,
+    name: Option<TripName>,
     first: &'p Photo,
     last: &'p Photo,
     key: String,
@@ -65,7 +66,7 @@ impl<'p> Trip<'p> {
             members,
             capped_members,
             location,
-            location_name: None,
+            name: None,
             first,
             last,
             key,
@@ -98,7 +99,9 @@ pub(super) fn analyze<'p>(members: &[Located<'p>], now: i64, places: &Places) ->
     }
     let mut trips = merge_nearby_trips(trips);
     for trip in &mut trips {
-        trip.location_name = places.trip_name(&trip.members, &base_countries);
+        trip.name = places
+            .trip_name(&trip.members, &base_countries)
+            .map(TripName::Place);
     }
     TripAnalysis { bases, trips }
 }
@@ -242,7 +245,7 @@ mod tests {
     use crate::memories::tests::{located_file, micros, period};
     use crate::memories::{
         BaseMemory, CachedTrip, CityLookup, MemoriesRequest, Memory, MemoryFile, MemoryKind,
-        ShownTrip, SmartMemories, TripDetection, TripMemory, compute_all_trip_memories,
+        ShownTrip, SmartMemories, TripDetection, TripMemory, TripName, compute_all_trip_memories,
         compute_smart_memories,
     };
 
@@ -409,7 +412,7 @@ mod tests {
         let memories = &result.periods[0];
         assert_eq!(trip_keys(memories), [ROME_KEY, PARIS_KEY]);
         let rome = trips(memories)[0];
-        assert_eq!((rome.year, rome.location_name.as_deref()), (2024, None));
+        assert_eq!((rome.year, rome.name.as_ref()), (2024, None));
         let rome_memory = memories
             .iter()
             .find(|memory| matches!(&memory.kind, MemoryKind::Trip(trip) if trip.key == ROME_KEY))
@@ -708,7 +711,7 @@ mod tests {
 
         let trips = trips(&memories);
         assert_eq!(trips.len(), 1);
-        assert_eq!(trips[0].location_name.as_deref(), Some("Lyon"));
+        assert_eq!(trips[0].name, Some(TripName::Place("Lyon".to_owned())));
     }
 
     #[test]
@@ -734,13 +737,11 @@ mod tests {
                 ..MemoriesRequest::default()
             }
         };
-        let name = |request: &MemoriesRequest| {
-            trips(&legacy(request, Some(&cities)))[0]
-                .location_name
-                .clone()
-        };
+        let name =
+            |request: &MemoriesRequest| trips(&legacy(request, Some(&cities)))[0].name.clone();
+        let place = |name: &str| Some(TripName::Place(name.to_owned()));
 
-        assert_eq!(name(&tour(AMSTERDAM)).as_deref(), Some("France"));
+        assert_eq!(name(&tour(AMSTERDAM)), place("France"));
         assert_eq!(name(&tour(BORDEAUX)), None);
 
         let paris = stay(1, "2025-03-10T08:00:00", 24, PARIS);
@@ -751,7 +752,7 @@ mod tests {
             surface_all: true,
             ..MemoriesRequest::default()
         };
-        assert_eq!(name(&request).as_deref(), Some("Paris"));
+        assert_eq!(name(&request), place("Paris"));
     }
 
     #[test]
