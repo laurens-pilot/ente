@@ -22,10 +22,45 @@ const HEADER_PARSING_BYTES: u64 = 16 * 1024 * 1024;
 const DECODER_BYTES: u64 = 1024 * 1024;
 const DECODER_BYTES_PER_COLUMN: u64 = 1024;
 const METADATA_COPIES: u64 = 16;
+const PROGRESSIVE_FRAME: u8 = 0xc2;
+const COEFFICIENT_BYTES: u64 = 2;
+const COEFFICIENT_COPIES: u64 = 2;
 
 struct ScanHeader {
     components: u8,
     end: usize,
+    frame: Option<Frame>,
+}
+
+enum Frame {
+    Other,
+    Progressive { coefficients: u64 },
+}
+
+enum SegmentsEnd {
+    EndOfImage,
+    Malformed,
+}
+
+struct Scans {
+    first: ScanHeader,
+    segment_bytes: usize,
+    data_end: usize,
+}
+
+impl Scans {
+    fn is_progressive(&self) -> bool {
+        matches!(self.first.frame, Some(Frame::Progressive { .. }))
+    }
+
+    fn coefficient_bytes(&self) -> u64 {
+        match self.first.frame {
+            Some(Frame::Progressive { coefficients }) => {
+                coefficients.saturating_mul(COEFFICIENT_BYTES * COEFFICIENT_COPIES)
+            }
+            _ => 0,
+        }
+    }
 }
 
 pub(crate) fn decode(
@@ -34,15 +69,15 @@ pub(crate) fn decode(
 ) -> ImageResult<BoundedDecodedImage> {
     match input {
         ImageInput::Bytes(bytes) => {
-            let scan = first_scan(bytes)?;
-            let end = scan_data_end(bytes, &scan)?;
+            let scans = scans(bytes)?;
+            let end = scans.data_end;
             if bytes[end..].starts_with(END_OF_IMAGE) {
-                return decode_bytes(&bytes[..end + END_OF_IMAGE.len()], &scan, 0, options);
+                return decode_bytes(&bytes[..end + END_OF_IMAGE.len()], &scans, 0, options);
             }
             let mut terminated = input_buffer(end as u64, options.max_memory_bytes)?;
             terminated.extend_from_slice(&bytes[..end]);
             terminated.extend_from_slice(END_OF_IMAGE);
-            decode_bytes(&terminated, &scan, terminated.capacity() as u64, options)
+            decode_bytes(&terminated, &scans, terminated.capacity() as u64, options)
         }
         ImageInput::Path(path) => {
             let read_error =
@@ -53,10 +88,10 @@ pub(crate) fn decode(
             file.take(length)
                 .read_to_end(&mut bytes)
                 .map_err(read_error)?;
-            let scan = first_scan(&bytes)?;
-            bytes.truncate(scan_data_end(&bytes, &scan)?);
+            let scans = scans(&bytes)?;
+            bytes.truncate(scans.data_end);
             bytes.extend_from_slice(END_OF_IMAGE);
-            decode_bytes(&bytes, &scan, bytes.capacity() as u64, options)
+            decode_bytes(&bytes, &scans, bytes.capacity() as u64, options)
         }
     }
 }
@@ -74,32 +109,59 @@ fn input_buffer(input_bytes: u64, max_memory_bytes: u64) -> ImageResult<Vec<u8>>
 }
 
 fn first_scan(bytes: &[u8]) -> ImageResult<ScanHeader> {
-    next_scan(bytes, START_OF_IMAGE.len()).ok_or_else(|| unsupported("malformed header segments"))
+    next_scan(bytes, START_OF_IMAGE.len()).map_err(|_| unsupported("malformed header segments"))
 }
 
-fn scan_data_end(bytes: &[u8], scan: &ScanHeader) -> ImageResult<usize> {
-    let end = bytes
-        .get(scan.end..)
+fn scans(bytes: &[u8]) -> ImageResult<Scans> {
+    let first = first_scan(bytes)?;
+    if matches!(first.frame, Some(Frame::Progressive { coefficients: 0 })) {
+        return Err(unsupported("progressive frame without dimensions"));
+    }
+    let segment_bytes = first.end;
+    let data_end = scan_data_end(bytes, first.end);
+    let mut scans = Scans {
+        first,
+        segment_bytes,
+        data_end,
+    };
+    loop {
+        match next_scan(bytes, scans.data_end) {
+            Ok(_) if !scans.is_progressive() => return Err(unsupported("more than one scan")),
+            Ok(scan) if scan.frame.is_some() => {
+                return Err(unsupported("frame header between scans"));
+            }
+            Ok(scan) => {
+                scans.segment_bytes += scan.end - scans.data_end;
+                scans.data_end = scan_data_end(bytes, scan.end);
+            }
+            Err(SegmentsEnd::Malformed) if scans.is_progressive() => {
+                return Err(unsupported("malformed segments between scans"));
+            }
+            Err(_) => return Ok(scans),
+        }
+    }
+}
+
+fn scan_data_end(bytes: &[u8], data_start: usize) -> usize {
+    bytes
+        .get(data_start..)
         .and_then(|data| {
             data.windows(2)
                 .position(|pair| pair[0] == 0xff && !matches!(pair[1], 0x00 | 0xd0..=0xd7 | 0xff))
         })
-        .map_or(bytes.len(), |position| scan.end + position);
-    if next_scan(bytes, end).is_some() {
-        return Err(unsupported("more than one scan"));
-    }
-    Ok(end)
+        .map_or(bytes.len(), |position| data_start + position)
 }
 
 fn decode_bytes(
     bytes: &[u8],
-    scan: &ScanHeader,
+    scans: &Scans,
     owned_input_bytes: u64,
     options: BoundedDecodeOptions,
 ) -> ImageResult<BoundedDecodedImage> {
     let retained_bytes = owned_input_bytes
-        .saturating_add(METADATA_COPIES.saturating_mul(scan.end as u64))
-        .saturating_add(HEADER_PARSING_BYTES);
+        .saturating_add(METADATA_COPIES.saturating_mul(scans.segment_bytes as u64))
+        .saturating_add(HEADER_PARSING_BYTES)
+        .saturating_add(scans.coefficient_bytes());
     if retained_bytes > options.max_memory_bytes {
         return Err(too_large());
     }
@@ -111,16 +173,22 @@ fn decode_bytes(
             .set_max_height(usize::from(u16::MAX)),
     );
     decoder.decode_headers().map_err(jpeg_error)?;
-    if decoder.inner_reader().position().ok() != Some(scan.end as u64) {
+    if decoder.inner_reader().position().ok() != Some(scans.first.end as u64) {
         return Err(unsupported("malformed header segments"));
     }
     let info = decoder
         .info()
         .ok_or_else(|| ImageError::Decode("JPEG headers were not decoded".into()))?;
-    if !info.sof.is_sequential_dct() {
+    let progressive = scans.is_progressive();
+    let supported = if progressive {
+        info.sof.is_progressive()
+    } else {
+        info.sof.is_sequential_dct()
+    };
+    if !supported {
         return Err(unsupported(&format!("{:?}", info.sof)));
     }
-    if scan.components != info.components {
+    if !progressive && scans.first.components != info.components {
         return Err(unsupported("components are in separate scans"));
     }
     let source = Dimensions {
@@ -193,31 +261,75 @@ fn required_bytes(retained_bytes: u64, source: &Dimensions, target: &Dimensions)
         .saturating_add(DECODER_BYTES + u64::from(source.width) * DECODER_BYTES_PER_COLUMN)
 }
 
-fn next_scan(bytes: &[u8], mut offset: usize) -> Option<ScanHeader> {
+fn next_scan(bytes: &[u8], mut offset: usize) -> Result<ScanHeader, SegmentsEnd> {
+    let byte = |index: usize| bytes.get(index).copied().ok_or(SegmentsEnd::Malformed);
+    let mut frame = None;
     loop {
-        if *bytes.get(offset)? != 0xff {
-            return None;
+        if offset == bytes.len() {
+            return Err(SegmentsEnd::EndOfImage);
         }
-        while *bytes.get(offset)? == 0xff {
+        if byte(offset)? != 0xff {
+            return Err(SegmentsEnd::Malformed);
+        }
+        while byte(offset)? == 0xff {
             offset += 1;
         }
         let marker = bytes[offset];
-        let length = usize::from(u16::from_be_bytes([
-            *bytes.get(offset + 1)?,
-            *bytes.get(offset + 2)?,
-        ]));
-        if length < 2 || matches!(marker, 0x00 | 0x01 | 0xd0..=0xd9) {
-            return None;
+        if marker == 0xd9 {
+            return Err(SegmentsEnd::EndOfImage);
+        }
+        let length = usize::from(u16::from_be_bytes([byte(offset + 1)?, byte(offset + 2)?]));
+        if length < 2 || matches!(marker, 0x00 | 0x01 | 0xd0..=0xd8) {
+            return Err(SegmentsEnd::Malformed);
         }
         let end = offset + 1 + length;
+        if end > bytes.len() {
+            return Err(SegmentsEnd::Malformed);
+        }
         if marker == 0xda {
-            return Some(ScanHeader {
-                components: *bytes.get(offset + 3)?,
+            return Ok(ScanHeader {
+                components: byte(offset + 3)?,
                 end,
+                frame,
             });
+        }
+        if matches!(marker, 0xc0..=0xcf) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            let segment = bytes.get(offset + 3..end).ok_or(SegmentsEnd::Malformed)?;
+            frame = Some(frame_header(marker, segment).ok_or(SegmentsEnd::Malformed)?);
         }
         offset = end;
     }
+}
+
+fn frame_header(marker: u8, segment: &[u8]) -> Option<Frame> {
+    if marker != PROGRESSIVE_FRAME {
+        return Some(Frame::Other);
+    }
+    let height = u64::from(u16::from_be_bytes([*segment.get(1)?, *segment.get(2)?]));
+    let width = u64::from(u16::from_be_bytes([*segment.get(3)?, *segment.get(4)?]));
+    let components = segment.get(6..6 + 3 * usize::from(*segment.get(5)?))?;
+    let sampling = components
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|component| (u64::from(component[1] >> 4), u64::from(component[1] & 0x0f)));
+    if sampling
+        .clone()
+        .any(|(horizontal, vertical)| horizontal == 0 || vertical == 0)
+    {
+        return None;
+    }
+    let horizontal = sampling.clone().map(|(horizontal, _)| horizontal).max()?;
+    let vertical = sampling.clone().map(|(_, vertical)| vertical).max()?;
+    let blocks_per_unit: u64 = sampling
+        .map(|(horizontal, vertical)| horizontal * vertical)
+        .sum();
+    Some(Frame::Progressive {
+        coefficients: 64
+            * width.div_ceil(8 * horizontal)
+            * height.div_ceil(8 * vertical)
+            * blocks_per_unit,
+    })
 }
 
 fn rows_rgb(
@@ -361,7 +473,7 @@ mod tests {
         let mut patched = bytes.to_vec();
         let sof = patched
             .windows(2)
-            .rposition(|window| window == [0xff, 0xc0])
+            .rposition(|window| window[0] == 0xff && matches!(window[1], 0xc0 | PROGRESSIVE_FRAME))
             .unwrap();
         patched[sof + 5..sof + 7].copy_from_slice(&height.to_be_bytes());
         patched[sof + 7..sof + 9].copy_from_slice(&width.to_be_bytes());
@@ -589,12 +701,333 @@ mod tests {
         assert_eq!(from_path.image.dimensions, from_bytes.image.dimensions);
     }
 
+    fn progressive(pixels: &[u8], width: u16, height: u16, sampling: SamplingFactor) -> Vec<u8> {
+        encode_layout(pixels, width, height, ColorType::Rgb, |encoder| {
+            encoder.set_progressive(true);
+            encoder.set_sampling_factor(sampling);
+        })
+    }
+
+    fn progressive_estimate(bytes: &[u8], owned: u64, max_side: u32) -> (Dimensions, u64) {
+        let scans = scans(bytes).unwrap();
+        let mut decoder = JpegDecoder::new(ZCursor::new(bytes));
+        decoder.decode_headers().unwrap();
+        let (width, height) = decoder.dimensions().unwrap();
+        let source = Dimensions {
+            width: width as u32,
+            height: height as u32,
+        };
+        let target = target_dimensions(&source, max_side);
+        let retained =
+            owned + METADATA_COPIES * scans.segment_bytes as u64 + scans.coefficient_bytes();
+        let estimate = required_bytes(retained, &source, &target);
+        (target, estimate)
+    }
+
+    fn second_scan(bytes: &[u8]) -> usize {
+        let first_scan_end = first_scan(bytes).unwrap().end;
+        first_scan_end
+            + bytes[first_scan_end..]
+                .windows(2)
+                .position(|window| window == [0xff, 0xda])
+                .unwrap()
+    }
+
+    fn inserted(bytes: &[u8], position: usize, segment: &[u8]) -> Vec<u8> {
+        [&bytes[..position], segment, &bytes[position..]].concat()
+    }
+
+    fn icc_profile_chunks() -> Vec<u8> {
+        let mut segments = Vec::new();
+        for sequence in 1..=64 {
+            let mut chunk = b"ICC_PROFILE\0".to_vec();
+            chunk.extend_from_slice(&[sequence, 64]);
+            chunk.extend(std::iter::repeat_n(sequence, 65_000));
+            segments.extend_from_slice(&[0xff, 0xe2]);
+            segments.extend_from_slice(&u16::try_from(chunk.len() + 2).unwrap().to_be_bytes());
+            segments.extend_from_slice(&chunk);
+        }
+        segments
+    }
+
     #[test]
-    fn progressive_and_separate_scan_jpegs_are_rejected() {
-        let pixels = rgb(24, 24);
-        let progressive = encode_layout(&pixels, 24, 24, ColorType::Rgb, |encoder| {
-            encoder.set_progressive(true)
+    fn progressive_jpegs_match_the_full_decoder() {
+        let samplings = [
+            SamplingFactor::F_1_1,
+            SamplingFactor::F_2_1,
+            SamplingFactor::F_1_2,
+            SamplingFactor::F_2_2,
+            SamplingFactor::F_4_1,
+        ];
+        for (width, height) in [(1, 19), (19, 1), (13, 17), (37, 53), (70, 41)] {
+            let pixels = rgb(u32::from(width), u32::from(height));
+            let gray = pixels.iter().step_by(3).copied().collect::<Vec<_>>();
+            let cmyk = (0..usize::from(width) * usize::from(height) * 4)
+                .map(|i| ((i * 53 + 7) % 256) as u8)
+                .collect::<Vec<_>>();
+            let mut files = samplings
+                .map(|sampling| {
+                    (
+                        format!("{sampling:?}"),
+                        progressive(&pixels, width, height, sampling),
+                    )
+                })
+                .to_vec();
+            files.push((
+                "grayscale".into(),
+                encode_layout(&gray, width, height, ColorType::Luma, |encoder| {
+                    encoder.set_progressive(true)
+                }),
+            ));
+            files.push((
+                "restart interval".into(),
+                encode_layout(&pixels, width, height, ColorType::Rgb, |encoder| {
+                    encoder.set_progressive(true);
+                    encoder.set_sampling_factor(SamplingFactor::F_2_2);
+                    encoder.set_restart_interval(1);
+                }),
+            ));
+            files.push((
+                "two scans per component".into(),
+                encode_layout(&pixels, width, height, ColorType::Rgb, |encoder| {
+                    encoder.set_progressive_scans(2)
+                }),
+            ));
+            files.push((
+                "CMYK".into(),
+                encode_layout(&cmyk, width, height, ColorType::Cmyk, |encoder| {
+                    encoder.set_progressive(true)
+                }),
+            ));
+            files.push((
+                "YCCK".into(),
+                encode_layout(&cmyk, width, height, ColorType::CmykAsYcck, |encoder| {
+                    encoder.set_progressive(true);
+                    encoder.set_sampling_factor(SamplingFactor::F_2_2);
+                }),
+            ));
+            for (label, bytes) in files {
+                for max_side in [7, 6000] {
+                    assert_matches_full_decoder(
+                        &bytes,
+                        max_side,
+                        &format!("{width}x{height} {label}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_frames_count_every_coefficient_block() {
+        let bytes = progressive(&rgb(37, 53), 37, 53, SamplingFactor::F_2_2);
+        let scan = first_scan(&bytes).unwrap();
+        assert!(matches!(
+            scan.frame,
+            Some(Frame::Progressive { coefficients }) if coefficients == 64 * 3 * 4 * 6
+        ));
+        let sof = marker(&bytes, PROGRESSIVE_FRAME);
+        let mut zero_sampling = bytes;
+        zero_sampling[sof + 11] = 0;
+        assert!(first_scan(&zero_sampling).is_err());
+        let baseline = encode(&rgb(8, 8), 8, 8, ExtendedColorType::Rgb8, None, None);
+        assert!(matches!(
+            first_scan(&baseline).unwrap().frame,
+            Some(Frame::Other)
+        ));
+    }
+
+    #[test]
+    fn progressive_frames_without_dimensions_are_refused() {
+        let plain = progressive(&rgb(16, 16), 16, 16, SamplingFactor::F_1_1);
+        let height_from_scan = b"\xff\xdc\x00\x04\x0f\xa0";
+        let deferred = inserted(
+            &with_dimensions(&plain, 4000, 0),
+            marker(&plain, 0xda),
+            height_from_scan,
+        );
+        let limit = 64 * 1024 * 1024;
+        let budget = MemoryBudget::new(limit);
+        let result = budget.enter(|| {
+            decode_bounded(
+                ImageInput::Bytes(&deferred),
+                BoundedDecodeOptions {
+                    max_side: 8,
+                    max_memory_bytes: limit as u64,
+                },
+            )
         });
+        assert!(
+            matches!(&result, Err(ImageError::Decode(message)) if message.contains("progressive frame without dimensions")),
+            "{result:?}"
+        );
+        assert!(!budget.is_exceeded());
+        let ignored = inserted(&plain, marker(&plain, 0xda), height_from_scan);
+        assert_eq!(
+            decode_bounded(ImageInput::Bytes(&ignored), options(6000))
+                .unwrap()
+                .image
+                .rgb,
+            decode_bounded(ImageInput::Bytes(&plain), options(6000))
+                .unwrap()
+                .image
+                .rgb
+        );
+    }
+
+    #[test]
+    fn malformed_segments_between_progressive_scans_are_refused() {
+        let plain = progressive(&rgb(64, 64), 64, 64, SamplingFactor::F_2_2);
+        let second = second_scan(&plain);
+        let stray_byte = inserted(&plain, second, b"\xff\xfe\x00\x04ab\x00");
+        let cut_scan_header = plain[..second + 5].to_vec();
+        for bytes in [stray_byte, cut_scan_header] {
+            let result = decode_bounded(ImageInput::Bytes(&bytes), options(6000));
+            assert!(
+                matches!(&result, Err(ImageError::Decode(message)) if message.contains("malformed segments between scans")),
+                "{result:?}"
+            );
+        }
+        let trailing_comment = inserted(
+            &plain,
+            plain.len() - END_OF_IMAGE.len(),
+            b"\xff\xfe\x00\x04ab",
+        );
+        assert_eq!(
+            decode_bounded(ImageInput::Bytes(&trailing_comment), options(6000))
+                .unwrap()
+                .image
+                .rgb,
+            decode_bounded(ImageInput::Bytes(&plain), options(6000))
+                .unwrap()
+                .image
+                .rgb
+        );
+    }
+
+    #[test]
+    fn truncated_progressive_jpegs_decode_like_the_full_decoder_given_an_end_marker() {
+        let bytes = progressive(&rgb(40, 70), 40, 70, SamplingFactor::F_2_2);
+        for length in [
+            bytes.len() - 2,
+            bytes.len() - 1,
+            bytes.len() - 20,
+            marker(&bytes, 0xda) + 20,
+            second_scan(&bytes),
+        ] {
+            let truncated = &bytes[..length];
+            let terminated = [truncated, END_OF_IMAGE].concat();
+            assert_eq!(
+                decode_bounded(ImageInput::Bytes(truncated), options(6000))
+                    .unwrap()
+                    .image
+                    .rgb,
+                decode_image_from_bytes(&terminated).unwrap().rgb,
+                "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_memory_estimate_covers_the_decode() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.jpg");
+        let wide = rgb(4000, 40);
+        let square = rgb(1024, 1024);
+        let mut files = vec![
+            (
+                progressive(&square, 1024, 1024, SamplingFactor::F_1_1),
+                6000,
+            ),
+            (progressive(&square, 1024, 1024, SamplingFactor::F_2_2), 300),
+        ];
+        for sampling in [SamplingFactor::F_2_1, SamplingFactor::F_1_2] {
+            files.push((progressive(&wide, 4000, 40, sampling), 300));
+        }
+        for (bytes, max_side) in files {
+            std::fs::write(&path, &bytes).unwrap();
+            let owned = (bytes.len() + END_OF_IMAGE.len()) as u64;
+            let (target, estimate) = progressive_estimate(&bytes, owned, max_side);
+            let limit = |max_memory_bytes| BoundedDecodeOptions {
+                max_side,
+                max_memory_bytes,
+            };
+            let admitted = estimate + HEADER_PARSING_BYTES;
+            let budget = MemoryBudget::new(estimate as usize);
+            let decoded = budget
+                .enter(|| decode_bounded(ImageInput::Path(path.to_str().unwrap()), limit(admitted)))
+                .unwrap();
+            assert_eq!(decoded.image.dimensions, target);
+            assert!(!budget.is_exceeded(), "{target:?}");
+            assert!(matches!(
+                decode_bounded(
+                    ImageInput::Path(path.to_str().unwrap()),
+                    limit(admitted - 1)
+                ),
+                Err(ImageError::TooLarge(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn progressive_coefficients_are_refused_before_decoding() {
+        let bytes = with_dimensions(
+            &progressive(&rgb(16, 16), 16, 16, SamplingFactor::F_2_2),
+            4000,
+            4000,
+        );
+        let budget = MemoryBudget::new(4 * 1024 * 1024);
+        let result = budget.enter(|| {
+            decode_bounded(
+                ImageInput::Bytes(&bytes),
+                BoundedDecodeOptions {
+                    max_memory_bytes: 64 * 1024 * 1024,
+                    ..BoundedDecodeOptions::default()
+                },
+            )
+        });
+        assert!(matches!(result, Err(ImageError::TooLarge(_))), "{result:?}");
+        assert!(!budget.is_exceeded());
+    }
+
+    #[test]
+    fn metadata_between_progressive_scans_counts_towards_the_budget() {
+        let plain = progressive(&rgb(64, 64), 64, 64, SamplingFactor::F_2_2);
+        let bytes = inserted(&plain, second_scan(&plain), &icc_profile_chunks());
+        let expected = decode_bounded(ImageInput::Bytes(&plain), options(6000)).unwrap();
+        let (_, estimate) = progressive_estimate(&bytes, 0, 6000);
+        let limit = |max_memory_bytes| BoundedDecodeOptions {
+            max_memory_bytes,
+            ..BoundedDecodeOptions::default()
+        };
+        let admitted = estimate + HEADER_PARSING_BYTES;
+        let budget = MemoryBudget::new(estimate as usize);
+        let decoded = budget
+            .enter(|| decode_bounded(ImageInput::Bytes(&bytes), limit(admitted)))
+            .unwrap();
+        assert!(!budget.is_exceeded());
+        assert_eq!(decoded.image.rgb, expected.image.rgb);
+        assert!(matches!(
+            decode_bounded(ImageInput::Bytes(&bytes), limit(admitted - 1)),
+            Err(ImageError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn frame_headers_between_progressive_scans_are_rejected() {
+        let plain = progressive(&rgb(64, 64), 64, 64, SamplingFactor::F_2_2);
+        let sof = marker(&plain, PROGRESSIVE_FRAME);
+        let sof_end = sof + 2 + usize::from(u16::from_be_bytes([plain[sof + 2], plain[sof + 3]]));
+        let bytes = inserted(&plain, second_scan(&plain), &plain[sof..sof_end]);
+        assert!(matches!(
+            decode_bounded(ImageInput::Bytes(&bytes), options(6000)),
+            Err(ImageError::Decode(message)) if message.contains("frame header between scans")
+        ));
+    }
+
+    #[test]
+    fn separate_scan_jpegs_are_rejected() {
+        let pixels = rgb(24, 24);
         let separate = with_separate_scans(&encode(
             &pixels,
             24,
@@ -609,29 +1042,12 @@ mod tests {
         let quadruple = encode_layout(&pixels, 24, 24, ColorType::Rgb, |encoder| {
             encoder.set_sampling_factor(SamplingFactor::F_4_1)
         });
-        for bytes in [progressive, separate, optimized, quadruple] {
+        for bytes in [separate, optimized, quadruple] {
             assert!(matches!(
                 decode_bounded(ImageInput::Bytes(&bytes), options(8)),
                 Err(ImageError::Decode(message)) if message.contains("unsupported JPEG")
             ));
         }
-    }
-
-    #[test]
-    fn progressive_jpegs_with_one_scan_are_rejected_before_buffering() {
-        let mut bytes = with_dimensions(&plain_64(), 4000, 4000);
-        let sof = marker(&bytes, 0xc0);
-        bytes[sof + 1] = 0xc2;
-        let sos = marker(&bytes, 0xda);
-        let components = usize::from(bytes[sos + 4]);
-        bytes[sos + 6 + 2 * components] = 0;
-        let budget = MemoryBudget::new(4 * 1024 * 1024);
-        let result = budget.enter(|| decode_bounded(ImageInput::Bytes(&bytes), options(8)));
-        assert!(
-            matches!(&result, Err(ImageError::Decode(message)) if message.contains("Progressive DCT")),
-            "{result:?}"
-        );
-        assert!(!budget.is_exceeded());
     }
 
     #[test]
@@ -690,7 +1106,7 @@ mod tests {
             b"\xff\xd8\xff\xda\0\x08",
         ] {
             assert!(
-                next_scan(header, START_OF_IMAGE.len()).is_none(),
+                next_scan(header, START_OF_IMAGE.len()).is_err(),
                 "{header:x?}"
             );
         }
@@ -919,51 +1335,27 @@ mod tests {
 
     #[test]
     fn scan_data_ends_at_the_first_marker_after_the_scan() {
-        let scan = ScanHeader {
-            components: 3,
-            end: 0,
-        };
         let data = b"\x12\xff\x00\x34\xff\xd3\x56\xff\xff\xd9\xff\xe1";
-        assert_eq!(scan_data_end(data, &scan).unwrap(), 8);
-        assert_eq!(scan_data_end(b"\x12\x34\xff", &scan).unwrap(), 3);
-        assert_eq!(scan_data_end(b"\x12\x34", &scan).unwrap(), 2);
+        assert_eq!(scan_data_end(data, 0), 8);
+        assert_eq!(scan_data_end(b"\x12\x34\xff", 0), 3);
+        assert_eq!(scan_data_end(b"\x12\x34", 0), 2);
+        assert_eq!(scan_data_end(b"\x12\xff\xe1\0\x04ab\xff\xd9", 0), 1);
         assert_eq!(
-            scan_data_end(b"\x12\xff\xe1\0\x04ab\xff\xd9", &scan).unwrap(),
+            scan_data_end(b"\x12\xff\xe1\0\x04ab\x99\xff\xda\0\x08\x01", 0),
             1
         );
-        assert_eq!(
-            scan_data_end(b"\x12\xff\xe1\0\x04ab\x99\xff\xda\0\x08\x01", &scan).unwrap(),
-            1
-        );
-        for later_scan in [
-            &b"\x12\xff\xda\0\x08\x01\x01\0\0\x3f\0"[..],
-            b"\x12\xff\xe1\0\x04ab\xff\xff\xda\0\x08\x01\x01\0\0\x3f\0",
-        ] {
-            assert!(matches!(
-                scan_data_end(later_scan, &scan),
-                Err(ImageError::Decode(message)) if message.contains("more than one scan")
-            ));
-        }
-        let beyond = ScanHeader {
-            components: 3,
-            end: 9,
-        };
-        assert_eq!(scan_data_end(b"\xff\xd8", &beyond).unwrap(), 2);
+        assert_eq!(scan_data_end(b"\x12\xff\xda\0\x08\x01\x01\0\0\x3f\0", 0), 1);
+        assert_eq!(scan_data_end(b"\xff\xd8", 9), 2);
     }
 
     #[test]
     fn metadata_after_the_scan_is_not_kept_by_the_decoder() {
         let plain = plain_64();
-        let mut bytes = plain[..plain.len() - END_OF_IMAGE.len()].to_vec();
-        for sequence in 1..=64 {
-            let mut chunk = b"ICC_PROFILE\0".to_vec();
-            chunk.extend_from_slice(&[sequence, 64]);
-            chunk.extend(std::iter::repeat_n(sequence, 65_000));
-            bytes.extend_from_slice(&[0xff, 0xe2]);
-            bytes.extend_from_slice(&u16::try_from(chunk.len() + 2).unwrap().to_be_bytes());
-            bytes.extend_from_slice(&chunk);
-        }
-        bytes.extend_from_slice(END_OF_IMAGE);
+        let bytes = inserted(
+            &plain,
+            plain.len() - END_OF_IMAGE.len(),
+            &icc_profile_chunks(),
+        );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("image.jpg");
         std::fs::write(&path, &bytes).unwrap();
@@ -1229,18 +1621,13 @@ mod tests {
             "ml/indexing/v1/files/IMG_pano.jpg",
             "media/motion-photos/v1/files/motionphoto.jpg",
             "media/motion-photos/v1/files/pixel_8.jpg",
+            "ml/indexing/v1/files/starwatchers.jpg",
         ] {
             let bytes = std::fs::read(directory.join(name)).unwrap();
             for max_side in [6000, 97] {
                 assert_matches_full_decoder(&bytes, max_side, name);
             }
         }
-        let progressive =
-            std::fs::read(directory.join("ml/indexing/v1/files/starwatchers.jpg")).unwrap();
-        assert!(matches!(
-            decode_bounded(ImageInput::Bytes(&progressive), options(6000)),
-            Err(ImageError::Decode(_))
-        ));
     }
 
     struct Pattern {
