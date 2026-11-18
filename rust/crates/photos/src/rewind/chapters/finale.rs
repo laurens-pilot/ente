@@ -19,6 +19,7 @@ mod tests {
     use crate::rewind::library::Library;
     use crate::rewind::ranking::Ranking;
     use crate::rewind::report::Finale;
+    use crate::rewind::{RewindStatus, compute_rewind};
 
     use super::finale;
 
@@ -44,6 +45,30 @@ mod tests {
                 file_ids: vec![1, 6, 2, 3],
             })
         );
+    }
+
+    #[test]
+    fn a_burst_across_months_does_not_push_a_month_out_of_the_finale() {
+        let mut files = vec![
+            photo(1, "2026-01-31T23:59:59"),
+            photo(2, "2026-01-05T10:00:00"),
+            photo(3, "2026-01-09T10:00:00"),
+            photo(4, "2026-01-12T10:00:00"),
+            photo(5, "2026-02-01T00:00:00"),
+            photo(6, "2026-02-01T00:00:00"),
+            photo(7, "2026-02-01T00:00:01"),
+            photo(8, "2026-02-14T10:00:00"),
+        ];
+        for file in &mut files {
+            file.is_favourite = true;
+        }
+        files[0].like_count = 1;
+
+        let state = compute_rewind(&request(files), None, None, None).unwrap();
+        let RewindStatus::Ready { report } = state.status else {
+            panic!("expected a ready Rewind");
+        };
+        assert_eq!(report.finale.unwrap().file_ids, [1, 8, 2, 3, 4]);
     }
 
     #[test]

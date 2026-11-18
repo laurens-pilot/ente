@@ -1,0 +1,1 @@
+- Kept Rewind photo picks spread across dates when near-duplicate photos are skipped.

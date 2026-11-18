@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use super::input::RewindVisibility;
 use super::library::{Library, YearFile};
@@ -114,34 +114,37 @@ impl<'a> Ranking<'a> {
         spread: Spread,
         limit: usize,
     ) {
-        let mut groups: Vec<Vec<&YearFile>> = Vec::new();
+        let mut groups: Vec<VecDeque<&YearFile>> = Vec::new();
         let mut positions: HashMap<i64, usize> = HashMap::new();
         for file in files {
             let position = *positions.entry(spread.key(file)).or_insert_with(|| {
-                groups.push(Vec::new());
+                groups.push(VecDeque::new());
                 groups.len() - 1
             });
-            groups[position].push(file);
+            groups[position].push_back(file);
         }
-        let rounds = groups.iter().map(Vec::len).max().unwrap_or(0);
-        for round in 0..rounds {
-            for file in groups.iter().filter_map(|group| group.get(round)) {
+        while !groups.is_empty() {
+            for group in &mut groups {
                 if chosen.len() >= limit {
                     return;
                 }
-                let vector = self.vector(file.id());
-                if chosen
-                    .iter()
-                    .any(|chosen| chosen.is_near(file, vector.as_deref()))
-                {
-                    continue;
+                while let Some(file) = group.pop_front() {
+                    let vector = self.vector(file.id());
+                    if chosen
+                        .iter()
+                        .any(|chosen| chosen.is_near(file, vector.as_deref()))
+                    {
+                        continue;
+                    }
+                    chosen.push(Chosen {
+                        id: file.id(),
+                        creation_time: file.file.creation_time,
+                        vector,
+                    });
+                    break;
                 }
-                chosen.push(Chosen {
-                    id: file.id(),
-                    creation_time: file.file.creation_time,
-                    vector,
-                });
             }
+            groups.retain(|group| !group.is_empty());
         }
     }
 
