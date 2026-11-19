@@ -124,68 +124,9 @@ jobs:
                   path: rust/target
 
     rust-flutter:
-        # For mobile-lint.yml.
-        runs-on: ubuntu-latest
-        defaults:
-            run:
-                working-directory: rust
-        env:
-            RUSTFLAGS: -D warnings
-        steps:
-            - name: Checkout code and submodules
-              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-              with:
-                  submodules: recursive
-
-            - name: Install Flutter
-              uses: $/.github/actions/setup-flutter
-
-            - name: Setup Rust cache
-              uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-              with:
-                  workspaces: rust
-                  shared-key: rust-flutter
-                  cache-targets: false
-
-            - name: Check Rust target cache
-              id: rust-target
-              uses: $/.github/actions/restore-rust-target
-              with:
-                  lookup-only: true
-                  shared-key: rust-flutter
-
-            - run: cargo codegen frb
-
-            - run: cargo clippy -p ente-auth-frb --features flutter --all-targets --locked
-
-            - run: cargo clippy -p ente-photos-frb --features flutter --all-targets --locked
-
-            - run: cargo clippy -p ente-locker-frb --features flutter --all-targets --locked
-
-            - name: Build Rust libraries for tests
-              run: cargo build -p ente-auth-frb -p ente-photos-frb --features flutter --locked
-
-            - run: node .github/actions/restore-rust-target/mtimes.mjs save
-              working-directory: ${{ github.workspace }}
-
-            - name: Save Rust target
-              if: steps.rust-target.outputs.cache-hit != 'true'
-              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-              with:
-                  key: ${{ steps.rust-target.outputs.cache-key }}
-                  path: rust/target
-
-            - name: Cache localizations
-              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-              with:
-                  key: mobile-l10n-${{ hashFiles('.github/actions/setup-flutter/action.yml', 'mobile/analysis_options.yaml', 'mobile/packages/strings/*.yaml', 'mobile/packages/strings/lib/l10n/arb/*.arb') }}
-                  path: |
-                      mobile/packages/strings/build
-                      mobile/packages/strings/lib/l10n/strings_localizations*.dart
-                      mobile/packages/strings/lib/l10n/untranslated_messages.json
-
-            - run: flutter pub get --enforce-lockfile
-              working-directory: mobile
+        uses: ./.github/workflows/warm-mobile-rust-cache.yml
+        with:
+            refresh: true
 
     web:
         # For web-lint.yml.

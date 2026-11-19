@@ -16,6 +16,9 @@ outputs:
     cache-hit:
         description: Exact cache hit
         value: ${{ steps.cache.outputs.cache-hit }}
+    cache-matched-key:
+        description: Key of the matching cache for this runner image
+        value: ${{ steps.cache.outputs.cache-matched-key }}
 
 runs:
     using: composite

@@ -1,0 +1,84 @@
+name: Warm mobile Rust cache
+
+on:
+    schedule:
+        - cron: "47 * * * *"
+    workflow_call:
+        inputs:
+            refresh:
+                description: Refresh the Rust and localization caches for mobile-lint
+                type: boolean
+                required: true
+
+permissions:
+    contents: read
+
+jobs:
+    warm:
+        if: github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        concurrency:
+            group: warm-mobile-rust-cache
+            queue: max
+        env:
+            RUSTFLAGS: -D warnings
+        steps:
+            - name: Check Rust target cache
+              id: rust-target
+              uses: $/.github/actions/restore-rust-target
+              with:
+                  lookup-only: true
+                  shared-key: rust-flutter
+
+            - name: Checkout code and submodules
+              if: &warm-target inputs.refresh || steps.rust-target.outputs.cache-matched-key == ''
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  submodules: recursive
+
+            - name: Install Flutter
+              if: *warm-target
+              uses: $/.github/actions/setup-flutter
+
+            - name: Setup Rust cache
+              if: *warm-target
+              uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+              with:
+                  workspaces: rust
+                  shared-key: rust-flutter
+                  cache-targets: false
+
+            - name: Generate, lint and build Rust bindings
+              id: build
+              if: *warm-target
+              working-directory: rust
+              run: |
+                  cargo codegen frb
+                  cargo clippy -p ente-auth-frb --features flutter --all-targets --locked
+                  cargo clippy -p ente-photos-frb --features flutter --all-targets --locked
+                  cargo clippy -p ente-locker-frb --features flutter --all-targets --locked
+                  cargo build -p ente-auth-frb -p ente-photos-frb --features flutter --locked
+
+            - run: node .github/actions/restore-rust-target/mtimes.mjs save
+              if: *warm-target
+
+            - name: Save Rust target
+              if: steps.build.outcome == 'success' && steps.rust-target.outputs.cache-hit != 'true'
+              uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  key: ${{ steps.rust-target.outputs.cache-key }}
+                  path: rust/target
+
+            - name: Cache localizations
+              if: inputs.refresh
+              uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+              with:
+                  key: mobile-l10n-${{ hashFiles('.github/actions/setup-flutter/action.yml', 'mobile/analysis_options.yaml', 'mobile/packages/strings/*.yaml', 'mobile/packages/strings/lib/l10n/arb/*.arb') }}
+                  path: |
+                      mobile/packages/strings/build
+                      mobile/packages/strings/lib/l10n/strings_localizations*.dart
+                      mobile/packages/strings/lib/l10n/untranslated_messages.json
+
+            - run: flutter pub get --enforce-lockfile
+              if: inputs.refresh
+              working-directory: mobile
