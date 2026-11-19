@@ -2935,6 +2935,7 @@ dependencies = [
  "ente-vecdb",
  "futures-util",
  "log",
+ "memchr",
  "mockito",
  "quick-xml 0.42.0",
  "rusqlite",

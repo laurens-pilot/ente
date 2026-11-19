@@ -106,6 +106,7 @@ js-sys = "0.3.102"
 keyring = { version = "3.6.3", default-features = false }
 log = "0.4.34"
 md-5 = "0.11.0"
+memchr = "2.8.0"
 mockito = "1.7.2"
 moxcms = "0.9.1"
 open = "5.4.4"
