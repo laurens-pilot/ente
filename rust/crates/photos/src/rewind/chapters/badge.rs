@@ -162,6 +162,12 @@ struct SubjectBadge {
     minimum: usize,
 }
 
+enum ShareValue {
+    Count,
+    Percentage,
+    Hidden,
+}
+
 struct Reading {
     id: RewindBadge,
     signal: f64,
@@ -401,6 +407,7 @@ fn readings(
             eligible.len(),
             SCREENSHOT_COLLECTOR,
             SCREENSHOT_COLLECTOR_MINIMUM,
+            ShareValue::Count,
         ),
         out_of_office(library, taken),
         share(
@@ -412,6 +419,7 @@ fn readings(
             taken.len(),
             ALWAYS_ROLLING,
             ALWAYS_ROLLING_MINIMUM,
+            ShareValue::Count,
         ),
     ];
     if let Some(people) = people {
@@ -480,6 +488,7 @@ fn share(
     base: usize,
     scale: Scale,
     minimum: usize,
+    value: ShareValue,
 ) -> Option<Reading> {
     (base > 0).then(|| Reading {
         enough: matching >= minimum,
@@ -487,7 +496,11 @@ fn share(
             id,
             matching as f64 / base as f64,
             scale,
-            Some(count(matching)),
+            match value {
+                ShareValue::Count => Some(count(matching)),
+                ShareValue::Percentage => Some(percent(matching, base)),
+                ShareValue::Hidden => None,
+            },
         )
     })
 }
@@ -547,10 +560,7 @@ fn share_of_hours(
         .iter()
         .filter(|file| hours.contains(&file.hour))
         .count();
-    share(id, matching, taken.len(), scale, 1).map(|reading| Reading {
-        value: None,
-        ..reading
-    })
+    share(id, matching, taken.len(), scale, 1, ShareValue::Hidden)
 }
 
 fn weekend_star(taken: &[&YearFile<'_>]) -> Option<Reading> {
@@ -564,11 +574,8 @@ fn weekend_star(taken: &[&YearFile<'_>]) -> Option<Reading> {
         taken.len(),
         WEEKEND_STAR,
         1,
+        ShareValue::Percentage,
     )
-    .map(|reading| Reading {
-        value: Some(percent(weekend, taken.len())),
-        ..reading
-    })
 }
 
 fn main_character(
@@ -591,11 +598,8 @@ fn main_character(
         images,
         MAIN_CHARACTER,
         MAIN_CHARACTER_MINIMUM,
+        ShareValue::Percentage,
     )
-    .map(|reading| Reading {
-        value: Some(percent(with_me, images)),
-        ..reading
-    })
 }
 
 fn out_of_office(library: &Library<'_>, taken: &[&YearFile<'_>]) -> Option<Reading> {
@@ -650,6 +654,7 @@ fn subject_share(badge: &SubjectBadge, classified: &Classified<'_, '_>) -> Optio
         classified.len(),
         badge.scale,
         badge.minimum,
+        ShareValue::Count,
     )
 }
 
@@ -702,10 +707,10 @@ fn indoor_kid(classified: &Classified<'_, '_>) -> Option<Reading> {
         classified.len(),
         INDOOR_KID,
         1,
+        ShareValue::Percentage,
     )
     .map(|reading| Reading {
         enough: reading.enough && classified.len() >= INDOOR_KID_MINIMUM_CLASSIFIED,
-        value: Some(percent(indoors, classified.len())),
         ..reading
     })
 }
@@ -750,8 +755,9 @@ mod tests {
     use crate::rewind::library::Library;
     use crate::rewind::people::People;
     use crate::rewind::report::{Badge, RewindBadge};
+    use crate::rewind::rewind_badge_signals;
 
-    use super::{badge, badge_signals, badge_uses_ml};
+    use super::{badge, badge_uses_ml};
 
     const HOUR: i64 = 3_600_000_000;
     const DAY: i64 = 24 * HOUR;
@@ -810,10 +816,8 @@ mod tests {
             file.shared_album_ids = vec![position as i64 / 6];
         }
         let signals_request = request(with_history(files));
-        let library = Library::of_year(&signals_request).unwrap();
-        let signals =
-            serde_json::to_value(badge_signals(&signals_request, &library, None, None, None))
-                .unwrap();
+        let signals: serde_json::Value =
+            serde_json::from_str(&rewind_badge_signals(&signals_request, None).unwrap()).unwrap();
 
         assert_eq!(signals["badge"], "LimitedEdition");
         assert_eq!(signals["taken"], 100);
@@ -842,6 +846,9 @@ mod tests {
         );
         assert_eq!(reading("WeekendStar")["signal"], 0.0);
         assert_eq!(reading("WeekendStar")["score"], serde_json::Value::Null);
+        assert_eq!(reading("WeekendStar")["value"], 1);
+        assert_eq!(reading("EarlyBird")["value"], serde_json::Value::Null);
+        assert_eq!(reading("AlwaysRolling")["value"], 0);
     }
 
     #[test]
