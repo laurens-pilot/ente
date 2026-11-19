@@ -10,6 +10,7 @@ ente-collections.workspace = true
 ente-core.workspace = true
 ente-exif.workspace = true
 log.workspace = true
+memchr.workspace = true
 quick-xml.workspace = true
 serde.workspace = true
 serde_json.workspace = true

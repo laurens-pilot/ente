@@ -1,4 +1,5 @@
 use super::{BUFFER_SIZE, VideoIndex};
+use memchr::memmem::Finder;
 use std::io::{self, Read};
 
 const FTYP_BOX_MIN_SIZE: u32 = 8;
@@ -15,6 +16,7 @@ pub(super) fn find_largest_ftyp_segment<R: Read>(
     size: usize,
 ) -> io::Result<Option<VideoIndex>> {
     const OVERLAP: usize = 11;
+    let finder = Finder::new(b"ftyp");
     let mut buffer = vec![0; BUFFER_SIZE + OVERLAP];
     let mut carried = 0;
     let mut offset = 0;
@@ -26,10 +28,11 @@ pub(super) fn find_largest_ftyp_segment<R: Read>(
         let length = remaining.min(BUFFER_SIZE);
         reader.read_exact(&mut buffer[carried..carried + length])?;
         let available = carried + length;
-        for (position, header) in buffer[..available].windows(12).enumerate() {
-            if &header[4..8] != b"ftyp" {
-                continue;
-            }
+        let bytes = &buffer[..available];
+        for position in finder.find_iter(bytes.get(4..).unwrap_or_default()) {
+            let Some(header) = bytes.get(position..position + 12) else {
+                break;
+            };
             let start = offset + position;
             let box_size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             if start == 0
@@ -89,6 +92,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn skips_invalid_headers_and_ignores_a_trailing_marker() {
+        let mut source = b"ftyp\0\0\0\0\0\0\0\x10ftypheic\0\0\0\0".to_vec();
+        let start = source.len();
+        source.extend_from_slice(b"\0\0\0\x10ftypmp42\0\0\0\0\0\0\0\x10ftyp");
+        let end = source.len();
+
+        assert_eq!(
+            find_largest_ftyp_segment(Cursor::new(&source), end).unwrap(),
+            Some(VideoIndex { start, end })
+        );
     }
 
     #[test]
