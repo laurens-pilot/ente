@@ -24,6 +24,15 @@ jobs:
             - name: Checkout
               uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+            - name: Checkout test fixtures
+              if: matrix.suite == 'workspace'
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  repository: ente/test-fixtures
+                  ref: 13c7cf83717140be20b32e6fbb178d5f15ea09ea
+                  path: test-fixtures
+                  persist-credentials: false
+
             - name: Free runner disk space
               run: sudo rm -rf /usr/local/lib/android
 
@@ -66,6 +75,7 @@ jobs:
               # postgresql_embedded downloads its binaries from GitHub.
               # GITHUB_TOKEN raises the API rate limit for those downloads.
               env:
+                  ENTE_TEST_FIXTURES_DIR: ${{ github.workspace }}/test-fixtures
                   GITHUB_TOKEN: ${{ github.token }}
 
             # Avoid unifying SQLCipher into other packages' SQLite tests.
