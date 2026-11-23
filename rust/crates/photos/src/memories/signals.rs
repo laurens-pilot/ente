@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use super::input::{ClipVectors, MlInputs, PhotoSignals};
+use super::input::{ClipMatches, ClipVectors, MlInputs, PhotoSignals};
 use super::text_embeddings::{NOSTALGIA, TextEmbedding};
 use crate::ml_store::Result;
 
@@ -33,8 +33,40 @@ impl<'m> Signals<'m> {
         &self,
         embedding: &TextEmbedding,
         min_similarity: f32,
-    ) -> Result<Vec<(i64, f32)>> {
+    ) -> Result<ClipMatches> {
         self.clip.matches(&query(embedding), min_similarity)
+    }
+
+    pub(super) fn matching_file_ids(
+        &self,
+        embeddings: &[&TextEmbedding],
+        min_similarity: f32,
+        file_ids: impl Iterator<Item = i64>,
+    ) -> Result<Vec<HashSet<i64>>> {
+        let mut file_ids = file_ids.peekable();
+        if file_ids.peek().is_none() {
+            return Ok(Vec::new());
+        }
+        let queries: Vec<_> = embeddings
+            .iter()
+            .map(|embedding| query(embedding))
+            .collect();
+        let matching_ids = |matches: ClipMatches| {
+            matches
+                .into_iter()
+                .filter_map(|(id, similarity)| (similarity > min_similarity).then_some(id))
+                .collect()
+        };
+        if let Some(matches) =
+            self.clip
+                .try_matches_in_files(&queries, min_similarity, &mut file_ids)?
+        {
+            return Ok(matches.into_iter().map(matching_ids).collect());
+        }
+        queries
+            .iter()
+            .map(|query| self.clip.matches(query, min_similarity).map(matching_ids))
+            .collect()
     }
 
     fn load_unit_vector(&self, file_id: i64) -> Result<()> {

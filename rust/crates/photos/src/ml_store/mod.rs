@@ -130,6 +130,10 @@ impl MlStore {
         self.read_index(index, VecDb::stats)
     }
 
+    pub(crate) fn index_len(&self, index: Index) -> Result<usize> {
+        self.read_index(index, VecDb::len)
+    }
+
     fn lock_mutations(&self) -> MutexGuard<'_, ()> {
         self.locks
             .mutations

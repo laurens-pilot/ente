@@ -127,8 +127,20 @@ pub struct UnnamedCluster {
     pub file_ids: HashSet<i64>,
 }
 
+pub(super) type ClipMatches = Vec<(i64, f32)>;
+
 pub trait ClipVectors {
-    fn matches(&self, query: &[f32], min_similarity: f32) -> Result<Vec<(i64, f32)>>;
+    fn matches(&self, query: &[f32], min_similarity: f32) -> Result<ClipMatches>;
+
+    fn try_matches_in_files(
+        &self,
+        _queries: &[Vec<f32>],
+        _min_similarity: f32,
+        _file_ids: &mut dyn Iterator<Item = i64>,
+    ) -> Result<Option<Vec<ClipMatches>>> {
+        Ok(None)
+    }
+
     fn vector(&self, file_id: i64) -> Result<Option<Vec<f32>>>;
 }
 

@@ -82,13 +82,30 @@ impl<'a> People<'a> {
             id,
             file_ids: inputs.person_file_ids.get(id).unwrap_or(&no_file_ids),
         });
-        let mut important: Vec<&MemoryPerson> = important_people(request).collect();
-        important.sort_by_key(|&person| &person.id);
-        let activity_file_ids = match me {
-            Some(me) if important.iter().any(|person| person.id != me.id) => {
-                activity_file_ids(signals)?
-            }
-            _ => Vec::new(),
+        let mut important: Vec<_> = important_people(request)
+            .map(|person| {
+                let mut photos: Vec<&Photo> = inputs
+                    .person_file_ids
+                    .get(&person.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|file_id| photos_by_id.get(file_id).copied())
+                    .collect();
+                sort_chronologically(&mut photos);
+                (person, photos)
+            })
+            .collect();
+        important.sort_by_key(|(person, _)| &person.id);
+        let activity_file_ids = if let Some(me) = me {
+            let eligible = important
+                .iter()
+                .filter(|(person, photos)| {
+                    person.id != me.id && photos.len() > MINIMUM_MEMORY_LENGTH
+                })
+                .flat_map(|(_, photos)| photos.iter().map(|photo| photo.id));
+            activity_file_ids(signals, eligible)?
+        } else {
+            Vec::new()
         };
         let unnamed_people = if shows_unnamed_clusters(request) {
             unnamed_people(inputs, &photos_by_id, me)
@@ -100,7 +117,7 @@ impl<'a> People<'a> {
                 .min(important.len().max(1) as i64 * UPDATE_FREQUENCY_DAYS),
             persons: important
                 .into_iter()
-                .map(|person| Person::new(person, inputs, &photos_by_id, me, &activity_file_ids))
+                .map(|(person, photos)| Person::new(person, inputs, photos, me, &activity_file_ids))
                 .collect(),
             unnamed_people,
             uses_unnamed_fallback: uses_unnamed_fallback(request),
@@ -332,18 +349,10 @@ impl<'a> Person<'a> {
     fn new(
         person: &'a MemoryPerson,
         inputs: &PeopleInputs,
-        photos_by_id: &HashMap<i64, &'a Photo>,
+        photos: Vec<&'a Photo>,
         me: Option<Me>,
         activity_file_ids: &[(PeopleActivity, HashSet<i64>)],
     ) -> Self {
-        let mut photos: Vec<&Photo> = inputs
-            .person_file_ids
-            .get(&person.id)
-            .into_iter()
-            .flatten()
-            .filter_map(|file_id| photos_by_id.get(file_id).copied())
-            .collect();
-        sort_chronologically(&mut photos);
         let face_count = |photo: &Photo| inputs.face_counts.get(&photo.id).copied();
         let enough_matching = |matches: &dyn Fn(&Photo) -> bool| {
             let matching: Vec<&Photo> = photos
@@ -467,19 +476,13 @@ impl Candidate<'_, '_> {
     }
 }
 
-fn activity_file_ids(signals: &Signals) -> Result<Vec<(PeopleActivity, HashSet<i64>)>> {
-    PeopleActivity::ALL
-        .into_iter()
-        .map(|activity| {
-            let file_ids = signals
-                .matches(activity.embedding(), ACTIVITY_SIMILARITY)?
-                .into_iter()
-                .filter(|&(_, similarity)| similarity > ACTIVITY_SIMILARITY)
-                .map(|(file_id, _)| file_id)
-                .collect();
-            Ok((activity, file_ids))
-        })
-        .collect()
+fn activity_file_ids(
+    signals: &Signals,
+    eligible: impl Iterator<Item = i64>,
+) -> Result<Vec<(PeopleActivity, HashSet<i64>)>> {
+    let embeddings = PeopleActivity::ALL.map(PeopleActivity::embedding);
+    let matches = signals.matching_file_ids(&embeddings, ACTIVITY_SIMILARITY, eligible)?;
+    Ok(PeopleActivity::ALL.into_iter().zip(matches).collect())
 }
 
 pub(super) fn shows_unnamed_clusters(request: &MemoriesRequest) -> bool {

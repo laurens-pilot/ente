@@ -140,8 +140,11 @@ fn unnamed_clusters(db: &MlDb, request: &MemoriesRequest) -> Result<Vec<UnnamedC
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use super::load_ml_inputs;
-    use crate::memories::{MemoriesRequest, MemoryPerson, UnnamedCluster};
+    use super::{compute_smart_memories_from_store, load_ml_inputs};
+    use crate::memories::tests::{files_on, period};
+    use crate::memories::{
+        MemoriesRequest, MemoryKind, MemoryPerson, PeopleActivity, PeopleMemoryType, UnnamedCluster,
+    };
     use crate::ml_db::{CLIP_EMBEDDING_DIMENSIONS, ClipEmbedding, FaceRow};
     use crate::ml_store::{CLUSTER_CENTROID_DIMENSIONS, Error, FillState, Index, MlStore};
 
@@ -254,6 +257,69 @@ mod tests {
             inputs.people.person_file_ids["carol"],
             HashSet::from([1, 2, 6])
         );
+    }
+
+    #[test]
+    fn sparse_and_dense_activity_searches_produce_the_same_memories() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MlStore::open(directory.path().join("ente.ml.db")).unwrap();
+        let db = store.db();
+        let assigned: Vec<_> = (1..=7).chain([100]).map(|id| format!("{id}_a")).collect();
+        db.bulk_insert_faces(&assigned.iter().map(|id| face(id)).collect::<Vec<_>>())
+            .unwrap();
+        db.update_face_id_to_cluster_id(
+            &assigned
+                .into_iter()
+                .map(|id| (id, "alice".to_owned()))
+                .collect(),
+        )
+        .unwrap();
+        db.assign_cluster_to_person("alice", "alice").unwrap();
+        let party = |file_id: i64| {
+            let mut embedding: Vec<_> = PeopleActivity::Party
+                .embedding()
+                .iter()
+                .copied()
+                .map(f64::from)
+                .collect();
+            embedding[file_id as usize] += 300.0;
+            ClipEmbedding {
+                file_id,
+                embedding,
+                version: 1,
+            }
+        };
+        store
+            .put_clip(&(1..=8).chain([100]).map(party).collect::<Vec<_>>())
+            .unwrap();
+        let request = MemoriesRequest {
+            files: files_on(1, "2026-05-01", 8),
+            people: vec![person("me"), person("alice")],
+            me_person_id: Some("me".to_owned()),
+            surface_all: true,
+            ..MemoriesRequest::default()
+        };
+        let periods = [period("2026-10-30T09:00:00"), period("2026-11-02T09:00:00")];
+        let dense =
+            compute_smart_memories_from_store(&request, &periods, Some(&store), None).unwrap();
+        assert!(
+            dense
+                .periods
+                .iter()
+                .all(|memories| memories.iter().any(|memory| {
+                    matches!(&memory.kind, MemoryKind::People(people)
+                if people.person_id == "alice"
+                    && people.memory_type == PeopleMemoryType::DoingSomethingTogether
+                    && people.activity == Some(PeopleActivity::Party))
+                }))
+        );
+
+        store
+            .put_clip(&(101..=180).map(party).collect::<Vec<_>>())
+            .unwrap();
+        let sparse =
+            compute_smart_memories_from_store(&request, &periods, Some(&store), None).unwrap();
+        assert_eq!(sparse, dense);
     }
 
     #[test]
