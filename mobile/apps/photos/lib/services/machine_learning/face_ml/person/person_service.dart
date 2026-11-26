@@ -642,9 +642,13 @@ class PersonService {
     entities.sort((a, b) => a.updatedAt.compareTo(b.updatedAt));
     final Map<String, String> faceIdToClusterID = {};
     final Map<String, String> clusterToPersonID = {};
+    final hiddenPeople = <String, String?>{};
     bool shouldCheckRejectedFaces = false;
     for (var e in entities) {
       final personData = PersonData.fromJson(json.decode(e.data));
+      if (personData.hideFromMemories) {
+        hiddenPeople[e.id] = personData.email;
+      }
       if (personData.rejectedFaceIDs.isNotEmpty) {
         shouldCheckRejectedFaces = true;
       }
@@ -737,6 +741,9 @@ class PersonService {
       }
     }
 
+    if ((changed || hasUnappliedChanges) && hiddenPeople.isNotEmpty) {
+      await memoriesCacheService.purgePeopleFromMemoriesCache(hiddenPeople);
+    }
     await prefs.setInt(_appliedCGroupSyncTimeKey, downloadedSyncTime);
     return changed || hasUnappliedChanges;
   }
@@ -891,13 +898,10 @@ class PersonService {
     await updatePerson(updatedPerson);
     await refreshPersonCache();
     if (hideFromMemories == true && !person.data.hideFromMemories) {
-      final currentUserEmail = Configuration.instance.getEmail();
       unawaited(
-        memoriesCacheService.purgePersonFromMemoriesCache(
-          id,
-          isCurrentUser:
-              currentUserEmail != null && person.data.email == currentUserEmail,
-        ),
+        memoriesCacheService.purgePeopleFromMemoriesCache({
+          id: updatedPerson.data.email,
+        }),
       );
     }
     return updatedPerson;

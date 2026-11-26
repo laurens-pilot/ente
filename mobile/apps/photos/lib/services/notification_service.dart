@@ -451,6 +451,7 @@ class NotificationService {
 
   Future<void> clearAllScheduledNotifications({
     String? containingPayload,
+    Set<String>? matchingPayloads,
     bool logLines = true,
   }) async {
     try {
@@ -466,8 +467,10 @@ class NotificationService {
         return;
       }
       for (final request in pending) {
-        if (containingPayload != null &&
-            !request.payload.toString().contains(containingPayload)) {
+        if ((containingPayload != null &&
+                !request.payload.toString().contains(containingPayload)) ||
+            (matchingPayloads != null &&
+                !matchingPayloads.contains(request.payload))) {
           if (logLines) {
             _logger.info(
               "Skip clearing of notification with id: ${request.id} and payload: ${request.payload}",

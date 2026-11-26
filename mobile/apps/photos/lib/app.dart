@@ -19,6 +19,7 @@ import "package:photos/service_locator.dart";
 import 'package:photos/services/app_lifecycle_service.dart';
 import "package:photos/services/app_navigation_service.dart";
 import "package:photos/services/home_widget_service.dart";
+import "package:photos/services/machine_learning/face_ml/person/person_service.dart";
 import "package:photos/services/machine_learning/ml_run_control.dart";
 import "package:photos/services/machine_learning/ml_service.dart";
 import "package:photos/services/memory_home_widget_service.dart";
@@ -297,7 +298,13 @@ class _EnteAppState extends State<EnteApp> with WidgetsBindingObserver {
   Future<void> _reloadCachesUpdatedInBackground(
     int lastAppOpenTimeInMicroseconds,
   ) async {
+    final personService = PersonService.isInitialized && !isLocalGalleryMode
+        ? PersonService.instance
+        : null;
+    final peopleSyncTime = personService?.lastRemoteSyncTime();
     await ServiceLocator.instance.prefs.reload();
+    final peopleSyncedInBackground =
+        peopleSyncTime != personService?.lastRemoteSyncTime();
     unawaited(rewindService.refresh());
 
     final futures = <Future<void>>[];
@@ -306,7 +313,8 @@ class _EnteAppState extends State<EnteApp> with WidgetsBindingObserver {
       futures.add(magicCacheService.refreshCache());
     }
     if (memoriesCacheService.lastMemoriesCacheUpdateTime >
-        lastAppOpenTimeInMicroseconds) {
+            lastAppOpenTimeInMicroseconds ||
+        peopleSyncedInBackground) {
       futures.add(memoriesCacheService.refreshCache());
     }
     if (futures.isEmpty) {

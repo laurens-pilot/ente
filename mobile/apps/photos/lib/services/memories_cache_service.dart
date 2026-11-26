@@ -6,6 +6,7 @@ import "package:flutter/cupertino.dart";
 import "package:flutter/foundation.dart" show kDebugMode;
 import "package:logging/logging.dart";
 import "package:path_provider/path_provider.dart";
+import "package:photos/core/configuration.dart";
 import "package:photos/core/event_bus.dart";
 import "package:photos/db/files_db.dart";
 import "package:photos/db/memories_db.dart";
@@ -483,8 +484,8 @@ class MemoriesCacheService {
         "Running deferred initial offline memories cache upgrade after $trigger",
       );
       await updateCache(forced: true);
-      final persistedMemories = await _getMemoriesFromCache();
-      if (persistedMemories != null && persistedMemories.isNotEmpty) {
+      final cache = await _readCacheFromDisk();
+      if (cache != null && (await fromCacheToMemories(cache)).isNotEmpty) {
         _pendingInitialOfflineCacheUpgrade = false;
         _logger.info(
           "Deferred initial offline memories cache upgrade after $trigger completed",
@@ -589,76 +590,94 @@ class MemoriesCacheService {
     return spec is SpecialMemorySpec && spec.needsMl;
   }
 
-  Future<void> purgePersonFromMemoriesCache(
-    String personID, {
-    required bool isCurrentUser,
-  }) async {
-    bool shouldPurge(String? memoryPersonID, PeopleMemoryType? memoryType) {
-      return memoryPersonID == personID ||
-          (isCurrentUser &&
-              _peopleMemoryTypesWithCurrentUser.contains(memoryType));
-    }
-
+  Future<void> purgePeopleFromMemoriesCache(
+    Map<String, String?> hiddenPeople,
+  ) async {
+    final ownerID = Configuration.instance.getUserID();
+    if (ownerID == null || hiddenPeople.isEmpty) return;
     await _memoriesUpdateLock.synchronized(() async {
-      final removedMemoryIDs = <String>{};
-      bool cacheChanged = false;
-
-      if (_cachedMemories != null && _cachedMemories!.isNotEmpty) {
-        final filtered = <SmartMemory>[];
-        for (final memory in _cachedMemories!) {
-          if (memory is PeopleMemory &&
-              shouldPurge(memory.personID, memory.peopleMemoryType)) {
-            removedMemoryIDs.add(memory.id);
-            continue;
-          }
-          filtered.add(memory);
-        }
-        if (filtered.length != _cachedMemories!.length) {
-          _cachedMemories = filtered;
-          cacheChanged = true;
-        }
+      if (isLocalGalleryMode) return;
+      final cachePath = await _getCachePath();
+      final cache = await _readCacheFromDisk(cachePath: cachePath);
+      if (isLocalGalleryMode || ownerID != Configuration.instance.getUserID()) {
+        return;
       }
-
-      final cache = await _readCacheFromDisk();
-      if (cache != null) {
-        final originalToShowLength = cache.toShowMemories.length;
-        final originalLogLength = cache.peopleShownLogs.length;
-        bool shouldPurgeCacheMemory(ToShowMemory memory) {
-          return memory.type == MemoryType.people &&
-              shouldPurge(memory.personID, memory.peopleMemoryType);
-        }
-
-        for (final memory in cache.toShowMemories) {
-          if (shouldPurgeCacheMemory(memory)) {
-            removedMemoryIDs.add(memory.id);
-          }
-        }
-        cache.toShowMemories.removeWhere(shouldPurgeCacheMemory);
-        cache.peopleShownLogs.removeWhere((log) => log.personID == personID);
-        final shouldWriteCache =
-            cache.toShowMemories.length != originalToShowLength ||
-            cache.peopleShownLogs.length != originalLogLength;
-        if (shouldWriteCache) {
-          await writeToJsonFile<MemoriesCache>(
-            await _getCachePath(),
-            cache,
-            MemoriesCache.encodeToJsonString,
-          );
-          cacheChanged = true;
-        }
-      }
-
-      if (removedMemoryIDs.isNotEmpty) {
-        await NotificationService.instance.clearAllScheduledNotifications(
-          containingPayload: personID,
-          logLines: false,
-        );
-      }
-
-      if (cacheChanged) {
+      if (await _purgeHiddenPeople(hiddenPeople, cache, cachePath)) {
         Bus.instance.fire(MemoriesChangedEvent());
       }
     });
+  }
+
+  Future<bool> _purgeHiddenPeople(
+    Map<String, String?> hiddenPeople,
+    MemoriesCache? cache,
+    String cachePath,
+  ) async {
+    if (hiddenPeople.isEmpty) return false;
+    final email = Configuration.instance.getEmail();
+    final isCurrentUserHidden =
+        email != null && hiddenPeople.containsValue(email);
+    bool shouldPurge(String? memoryPersonID, PeopleMemoryType? memoryType) {
+      return hiddenPeople.containsKey(memoryPersonID) ||
+          (isCurrentUserHidden &&
+              _peopleMemoryTypesWithCurrentUser.contains(memoryType));
+    }
+
+    var cacheChanged = false;
+    final cachedMemories = _cachedMemories;
+    if (cachedMemories != null) {
+      final filtered = cachedMemories.where((memory) {
+        return memory is! PeopleMemory ||
+            !shouldPurge(memory.personID, memory.peopleMemoryType);
+      }).toList();
+      if (filtered.length != cachedMemories.length) {
+        _cachedMemories = filtered;
+        cacheChanged = true;
+      }
+    }
+
+    if (cache == null) return cacheChanged;
+    final removedBirthdayPeople = <String>{};
+    final originalToShowLength = cache.toShowMemories.length;
+    final originalLogLength = cache.peopleShownLogs.length;
+    cache.toShowMemories.removeWhere((memory) {
+      final personID = memory.personID;
+      final remove =
+          memory.type == MemoryType.people &&
+          shouldPurge(personID, memory.peopleMemoryType);
+      if (remove && memory.isBirthday == true && personID != null) {
+        removedBirthdayPeople.add(personID);
+      }
+      return remove;
+    });
+    cache.peopleShownLogs.removeWhere(
+      (log) => hiddenPeople.containsKey(log.personID),
+    );
+    if (cache.toShowMemories.length != originalToShowLength ||
+        cache.peopleShownLogs.length != originalLogLength) {
+      await writeToJsonFile<MemoriesCache>(
+        cachePath,
+        cache,
+        MemoriesCache.encodeToJsonString,
+      );
+      cacheChanged = true;
+    }
+    if (removedBirthdayPeople.isNotEmpty) {
+      final payloads = {
+        for (final personID in removedBirthdayPeople.difference({
+          for (final memory in cache.toShowMemories)
+            if (memory.isBirthday == true) ?memory.personID,
+        }))
+          "birthday_$personID",
+      };
+      if (payloads.isNotEmpty) {
+        await NotificationService.instance.clearAllScheduledNotifications(
+          matchingPayloads: payloads,
+          logLines: false,
+        );
+      }
+    }
+    return cacheChanged;
   }
 
   Future<List<SmartMemory>> getMemories({bool onlyUseCache = false}) async {
@@ -689,7 +708,7 @@ class MemoriesCacheService {
           return _cachedMemories!;
         }
         final cacheFileExists = await _cacheFileExists();
-        _cachedMemories = await _getMemoriesFromCache();
+        await _memoriesUpdateLock.synchronized(_loadMemoriesFromCache);
         if (_cachedMemories == null || _cachedMemories!.isEmpty) {
           final shouldRefreshEmptyCache =
               _cachedMemories == null ||
@@ -753,19 +772,47 @@ class MemoriesCacheService {
     return;
   }
 
-  Future<List<SmartMemory>?> _getMemoriesFromCache() async {
-    final cache = await _readCacheFromDisk();
+  Future<void> _loadMemoriesFromCache() async {
+    final localGallery = isLocalGalleryMode;
+    final cachePath = await _getCachePath();
+    final cache = await _readCacheFromDisk(cachePath: cachePath);
+    if (localGallery != isLocalGalleryMode) return;
     if (cache == null) {
-      return null;
+      _cachedMemories = null;
+      return;
     }
-    final result = await fromCacheToMemories(cache);
-    return result;
+    if (!localGallery &&
+        PersonService.isInitialized &&
+        cache.toShowMemories.any(
+          (memory) => memory.type == MemoryType.people,
+        )) {
+      final ownerID = Configuration.instance.getUserID();
+      try {
+        final people = await PersonService.instance.getPersons();
+        if (isLocalGalleryMode ||
+            ownerID != Configuration.instance.getUserID()) {
+          return;
+        }
+        await _purgeHiddenPeople(
+          {
+            for (final person in people)
+              if (person.data.hideFromMemories)
+                person.remoteID: person.data.email,
+          },
+          cache,
+          cachePath,
+        );
+      } catch (e, s) {
+        _logger.warning("Failed to reconcile hidden people in Memories", e, s);
+      }
+    }
+    _cachedMemories = await fromCacheToMemories(cache);
   }
 
-  Future<MemoriesCache?> _readCacheFromDisk() async {
+  Future<MemoriesCache?> _readCacheFromDisk({String? cachePath}) async {
     _logger.info("Reading memories cache result from disk");
     final cache = decodeJsonFile<MemoriesCache>(
-      await _getCachePath(),
+      cachePath ?? await _getCachePath(),
       MemoriesCache.decodeFromJsonString,
     );
     return cache;
@@ -1103,7 +1150,7 @@ class MemoriesCacheService {
 
     return _memoriesUpdateLock.synchronized(() async {
       try {
-        _cachedMemories = await _getMemoriesFromCache();
+        await _loadMemoriesFromCache();
         Bus.instance.fire(MemoriesChangedEvent());
       } catch (e, s) {
         _logger.info("Error refreshing memories cache", e, s);
