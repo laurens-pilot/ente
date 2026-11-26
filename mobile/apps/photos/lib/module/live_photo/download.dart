@@ -61,11 +61,14 @@ Future<LivePhotoFiles?> downloadLivePhotoFiles(
   }
 }
 
+String livePhotoImageCacheKey(EnteFile file) => Platform.isAndroid
+    ? '${file.downloadUrl}?livePhotoImage=original'
+    : file.downloadUrl;
+
 Future<File> _cacheImagePart(EnteFile file, LivePhotoArchivePart part) async {
   var fileExtension = _fileExtension(part.fileName);
   File imageFile = part.file;
-  if (fileExtension == 'unknown' ||
-      (Platform.isAndroid && fileExtension == 'heic')) {
+  if (fileExtension == 'unknown') {
     final compressResult = await FlutterImageCompress.compressAndGetFile(
       imageFile.path,
       '${imageFile.path}.jpg',
@@ -80,6 +83,7 @@ Future<File> _cacheImagePart(EnteFile file, LivePhotoArchivePart part) async {
   return DefaultCacheManager().putFileStream(
     file.downloadUrl,
     imageFile.openRead(),
+    key: livePhotoImageCacheKey(file),
     eTag: file.downloadUrl,
     maxAge: const Duration(days: 365),
     fileExtension: fileExtension,

@@ -182,7 +182,9 @@ Future<File?> getFileFromServer(
   final cacheManager = (file.fileType == FileType.video || liveVideo)
       ? VideoCacheManager.instance
       : DefaultCacheManager();
-  final fileFromCache = await cacheManager.getFileFromCache(file.downloadUrl);
+  final fileFromCache = await cacheManager.getFileFromCache(
+    _downloadCacheKey(file, liveVideo: liveVideo),
+  );
   if (fileFromCache != null) {
     return fileFromCache.file;
   }
@@ -225,9 +227,16 @@ Future<bool> isFileCached(EnteFile file, {bool liveVideo = false}) async {
   final cacheManager = (file.fileType == FileType.video || liveVideo)
       ? VideoCacheManager.instance
       : DefaultCacheManager();
-  final fileInfo = await cacheManager.getFileFromCache(file.downloadUrl);
+  final fileInfo = await cacheManager.getFileFromCache(
+    _downloadCacheKey(file, liveVideo: liveVideo),
+  );
   return fileInfo != null;
 }
+
+String _downloadCacheKey(EnteFile file, {required bool liveVideo}) =>
+    file.fileType == FileType.livePhoto && !liveVideo
+    ? livePhotoImageCacheKey(file)
+    : file.downloadUrl;
 
 final Map<int, Future<LivePhotoFiles?>> _livePhotoDownloadsTracker =
     <int, Future<LivePhotoFiles?>>{};
@@ -315,7 +324,9 @@ Future<void> removeFromDownloadCache(EnteFile file) async {
   if (file.fileType == FileType.video) {
     await VideoCacheManager.instance.removeFile(file.downloadUrl);
   } else {
-    await DefaultCacheManager().removeFile(file.downloadUrl);
+    await DefaultCacheManager().removeFile(
+      _downloadCacheKey(file, liveVideo: false),
+    );
     if (file.fileType == FileType.livePhoto) {
       await VideoCacheManager.instance.removeFile(file.downloadUrl);
     }
