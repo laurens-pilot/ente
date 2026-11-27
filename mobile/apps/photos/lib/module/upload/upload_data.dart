@@ -78,6 +78,7 @@ Future<MediaUploadData> _getMediaUploadDataFromAssetFile(EnteFile file) async {
   Map<String, IfdTag>? exifData;
   String? cameraMake;
   String? cameraModel;
+  FFProbeProps? videoProps;
 
   final asset = await _getAsset(file);
   file.fileSubType = asset.subtype;
@@ -93,7 +94,10 @@ Future<MediaUploadData> _getMediaUploadDataFromAssetFile(EnteFile file) async {
         cameraModel = extractPrintableExifValue(exifData['Image Model']);
       }
     }
-    await _decorateEnteFileData(file, asset, sourceFile, exifData);
+    if (file.fileType == FileType.video) {
+      videoProps = await getVideoProps(sourceFile);
+    }
+    await _decorateEnteFileData(file, asset, sourceFile, exifData, videoProps);
     fileHash = CryptoUtil.bin2base64(await CryptoUtil.getHash(sourceFile));
 
     if (file.fileType == FileType.livePhoto && Platform.isIOS) {
@@ -145,6 +149,7 @@ Future<MediaUploadData> _getMediaUploadDataFromAssetFile(EnteFile file) async {
         cameraModel: cameraModel,
         motionPhotoStartIndex: motionPhotoStartingIndex,
         exifData: exifData,
+        videoCaptureTime: videoCaptureTime(videoProps),
       ),
     );
   } catch (_) {
@@ -277,6 +282,7 @@ Future<void> _decorateEnteFileData(
   AssetEntity asset,
   File sourceFile,
   Map<String, IfdTag>? exifData,
+  FFProbeProps? videoProps,
 ) async {
   // Fetch missing Android Q+ location data lazily during upload.
   if (!file.hasLocation) {
@@ -288,7 +294,12 @@ Future<void> _decorateEnteFileData(
       );
     }
   }
-  await updateLocationFromEmbeddedMetadata(file, sourceFile, exifData);
+  await updateLocationFromEmbeddedMetadata(
+    file,
+    sourceFile,
+    exifData,
+    videoProps: videoProps,
+  );
   if (Platform.isIOS) {
     final originalTitle = await asset.titleAsync;
     if (originalTitle.isNotEmpty) {
@@ -308,6 +319,7 @@ Future<MediaUploadData> _getMediaUploadDataFromAppCache(EnteFile file) async {
   Map<String, IfdTag>? exifData;
   String? cameraMake;
   String? cameraModel;
+  FFProbeProps? videoProps;
   const bool isDeleted = false;
   final localPath = getSharedMediaFilePath(file);
   sourceFile = File(localPath);
@@ -340,12 +352,12 @@ Future<MediaUploadData> _getMediaUploadDataFromAppCache(EnteFile file) async {
       sourceFile,
       sourceVideoInfo: thumbnailResult.videoInfo,
     );
+    videoProps = await getVideoProps(sourceFile);
   }
 
   if (!file.hasLocation && file.isVideo && Platform.isAndroid) {
-    final FFProbeProps? props = await getVideoProps(sourceFile);
-    if (props?.location != null) {
-      file.location = props!.location;
+    if (videoProps?.location != null) {
+      file.location = videoProps!.location;
     }
   }
   return MediaUploadData(
@@ -359,6 +371,7 @@ Future<MediaUploadData> _getMediaUploadDataFromAppCache(EnteFile file) async {
       cameraMake: cameraMake,
       cameraModel: cameraModel,
       exifData: exifData,
+      videoCaptureTime: videoCaptureTime(videoProps),
     ),
   );
 }

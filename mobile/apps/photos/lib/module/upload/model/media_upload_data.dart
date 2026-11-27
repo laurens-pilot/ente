@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:exif_reader/exif_reader.dart';
+import 'package:photos/module/metadata/exif.dart';
 
 class MediaUploadData {
   final File sourceFile;
@@ -31,6 +32,7 @@ class DerivedMediaMetadata {
   final int? motionPhotoStartIndex;
 
   final Map<String, IfdTag>? exifData;
+  final ParsedExifDateTime? videoCaptureTime;
 
   const DerivedMediaMetadata({
     this.height,
@@ -39,5 +41,6 @@ class DerivedMediaMetadata {
     this.cameraModel,
     this.motionPhotoStartIndex,
     this.exifData,
+    this.videoCaptureTime,
   });
 }
