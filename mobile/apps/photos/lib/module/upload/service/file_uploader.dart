@@ -644,10 +644,11 @@ class FileUploader {
           contentMd5: thumbnailMd5,
         );
       }
-      final exifData = mediaUploadData.derivedMetadata.exifData;
+      final derivedMetadata = mediaUploadData.derivedMetadata;
+      final exifData = derivedMetadata.exifData;
       final ParsedExifDateTime? exifTime = exifData != null
           ? await tryParseExifDateTime(null, exifData)
-          : null;
+          : derivedMetadata.videoCaptureTime;
       file.metadataVersion = EnteFile.kCurrentMetadataVersion;
       final preparedMetadata = await prepareUploadMetadata(
         file,

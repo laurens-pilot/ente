@@ -13,6 +13,7 @@ class FFProbeProps {
   Map<String, dynamic>? propData;
   Location? location;
   DateTime? creationTimeUTC;
+  String? quickTimeCreationDate;
   String? bitrate;
   String? majorBrand;
   String? fps;
@@ -126,6 +127,10 @@ class FFProbeProps {
         case FFProbeKeys.creationTime:
           parsedData[stringKey] = _formatDate(json[key] ?? "");
           result.creationTimeUTC = _getUTCDateTime(json[key] ?? "");
+          break;
+        case FFProbeKeys.quickTimeCreationDate:
+          result.quickTimeCreationDate = json[key]?.toString();
+          parsedData[stringKey] = json[key];
           break;
         case FFProbeKeys.durationMicros:
           parsedData[stringKey] = formatPreciseDuration(
