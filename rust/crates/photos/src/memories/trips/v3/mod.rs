@@ -1,8 +1,8 @@
 mod homes;
 mod naming;
 
-use std::collections::HashMap;
-use std::{iter, mem};
+use std::collections::{HashMap, HashSet};
+use std::mem;
 
 use ente_location::{Coordinate, CountryCode};
 
@@ -25,6 +25,7 @@ const DESTINATION_RADIUS_KM: f64 = 25.0;
 const FREQUENT_VISITS: usize = 4;
 const FREQUENT_WINDOW_DAYS: i64 = 182;
 const SHARED_PHOTO_MAX_KM: f64 = 50.0;
+const MAIN_PLACE_SHARE: f64 = 0.05;
 
 #[derive(Clone, Copy)]
 struct Placed<'p> {
@@ -131,6 +132,7 @@ fn trips<'p>(own: &[Placed<'p>], shared: &[Placed<'p>], homes: &Homes) -> Vec<Ve
         .flat_map(|(visit, _)| country_legs(visit))
         .filter(|leg| is_trip(leg))
         .flat_map(|leg| without_home_ends(leg, homes))
+        .filter_map(|(piece, qualifying)| without_stray_ends(piece, &qualifying))
         .collect()
 }
 
@@ -270,29 +272,33 @@ fn country_legs(visit: Vec<Placed>) -> Vec<Vec<Placed>> {
             _ => legs.push((country, vec![point])),
         }
     }
+    let too_short = |leg: &[Placed]| {
+        leg.iter().filter(|point| !point.joined).count() < OVERNIGHT_TRIP_MIN_PHOTOS
+    };
     let mut merged: Vec<(Option<CountryCode>, Vec<Placed>)> = Vec::new();
     for (country, leg) in legs {
         match merged.last_mut() {
-            Some((merged_country, merged_leg))
-                if *merged_country == country || leg.len() < OVERNIGHT_TRIP_MIN_PHOTOS =>
-            {
+            Some((merged_country, merged_leg)) if *merged_country == country || too_short(&leg) => {
                 merged_leg.extend(leg);
             }
             _ => merged.push((country, leg)),
         }
     }
-    if merged.len() > 1 && merged[0].1.len() < OVERNIGHT_TRIP_MIN_PHOTOS {
+    if merged.len() > 1 && too_short(&merged[0].1) {
         let (_, first) = merged.remove(0);
         merged[0].1.splice(0..0, first);
     }
     merged.into_iter().map(|(_, leg)| leg).collect()
 }
 
-fn without_home_ends<'p>(leg: Vec<Placed<'p>>, homes: &Homes) -> Vec<Vec<Placed<'p>>> {
+fn without_home_ends<'p>(
+    leg: Vec<Placed<'p>>,
+    homes: &Homes,
+) -> Vec<(Vec<Placed<'p>>, Vec<Placed<'p>>)> {
     let in_home_country: Vec<Option<bool>> = leg
         .iter()
         .map(|point| {
-            point.country.map(|country| {
+            point.country.filter(|_| !point.joined).map(|country| {
                 homes
                     .countries_on(point.member.photo.date.days_since_epoch())
                     .contains(&country)
@@ -303,10 +309,10 @@ fn without_home_ends<'p>(leg: Vec<Placed<'p>>, homes: &Homes) -> Vec<Vec<Placed<
         .filter(|&index| in_home_country[index] == Some(false))
         .collect();
     let (Some(&first), Some(&last)) = (abroad.first(), abroad.last()) else {
-        return vec![leg];
+        return vec![(leg.clone(), leg)];
     };
     if abroad.len() * 2 <= in_home_country.iter().flatten().count() {
-        return vec![leg];
+        return vec![(leg.clone(), leg)];
     }
     let start = in_home_country[..first]
         .iter()
@@ -316,16 +322,85 @@ fn without_home_ends<'p>(leg: Vec<Placed<'p>>, homes: &Homes) -> Vec<Vec<Placed<
         .iter()
         .position(|&home| home == Some(true))
         .map_or(leg.len(), |index| last + index);
+    let whole = leg.clone();
     let mut before = leg;
     let after = before.split_off(end);
     let away = before.split_off(start);
-    let before = is_trip(&before).then_some(before);
-    let after = is_trip(&after).then_some(after);
-    before
-        .into_iter()
-        .chain(iter::once(away))
-        .chain(after)
-        .collect()
+    vec![
+        (before.clone(), before),
+        (away, whole),
+        (after.clone(), after),
+    ]
+}
+
+fn without_stray_ends<'p>(
+    mut trip: Vec<Placed<'p>>,
+    qualifying: &[Placed<'p>],
+) -> Option<Vec<Placed<'p>>> {
+    let own: Vec<Located> = trip
+        .iter()
+        .filter(|point| !point.joined)
+        .map(|point| point.member)
+        .collect();
+    let few = |count: usize| (count as f64) < own.len() as f64 * MAIN_PLACE_SHARE;
+    let stops = cluster_by_location(own.iter().copied(), DESTINATION_RADIUS_KM);
+    let main_place_photos: HashSet<i64> = stops
+        .iter()
+        .filter(|stop| !few(stop.members.len()))
+        .flat_map(|stop| &stop.members)
+        .map(|member| member.photo.id)
+        .collect();
+    let at_main_place = |member: &Located| main_place_photos.contains(&member.photo.id);
+    let start = own
+        .iter()
+        .position(at_main_place)
+        .filter(|&first| few(first))
+        .unwrap_or(0);
+    let end = own
+        .iter()
+        .rposition(at_main_place)
+        .map(|last| last + 1)
+        .filter(|&end| few(own.len() - end))
+        .unwrap_or(own.len());
+    let kept = &own[start..end];
+    let (Some(first), Some(last)) = (kept.first(), kept.last()) else {
+        return None;
+    };
+    let order = |member: &Located| (member.photo.creation_time, member.photo.id);
+    let during = order(first)..=order(last);
+    let strictly_during = |member: &Located| {
+        first.photo.creation_time < member.photo.creation_time
+            && member.photo.creation_time < last.photo.creation_time
+    };
+    let mut left_out = HashSet::new();
+    trip.retain(|point| {
+        let stays = if point.joined {
+            strictly_during(&point.member)
+                || kept.iter().any(|member| {
+                    member.location.distance_km(point.member.location) <= DESTINATION_RADIUS_KM
+                })
+        } else {
+            during.contains(&order(&point.member))
+        };
+        if !stays {
+            left_out.insert(point.member.photo.id);
+        }
+        stays
+    });
+    let retained: HashSet<i64> = trip.iter().map(|point| point.member.photo.id).collect();
+    let still_qualifying: Vec<Placed> = qualifying
+        .iter()
+        .filter(|point| {
+            let id = point.member.photo.id;
+            if point.joined {
+                retained.contains(&id)
+            } else {
+                !left_out.contains(&id)
+            }
+        })
+        .copied()
+        .collect();
+    is_trip(&still_qualifying).then_some(trip)
 }
 
 fn is_trip(points: &[Placed]) -> bool {
@@ -380,6 +455,15 @@ mod tests {
     const HO_CHI_MINH_CITY: (f64, f64) = (10.7769, 106.7009);
     const MATTERHORN_BORDER: (f64, f64) = (45.976, 7.658);
     const ROMAN_COUNTRYSIDE: (f64, f64) = (42.25, 12.95);
+    const ROME_NORTH: (f64, f64) = (42.2163, 12.4964);
+    const ROME_SOUTH: (f64, f64) = (41.5893, 12.4964);
+    const NEAR_ROME: (f64, f64) = (42.0198, 12.4964);
+    const NORTH_EDGE_OF_ROME: (f64, f64) = (42.1186, 12.4964);
+    const BOLOGNA: (f64, f64) = (44.4949, 11.3426);
+    const DUTCH_COAST: (f64, f64) = (51.70, 4.15);
+    const BELGIAN_COAST: (f64, f64) = (51.45, 3.60);
+    const JUST_SOUTH_OF_ROME_NORTH: (f64, f64) = (42.16, 12.4964);
+    const BEYOND_ROME_NORTH: (f64, f64) = (42.43, 12.4964);
     const ARDECHE: (f64, f64) = (44.6, 4.4);
     const TRIER: (f64, f64) = (49.7499, 6.6371);
     const FLORENCE: (f64, f64) = (43.7696, 11.2558);
@@ -627,6 +711,14 @@ mod tests {
             ..MemoriesRequest::default()
         };
         compute_all_trip_memories(&request, period(NOW), Some(&Atlas), TripDetection::Improved)
+    }
+
+    fn trip_with(files: &[MemoryFile], id: i64) -> Vec<i64> {
+        memories(files.to_vec())
+            .into_iter()
+            .find(|memory| memory.file_ids.contains(&id))
+            .unwrap()
+            .file_ids
     }
 
     fn trips(files: Vec<MemoryFile>) -> Vec<(i64, Option<String>)> {
@@ -1404,5 +1496,290 @@ mod tests {
             trips(library(vec![trip], &AMSTERDAM_HOME)),
             named(&[(1, "Beach Village")])
         );
+    }
+
+    #[test]
+    fn trips_leave_out_a_few_photos_from_the_way_there_and_back_but_keep_the_stops_of_a_tour() {
+        let mut rome = stay(9000, "2024-05-10T21:00:00", 1, 0, PARIS);
+        rome.extend(stay(1000, "2024-05-11T10:00:00", 30, 180, ROME));
+        rome.extend(stay(9100, "2024-05-15T09:00:00", 1, 0, FLORENCE));
+        let mut tour = stay(2000, "2025-06-01T09:00:00", 1, 0, BRUSSELS);
+        tour.extend(stay(2001, "2025-06-01T12:00:00", 1, 0, LUXEMBOURG));
+        tour.extend(stay(2002, "2025-06-01T18:00:00", 30, 240, ZURICH));
+        tour.extend(stay(2100, "2025-06-07T10:00:00", 1, 0, ZERMATT));
+        tour.extend(stay(2101, "2025-06-07T14:00:00", 1, 0, PARIS));
+        let files = library(vec![rome, tour], &AMSTERDAM_HOME);
+        let zurich = trip_with(&files, 2002);
+
+        assert!(zurich.contains(&2000) && zurich.contains(&2101));
+        assert_eq!(trips(files), named(&[(1, "Rome"), (2, "Zurich")]));
+    }
+
+    #[test]
+    fn shared_photos_never_decide_where_a_trip_starts_or_ends() {
+        let mut rome = stay(9000, "2024-05-10T21:00:00", 1, 0, PARIS);
+        rome.extend(shared(stay(9300, "2024-05-10T21:30:00", 2, 20, PARIS)));
+        rome.extend(stay(1000, "2024-05-11T10:00:00", 30, 180, ROME));
+        rome.extend(shared(stay(1500, "2024-05-15T08:00:00", 2, 20, ROME)));
+        rome.extend(stay(9100, "2024-05-15T20:00:00", 1, 0, FLORENCE));
+        rome.extend(shared(stay(9101, "2024-05-15T20:00:00", 1, 0, FLORENCE)));
+        let mut day_out = stay(2000, "2025-05-10T08:00:00", 1, 0, ROME_NORTH);
+        day_out.extend(shared(stay(2001, "2025-05-10T10:00:00", 20, 20, ROME)));
+        day_out.extend(stay(2100, "2025-05-10T19:00:00", 1, 0, ROME_SOUTH));
+        let mut barely_a_stray = stay(3000, "2026-01-10T21:00:00", 1, 0, PARIS);
+        barely_a_stray.extend(stay(3001, "2026-01-11T10:00:00", 19, 180, ROME));
+        barely_a_stray.extend(shared(stay(3500, "2026-01-11T10:30:00", 1, 0, ROME)));
+        let mut drifting = stay(9400, "2023-06-10T20:00:00", 1, 0, ROME_NORTH);
+        drifting.extend(shared(stay(4500, "2023-06-10T21:00:00", 1, 0, NEAR_ROME)));
+        drifting.extend(stay(4000, "2023-06-11T10:00:00", 30, 180, ROME));
+        let files = library(
+            vec![rome, day_out, barely_a_stray, drifting],
+            &AMSTERDAM_HOME,
+        );
+        let day_out_trip = trip_with(&files, 2001);
+
+        assert!(trip_with(&files, 1000).contains(&1501));
+        assert!(day_out_trip.contains(&2000) && day_out_trip.contains(&2100));
+        assert!(trip_with(&files, 3001).contains(&3000));
+        assert_eq!(
+            trips(files),
+            named(&[(1, "Rome"), (2, "Rome"), (3, "Rome"), (4, "Rome")])
+        );
+    }
+
+    #[test]
+    fn shared_photos_before_or_after_your_own_stay_only_at_a_stop_you_kept() {
+        let mut at_the_place_before_you = stay(9000, "2023-01-10T20:00:00", 1, 0, ROME_NORTH);
+        at_the_place_before_you.extend(shared(stay(1500, "2023-01-10T21:00:00", 1, 0, ROME)));
+        at_the_place_before_you.extend(stay(1000, "2023-01-11T10:00:00", 30, 180, ROME));
+        let mut away_from_your_photo = stay(9100, "2023-08-10T14:00:00", 1, 0, ROME_NORTH);
+        away_from_your_photo.extend(shared(stay(9101, "2023-08-10T23:30:00", 1, 0, ROME_NORTH)));
+        away_from_your_photo.extend(stay(2000, "2023-08-11T08:00:00", 30, 180, ROME));
+        let mut beside_a_kept_photo = stay(9200, "2024-03-10T20:00:00", 1, 0, ROME_SOUTH);
+        beside_a_kept_photo.extend(shared(stay(3500, "2024-03-10T21:00:00", 1, 0, ROME)));
+        beside_a_kept_photo.extend(stay(3000, "2024-03-11T08:00:00", 1, 0, ROME));
+        beside_a_kept_photo.extend(stay(3001, "2024-03-11T11:00:00", 1, 0, NORTH_EDGE_OF_ROME));
+        beside_a_kept_photo.extend(stay(3002, "2024-03-11T14:00:00", 30, 180, ROME_NORTH));
+        let mut beside_a_photo_from_home = stay(9300, "2024-10-10T18:00:00", 1, 0, DUTCH_COAST);
+        beside_a_photo_from_home.extend(shared(stay(
+            9301,
+            "2024-10-10T18:10:00",
+            1,
+            0,
+            BELGIAN_COAST,
+        )));
+        beside_a_photo_from_home.extend(stay(4000, "2024-10-11T10:00:00", 30, 180, ROME));
+        let mut at_a_last_stop = stay(5000, "2025-05-11T10:00:00", 30, 180, ROME);
+        at_a_last_stop.extend(stay(5100, "2025-05-15T09:00:00", 1, 0, FLORENCE));
+        at_a_last_stop.extend(stay(5101, "2025-05-15T12:00:00", 1, 0, BOLOGNA));
+        at_a_last_stop.extend(shared(stay(5500, "2025-05-15T12:30:00", 1, 0, BOLOGNA)));
+        at_a_last_stop.extend(stay(9400, "2025-05-16T08:00:00", 1, 0, DUTCH_COAST));
+        let mut at_the_same_moment = stay(600, "2025-12-10T10:00:00", 1, 0, PARIS);
+        at_the_same_moment.extend(shared(stay(601, "2025-12-10T10:00:00", 1, 0, PARIS)));
+        at_the_same_moment.extend(stay(6100, "2025-12-10T10:00:00", 30, 180, ROME));
+        let mut near_a_stop_only_through_a_stray =
+            stay(9500, "2026-02-10T20:00:00", 1, 0, ROME_NORTH);
+        near_a_stop_only_through_a_stray.extend(shared(stay(
+            9501,
+            "2026-02-10T21:00:00",
+            1,
+            0,
+            JUST_SOUTH_OF_ROME_NORTH,
+        )));
+        near_a_stop_only_through_a_stray.extend(stay(7000, "2026-02-11T10:00:00", 20, 180, ROME));
+        near_a_stop_only_through_a_stray.extend(stay(
+            7500,
+            "2026-02-13T23:00:00",
+            1,
+            0,
+            BEYOND_ROME_NORTH,
+        ));
+        near_a_stop_only_through_a_stray.extend(stay(7020, "2026-02-14T08:00:00", 20, 180, ROME));
+        let files = library(
+            vec![
+                at_the_place_before_you,
+                away_from_your_photo,
+                beside_a_kept_photo,
+                beside_a_photo_from_home,
+                at_a_last_stop,
+                at_the_same_moment,
+                near_a_stop_only_through_a_stray,
+            ],
+            &AMSTERDAM_HOME,
+        );
+
+        assert_eq!(trip_with(&files, 1000)[0], 1500);
+        assert_eq!(trip_with(&files, 3000)[0], 3500);
+        for first in [2000, 4000, 6100, 7000] {
+            assert_eq!(trip_with(&files, first)[0], first);
+        }
+        assert!(trip_with(&files, 5000).contains(&5500));
+        assert!(trip_with(&files, 7000).contains(&7500));
+        assert_eq!(
+            trips(files),
+            named(&[
+                (1, "Rome"),
+                (2, "Rome"),
+                (3, "Italy"),
+                (4, "Rome"),
+                (5, "Rome"),
+                (6, "Rome"),
+                (7, "Rome")
+            ])
+        );
+    }
+
+    #[test]
+    fn shared_photos_at_a_kept_stop_stay_when_a_long_trip_splits_by_country() {
+        let mut long_trip = stay(1000, "2024-07-01T09:00:00", 40, 720, LUXEMBOURG);
+        long_trip.extend(shared(stay(1500, "2024-07-21T07:00:00", 1, 0, LUXEMBOURG)));
+        long_trip.extend(stay(2000, "2024-07-21T08:00:00", 30, 720, TRIER));
+        let files = library(vec![long_trip], &AMSTERDAM_HOME);
+
+        assert!(trip_with(&files, 1000).contains(&1500));
+        assert_eq!(trips(files), named(&[(1, "Luxembourg"), (2, "Trier")]));
+    }
+
+    #[test]
+    fn a_short_country_leg_joins_its_neighbour_whatever_shared_photos_it_has() {
+        let mut long_trip = stay(1000, "2024-07-01T09:00:00", 30, 720, PARIS);
+        long_trip.extend(stay(1100, "2024-07-16T09:00:00", 8, 720, LUXEMBOURG));
+        long_trip.extend(shared(stay(2500, "2024-07-20T07:00:00", 3, 10, TRIER)));
+        long_trip.extend(stay(2000, "2024-07-20T09:00:00", 40, 720, TRIER));
+        let files = library(vec![long_trip], &AMSTERDAM_HOME);
+        let paris = trip_with(&files, 1000);
+
+        assert!((1100..1108).all(|id| paris.contains(&id)));
+        assert_eq!(trips(files), named(&[(1, "Paris"), (2, "Trier")]));
+    }
+
+    #[test]
+    fn a_shared_photo_left_out_of_a_trip_never_takes_the_trip_away() {
+        let mut rome = stay(9300, "2024-10-10T18:00:00", 2, 5, DUTCH_COAST);
+        rome.extend(stay(1000, "2024-10-11T10:00:00", 9, 180, ROME));
+        let mut with_a_shared_photo = rome.clone();
+        with_a_shared_photo.extend(shared(stay(
+            9302,
+            "2024-10-10T18:10:00",
+            1,
+            0,
+            BELGIAN_COAST,
+        )));
+
+        assert_eq!(
+            trips(library(vec![rome], &AMSTERDAM_HOME)),
+            named(&[(1, "Rome")])
+        );
+        assert_eq!(
+            trips(library(vec![with_a_shared_photo], &AMSTERDAM_HOME)),
+            named(&[(1, "Rome")])
+        );
+    }
+
+    #[test]
+    fn a_home_country_end_left_with_too_few_photos_is_not_a_trip_of_its_own() {
+        let mut files = stay(2000, "2024-05-10T18:00:00", 2, 5, DUTCH_COAST);
+        files.extend(shared(stay(2100, "2024-05-10T18:10:00", 13, 5, ROTTERDAM)));
+        files.extend(stay(1000, "2024-05-11T10:00:00", 30, 180, ROME));
+
+        assert_eq!(
+            trips(library(vec![files], &AMSTERDAM_HOME)),
+            named(&[(1, "Rome")])
+        );
+    }
+
+    #[test]
+    fn shared_photos_between_the_countries_of_a_long_trip_never_make_a_trip_of_their_own() {
+        let mut long_trip = stay(1000, "2024-07-01T09:00:00", 40, 720, BELGIAN_COAST);
+        long_trip.extend(shared(stay(
+            1500,
+            "2024-07-20T22:00:00",
+            12,
+            100,
+            DUTCH_COAST,
+        )));
+        long_trip.extend(stay(2000, "2024-07-22T20:00:00", 30, 720, GRONINGEN));
+
+        assert_eq!(
+            trips(library(vec![long_trip], &AMSTERDAM_HOME)),
+            vec![(1, None), (2, Some("Groningen".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn shared_photos_taken_as_your_trip_starts_stay_only_near_your_photos() {
+        let mut files = shared(stay(999, "2024-05-11T10:00:00", 1, 0, ROME_NORTH));
+        files.extend(stay(1000, "2024-05-11T10:00:00", 30, 180, ROME));
+        files.extend(shared(stay(1998, "2024-05-11T10:00:00", 1, 0, ROME_NORTH)));
+        files.extend(shared(stay(1999, "2024-05-11T10:00:00", 1, 0, ROME)));
+        let rome = trip_with(&library(vec![files], &AMSTERDAM_HOME), 1000);
+
+        assert!(!rome.contains(&999) && !rome.contains(&1998) && rome.contains(&1999));
+    }
+
+    #[test]
+    fn shared_photos_from_abroad_never_turn_a_trip_at_home_into_one_abroad() {
+        let mut coast = stay(1000, "2024-08-10T18:00:00", 6, 30, DUTCH_COAST);
+        coast.extend(shared(stay(
+            1500,
+            "2024-08-10T21:00:00",
+            13,
+            20,
+            BELGIAN_COAST,
+        )));
+        coast.extend(stay(1006, "2024-08-11T08:00:00", 6, 30, DUTCH_COAST));
+        let files = library(vec![coast], &AMSTERDAM_HOME);
+        let trip = trip_with(&files, 1000);
+
+        assert!((1000..1012).all(|id| trip.contains(&id)));
+    }
+
+    #[test]
+    fn shared_photos_left_at_home_never_make_the_trip_abroad_a_trip() {
+        let mut files = stay(9300, "2024-10-10T18:00:00", 1, 0, DUTCH_COAST);
+        files.extend(shared(stay(
+            9301,
+            "2024-10-10T18:10:00",
+            6,
+            5,
+            BELGIAN_COAST,
+        )));
+        files.extend(stay(9310, "2024-10-10T18:40:00", 1, 0, DUTCH_COAST));
+        files.extend(stay(1000, "2024-10-11T10:00:00", 3, 180, ROME));
+
+        assert_eq!(trips(library(vec![files], &AMSTERDAM_HOME)), named(&[]));
+    }
+
+    #[test]
+    fn a_road_trip_through_many_small_stops_stays_whole() {
+        let start = micros("2024-06-01T09:00:00");
+        let road_trip: Vec<MemoryFile> = (0..41)
+            .map(|index| {
+                let stop = if index < 2 { index } else { index - 1 };
+                located_file(
+                    1000 + index,
+                    start + index * 2 * HOUR,
+                    (46.0, -1.0 + stop as f64 * 0.35),
+                )
+            })
+            .collect();
+        let files = library(vec![road_trip], &AMSTERDAM_HOME);
+
+        assert_eq!(trip_with(&files, 1000).len(), 41);
+    }
+
+    #[test]
+    fn a_trip_left_with_too_few_photos_by_its_shared_photos_is_not_a_trip() {
+        let mut files = stay(9300, "2024-10-10T18:00:00", 1, 0, DUTCH_COAST);
+        files.extend(shared(stay(
+            9301,
+            "2024-10-10T18:10:00",
+            13,
+            5,
+            BELGIAN_COAST,
+        )));
+        files.extend(stay(1000, "2024-10-11T10:00:00", 2, 180, ROME));
+
+        assert_eq!(trips(library(vec![files], &AMSTERDAM_HOME)), named(&[]));
     }
 }
